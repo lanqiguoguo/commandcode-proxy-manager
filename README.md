@@ -36,6 +36,8 @@
 
 ## 快速开始
 
+镜像采用精简基础镜像（alpine + 无 npm 的 nodejs），拉取体积约 29MB（node:22-alpine 基底约 58MB）。
+
 Docker：
 
     docker run -d --name cc-proxy-manager -p 3080:3080 \

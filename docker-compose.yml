@@ -1,7 +1,7 @@
 services:
   manager:
     build: .
-    image: ghcr.io/maxeaglet/commandcode-proxy-manager:latest
+    image: ghcr.io/lanqiguoguo/commandcode-proxy-manager:latest
     container_name: cc-proxy-manager
     ports:
       - "3080:3080"

@@ -42,7 +42,7 @@ Docker：
 
     docker run -d --name cc-proxy-manager -p 3080:3080 \
       -v ccpm-data:/data \
-      ghcr.io/maxeaglet/commandcode-proxy-manager:latest
+      ghcr.io/lanqiguoguo/commandcode-proxy-manager:latest
 
 docker compose：
 

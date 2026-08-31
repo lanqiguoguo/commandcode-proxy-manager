@@ -4,6 +4,7 @@ import { resolve } from "path";
 import { DATA_DIR } from "./config.mjs";
 
 const FILE = "stats.jsonl";
+const MAX_EVENTS = 200000;   // 内存事件硬上限：超出即截断最旧事件（含保留期内），防无界增长
 let retentionDays = 7;
 let events = [];
 let emitter = null;
@@ -49,6 +50,16 @@ function load() {
   }
 }
 
+let compactTimer = null;
+function scheduleCompact() {
+  if (compactTimer) return;
+  compactTimer = setTimeout(() => {
+    compactTimer = null;
+    prune();
+  }, 5000);
+  if (compactTimer.unref) compactTimer.unref();
+}
+
 export function appendEvent(ev) {
   const event = { ts: Date.now(), ...ev };
   events.push(event);
@@ -57,7 +68,10 @@ export function appendEvent(ev) {
   } catch (e) {
     console.error("[stats] append failed:", e.message);
   }
-  if (events.length > 200000) prune();
+  if (events.length > MAX_EVENTS) {
+    events = events.slice(-MAX_EVENTS);
+    scheduleCompact();
+  }
   if (emitter) emitter.emit("stats", event);
 }
 
@@ -65,6 +79,7 @@ export function prune() {
   const cutoff = cutoffMs();
   const before = events.length;
   events = events.filter((e) => e.ts >= cutoff);
+  if (events.length > MAX_EVENTS) events = events.slice(-MAX_EVENTS);
   if (events.length === before) return;
   try {
     const p = resolve(DATA_DIR, FILE);
@@ -110,11 +125,12 @@ function windowCounts(keyId, msWindow) {
 }
 
 export function usageByKey(keyId) {
-  return {
-    h5: windowCounts(keyId, 5 * 3600e3),
-    d7: windowCounts(keyId, 7 * 864e5),
-    d30: windowCounts(keyId, 30 * 864e5)
-  };
+  const h5 = windowCounts(keyId, 5 * 3600e3);
+  const d7 = windowCounts(keyId, 7 * 864e5);
+  // 30 天窗口仅在保留天数 >= 30 时才有完整数据；
+  // 否则退化为保留窗口（默认 7 天）并显式标记，前端不再误读为“30d 完整统计”
+  const d30 = retentionDays >= 30 ? windowCounts(keyId, 30 * 864e5) : d7;
+  return { h5, d7, d30, d30Valid: retentionDays >= 30 };
 }
 
 export function poolStats() {

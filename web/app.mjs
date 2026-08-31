@@ -211,12 +211,13 @@ function keyCard(k) {
   if (usd) quotaHtml += barHtml("订阅美元", usd.percent, "$" + usd.used + " / $" + usd.limit + " · 余 $" + usd.remaining);
   else quotaHtml += '<div class="muted small">订阅美元：无数据</div>';
   const w5 = u.h5 || {}, w7 = u.d7 || {}, w30 = u.d30 || {};
+  const d30Label = u.d30Valid ? "30d" : "保留期";
   const usageHtml =
     '<div class="muted small">实测用量</div>' +
     '<div class="row small muted">' +
     "<span>5h: " + w5.requests + " 请求 / " + fmtNum((w5.input || 0) + (w5.output || 0)) + " tok</span>" +
     "<span>7d: " + w7.requests + " 请求</span>" +
-    "<span>30d: " + w30.requests + " 请求</span>" +
+    "<span>" + d30Label + ": " + w30.requests + " 请求" + (u.d30Valid ? "" : "（保留期内）") + "</span>" +
     "</div>" +
     '<div class="row small muted">429: ' + (w7.err429 || 0) + " · 其他错误: " + (w7.errOther || 0) + " · 切换次数: " + ((k.health && k.health.failoverCount) || 0) + "</div>";
   return '<div class="card">' +
@@ -296,24 +297,41 @@ async function addKey() {
 
 async function bulkImport() {
   const text = document.getElementById("k-bulk").value;
-  const lines = text.split("\n").map((s) => s.trim()).filter(Boolean);
+  const rawLines = text.split("\n").map((s) => s.trim()).filter(Boolean);
+  // 去重（按 key 去重，保留首个别名）
+  const seen = new Set();
+  const lines = [];
+  for (const line of rawLines) {
+    const key = line.includes(",") ? line.split(",")[1].trim() : line.trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(line);
+  }
   let okCount = 0, failCount = 0;
   const errors = [];
-  for (const line of lines) {
-    let alias = "", key = line;
-    if (line.includes(",")) {
-      const parts = line.split(",");
-      alias = parts[0].trim();
-      key = parts[1].trim();
-    }
-    try {
-      await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ alias, key }) });
-      okCount++;
-    } catch (e) {
-      failCount++;
-      if (errors.length < 3) errors.push(e.message);
+  // 限制并发 5，避免批量导入打爆后端
+  const concurrency = 5;
+  let idx = 0;
+  async function worker() {
+    while (idx < lines.length) {
+      const i = idx++;
+      const line = lines[i];
+      let alias = "", key = line;
+      if (line.includes(",")) {
+        const parts = line.split(",");
+        alias = parts[0].trim();
+        key = parts[1].trim();
+      }
+      try {
+        await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ alias, key }) });
+        okCount++;
+      } catch (e) {
+        failCount++;
+        if (errors.length < 3) errors.push(e.message);
+      }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(concurrency, lines.length) }, () => worker()));
   document.getElementById("key-msg").innerHTML = '<div class="alert ' + (failCount ? "err" : "ok") + '">成功 ' + okCount + " 个，失败 " + failCount + " 个" + (errors.length ? "：" + esc(errors.join("；")) : "") + "</div>";
   document.getElementById("k-bulk").value = "";
   await refresh(); render();
@@ -539,7 +557,8 @@ window.ccpmMove = moveKey;
 window.addEventListener("hashchange", () => {
   state.view = location.hash.slice(2) || "dashboard";
   if (state.view === "history") loadHistory().catch(() => {});
-  if (state.view === "logs") loadLogs().catch(() => {});
+  if (state.view === "logs") { loadLogs().catch(() => {}); startLogPoller(); }
+  else stopLogPoller();
   render();
 });
 
@@ -551,6 +570,16 @@ document.getElementById("btn-logout").addEventListener("click", () => {
 
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 
+state.logTimer = null;
+function startLogPoller() {
+  if (state.logTimer) clearInterval(state.logTimer);
+  state.logTimer = setInterval(() => { if (state.view === "logs") loadLogs().catch(() => {}); }, 3000);
+  if (state.logTimer.unref) state.logTimer.unref?.();
+}
+function stopLogPoller() {
+  if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
+}
+
 if (!state.token) {
   showLogin();
 } else {
@@ -558,7 +587,7 @@ if (!state.token) {
     const ok = await refresh();
     if (!ok) { showLogin(); return; }
     startTicker();
-    setInterval(() => { if (state.view === "logs") loadLogs().catch(() => {}); }, 3000);
+    startLogPoller();
     if (state.view === "history") loadHistory().catch(() => {});
     render();
   })();

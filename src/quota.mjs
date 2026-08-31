@@ -30,6 +30,8 @@ export function initQuota(poolRef, poolCfg, opts = {}) {
 export function setRefreshMs(ms) {
   cfg.quotaRefreshMs = Math.max(5000, Number(ms) || 60000);
   startTimer();
+  // 参数变更后立即探测一次，避免等待整周期
+  refreshAll().catch(() => {});
 }
 
 function startTimer() {
@@ -73,7 +75,9 @@ function toMs(iso) {
 export async function probeKey(keyId) {
   const rec = pool.getKeyRecord(keyId);
   if (!rec || !rec.key) return null;
+  const prev = cache.get(keyId) || null;
   const report = { fiveHour: null, weekly: null, creditsUsd: null, updatedAt: Date.now(), stale: true };
+  let ok = false;
   try {
     const whoami = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
     const w = (whoami && (whoami.data || whoami)) || {};
@@ -81,50 +85,58 @@ export async function probeKey(keyId) {
     const orgQuery = orgId ? "?orgId=" + encodeURIComponent(orgId) : "";
 
     const credits = await fetchJson(API_BASE + PATH_CREDITS + orgQuery, rec.key);
-    if (!credits) return report;
-    const body = credits.data || credits;
-    const creditsObj = body.credits || null;
-    const limits = body.windowLimits || null;
-    if (!creditsObj && !limits) return report;
-
-    if (limits) {
-      report.fiveHour = parseWindow(limits.fiveHour);
-      report.weekly = parseWindow(limits.weekly);
-    }
-
-    // 订阅周期内美元额度（软失败，无周期起点时不展示）
-    const subs = await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key);
-    const sub = subs ? (subs.data || subs) : null;
-    const periodStart = sub && typeof sub.currentPeriodStart === "string" ? sub.currentPeriodStart : "";
-    if (periodStart && creditsObj) {
-      const usage = await fetchJson(API_BASE + PATH_USAGE + orgQuery + "&since=" + encodeURIComponent(periodStart), rec.key);
-      const u = usage ? (usage.data || usage) : null;
-      const used = u && u.totalCost !== undefined ? num(u.totalCost) : num(u && u.totalMonthlyCredits);
-      const pools = ["monthlyCredits", "purchasedCredits", "freeCredits"]
-        .map((k) => num(creditsObj[k]))
-        .filter((v) => v !== undefined)
-        .map((v) => Math.max(0, v));
-      if (used !== undefined && pools.length > 0) {
-        const remaining = pools.reduce((s, v) => s + v, 0);
-        const limit = used + remaining;
-        report.creditsUsd = {
-          used,
-          remaining,
-          limit,
-          percent: limit > 0 ? Math.round((used / limit) * 1000) / 10 : 0,
-          expiresAt: sub.currentPeriodEnd || undefined
-        };
+    const body = credits ? (credits.data || credits) : null;
+    const creditsObj = body ? (body.credits || null) : null;
+    const limits = body ? (body.windowLimits || null) : null;
+    if (creditsObj || limits) {
+      if (limits) {
+        report.fiveHour = parseWindow(limits.fiveHour);
+        report.weekly = parseWindow(limits.weekly);
       }
+
+      // 订阅周期内美元额度（软失败，无周期起点时不展示）
+      const subs = await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key);
+      const sub = subs ? (subs.data || subs) : null;
+      const periodStart = sub && typeof sub.currentPeriodStart === "string" ? sub.currentPeriodStart : "";
+      if (periodStart && creditsObj) {
+        const usage = await fetchJson(API_BASE + PATH_USAGE + orgQuery + "&since=" + encodeURIComponent(periodStart), rec.key);
+        const u = usage ? (usage.data || usage) : null;
+        const used = u && u.totalCost !== undefined ? num(u.totalCost) : num(u && u.totalMonthlyCredits);
+        const pools = ["monthlyCredits", "purchasedCredits", "freeCredits"]
+          .map((k) => num(creditsObj[k]))
+          .filter((v) => v !== undefined)
+          .map((v) => Math.max(0, v));
+        if (used !== undefined && pools.length > 0) {
+          const remaining = pools.reduce((s, v) => s + v, 0);
+          const limit = used + remaining;
+          report.creditsUsd = {
+            used,
+            remaining,
+            limit,
+            percent: limit > 0 ? Math.round((used / limit) * 1000) / 10 : 0,
+            expiresAt: sub.currentPeriodEnd || undefined
+          };
+        }
+      }
+      ok = true;
     }
-    report.stale = false;
   } catch (e) {
-    // 探测失败：保留上次成功值并标记 stale
+    // 探测失败：走下方统一失败路径
   }
-  cache.set(keyId, report);
+  // 决策 3：失败时保留上次成功值并标记 stale，绝不丢数据
+  // updatedAt：保留上次成功时间戳，避免前端误判为"刚刚更新"
+  const final = ok ? { ...report, stale: false } : {
+    fiveHour: prev && prev.fiveHour ? prev.fiveHour : null,
+    weekly: prev && prev.weekly ? prev.weekly : null,
+    creditsUsd: prev && prev.creditsUsd ? prev.creditsUsd : null,
+    updatedAt: prev ? prev.updatedAt : report.updatedAt,
+    stale: true
+  };
+  cache.set(keyId, final);
   persistCache();
-  applyLimits(keyId, report);
-  if (emitter) emitter.emit("quota", { keyId, report });
-  return report;
+  applyLimits(keyId, final);
+  if (emitter) emitter.emit("quota", { keyId, report: final });
+  return final;
 }
 
 // 决策 2：额度感知限制——5h/每周硬阈值、美元耗尽 → quota_limited

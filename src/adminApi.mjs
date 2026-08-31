@@ -23,11 +23,26 @@ function sendJson(res, status, data, extraHeaders) {
   res.end(JSON.stringify(data));
 }
 
-function readJsonBody(req) {
+function readJsonBody(req, opts = {}) {
+  const limit = opts.limit ?? 256 * 1024; // admin JSON 默认 256KB 上限
   return new Promise((resolveBody, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let size = 0;
+    let overflow = false;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) {
+        overflow = true;
+        // 丢弃后续数据，等待 end 再拒绝，避免破坏连接
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => {
+      if (overflow) {
+        reject(Object.assign(new Error("请求体过大"), { statusCode: 413 }));
+        return;
+      }
       try {
         resolveBody(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf-8")) : {});
       } catch {
@@ -55,15 +70,29 @@ function sanitizePoolPatch(body) {
       let v = Number(body[k]);
       if (!Number.isFinite(v)) continue;
       if (k === "maxRetries") v = Math.max(0, Math.min(10, Math.round(v)));
-      if (k === "sameKeyRetryCount") v = Math.max(0, Math.min(5, Math.round(v)));
-      if (k === "quotaRefreshMs") v = Math.max(5000, Math.round(v));
-      if (k === "historyRetentionDays") v = Math.max(1, Math.min(31, Math.round(v)));
+      else if (k === "sameKeyRetryCount") v = Math.max(0, Math.min(5, Math.round(v)));
+      else if (k === "sameKeyRetryDelayMs") v = Math.max(100, Math.min(10000, Math.round(v)));
+      else if (k === "sameKeyRetryMaxWaitMs") v = Math.max(500, Math.min(30000, Math.round(v)));
+      else if (k === "backoffBaseMs") v = Math.max(1000, Math.min(30000, Math.round(v)));
+      else if (k === "backoffMaxMs") v = Math.max(5000, Math.min(600000, Math.round(v)));
+      else if (k === "failoverCooldownMs") v = Math.max(0, Math.min(3600000, Math.round(v)));
+      else if (k === "fiveHourHardStop") v = Math.max(50, Math.min(100, Math.round(v)));
+      else if (k === "weeklyHardStop") v = Math.max(50, Math.min(100, Math.round(v)));
+      else if (k === "softStop") v = Math.max(50, Math.min(100, Math.round(v)));
+      else if (k === "quotaRefreshMs") v = Math.max(5000, Math.min(3600000, Math.round(v)));
+      else if (k === "historyRetentionDays") v = Math.max(1, Math.min(31, Math.round(v)));
+      else v = Math.round(v);
+      // 语义约束：backoffMax 必须 >= backoffBase，阈值需 softStop <= hardStop 在调用方处理
       patch[k] = v;
     } else if (k === "strategy") {
       if (["active-standby", "round-robin", "least-usage"].includes(body[k])) patch[k] = body[k];
     } else {
       patch[k] = !!body[k];
     }
+  }
+  // 交叉约束：backoffMaxMs 必须 >= backoffBaseMs
+  if (patch.backoffMaxMs !== undefined && patch.backoffBaseMs !== undefined) {
+    if (patch.backoffMaxMs < patch.backoffBaseMs) patch.backoffMaxMs = patch.backoffBaseMs;
   }
   return patch;
 }

@@ -118,9 +118,15 @@ function parseUsageFromSseLine(line) {
   return null;
 }
 
-async function pipeBody(upRes, res, isStream) {
+async function pipeBody(upRes, res, isStream, onAbort) {
   if (!isStream) {
-    const text = await upRes.text();
+    let text;
+    try {
+      text = await upRes.text();
+    } catch (e) {
+      if (onAbort) onAbort();
+      throw e;
+    }
     res.end(text);
     return parseUsageFromJson(text);
   }
@@ -144,16 +150,20 @@ async function pipeBody(upRes, res, isStream) {
       buffer = lines.pop() || "";
       for (const line of lines) {
         merge(parseUsageFromSseLine(line));
-        try { res.write(line + "\n"); } catch { try { reader.cancel(); } catch {} return usage; }
+        try { res.write(line + "\n"); } catch { try { reader.cancel(); } catch {} if (onAbort) onAbort(); return usage; }
       }
     }
     if (buffer.trim()) {
       merge(parseUsageFromSseLine(buffer.trim()));
       try { res.write(buffer); } catch {}
     }
-  } catch {
+  } catch (e) {
     // 客户端断开或上游中止
+    try { reader.cancel(); } catch {}
+    if (onAbort) onAbort();
+    return usage;
   }
+  try { res.end(); } catch {}
   return usage;
 }
 
@@ -189,12 +199,15 @@ export async function handleGateway(req, res, url) {
   }
 
   const poolCfg = pool.getPoolCfg();
-  const maxAttempts = Math.max(1, 1 + (poolCfg.maxRetries ?? 3));
+  // 文档语义：maxRetries = 额外重试次数（总尝试 = maxRetries + 1）
+  const maxAttempts = Math.max(1, (poolCfg.maxRetries ?? 3) + 1);
   const sameKeyMax = Math.max(0, poolCfg.sameKeyRetryCount ?? 2);
   let attempts = 0;
   let lastStatus = 429;
   let lastBody = null;
   const startedAt = Date.now();
+  const requestBudgetMs = 30000; // 单请求总预算，避免多 key 各 15s 串行过久
+  const deadlineAt = startedAt + requestBudgetMs;
 
   while (attempts < maxAttempts) {
     const chosen = pool.selectKey();
@@ -229,11 +242,13 @@ export async function handleGateway(req, res, url) {
         if (req.headers["x-session-id"]) headers["x-session-id"] = req.headers["x-session-id"];
         if (req.headers["x-claude-code-session-id"]) headers["x-claude-code-session-id"] = req.headers["x-claude-code-session-id"];
         let t;
+        const remainingMs = Math.max(1000, deadlineAt - Date.now());
+        const perAttemptMs = Math.min(15000, remainingMs);
         const timeoutP = new Promise((_, rej) => {
           t = setTimeout(() => {
             try { ac.abort(); } catch {}
             rej(Object.assign(new Error("upstream connect timeout"), { code: "CONNECT_TIMEOUT" }));
-          }, 15000);
+          }, perAttemptMs);
         });
         try {
           upRes = await Promise.race([
@@ -245,6 +260,20 @@ export async function handleGateway(req, res, url) {
         }
       } catch (e) {
         req.removeListener("close", onClose);
+        if (res.writableEnded || res.destroyed) {
+          // 客户端已断开：停止一切重试与响应写入
+          return;
+        }
+        const isTimeout = e && (e.code === "CONNECT_TIMEOUT" || /timeout/i.test(e.message || ""));
+        if (isTimeout) {
+          try { pool.recordTimeout(chosen.id); } catch {}
+          lastStatus = 502;
+          lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
+          stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 502, errorKind: "timeout", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+          if (Date.now() >= deadlineAt) break;
+          // 预算内才继续换 key 重试
+          break;
+        }
         lastStatus = 502;
         lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
@@ -252,7 +281,6 @@ export async function handleGateway(req, res, url) {
       }
 
       if (upRes.status === 200) {
-        req.removeListener("close", onClose);
         const ct = upRes.headers.get("content-type") || "";
         const isStream = stream && ct.includes("text/event-stream");
         const headers = { "content-type": ct || (isStream ? "text/event-stream" : "application/json") };
@@ -260,8 +288,35 @@ export async function handleGateway(req, res, url) {
           headers["cache-control"] = "no-cache";
           headers["connection"] = "keep-alive";
         }
+        let clientGone = false;
+        let pipeFailed = false;
+        const onDisconnect = () => {
+          clientGone = true;
+          try { ac.abort(); } catch {}
+        };
+        // 客户端断开时立即中断上游拉取（避免继续消耗 token/带宽），
+        // 并让 pipeBody 走中断路径；onClose 保持挂到管道结束为止。
+        // 必须在 writeHead 之前挂载，避免 writeHead 与挂监听之间的微任务间隙漏掉关闭事件。
+        req.on("close", onDisconnect);
         res.writeHead(200, headers);
-        const usage = await pipeBody(upRes, res, isStream);
+        let usage = null;
+        try {
+          usage = await pipeBody(upRes, res, isStream, onDisconnect);
+        } catch {
+          // pipeBody 内已处理；此处兜底（例如非流式读 body 抛错）
+          pipeFailed = true;
+        }
+        req.removeListener("close", onDisconnect);
+        req.removeListener("close", onClose);
+        if (clientGone) {
+          // 客户端已断开：不计成功、不记 stats（无法确认真实结果）
+          return;
+        }
+        if (pipeFailed) {
+          // 透传失败：不算成功（例如非流式 body 读取中断）
+          stats.appendEvent({ keyId: chosen.id, model, stream: isStream, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+          return;
+        }
         pool.recordSuccess(chosen.id);
         stats.appendEvent({
           keyId: chosen.id, model, stream: isStream, ok: true, status: 200,
@@ -290,7 +345,12 @@ export async function handleGateway(req, res, url) {
       if (isRateLimit) {
         lastStatus = 429;
         const mapped = mapError(429, text);
-        mapped.body.retry_after = retryAfterMs ? Math.ceil(retryAfterMs / 1000) : (mapped.body.retry_after ?? 30);
+        // Retry-After 为 0 表示“立即重试”，必须保留 0（不能回退成 30）。
+        // 注意：mapped.body.retry_after 已是 mapError 默认填的 30，下面的回退只在
+        // parseRetryAfter 既没解析到 header 也没解析到 body 时使用。
+        mapped.body.retry_after = retryAfterMs !== null
+          ? Math.ceil(retryAfterMs / 1000)
+          : (mapped.body.retry_after !== undefined ? mapped.body.retry_after : 30);
         lastBody = mapped.body;
         const zeroOut = isZeroOutput(text);
         // 决策 8：429/402/零输出先同 Key 重试；确属持续限流才退避 + 切换备 Key
@@ -298,8 +358,12 @@ export async function handleGateway(req, res, url) {
           (zeroOut || (retryAfterMs !== null && retryAfterMs <= (poolCfg.sameKeyRetryMaxWaitMs ?? 5000)));
         sameKeyTries++;
         if (retryable) {
-          const delay = Math.min(retryAfterMs ?? 2000, poolCfg.sameKeyRetryDelayMs ?? 2000);
-          await sleep(delay);
+          const delay = Math.min(retryAfterMs ?? 2000, poolCfg.sameKeyRetryDelayMs ?? 2000, Math.max(0, deadlineAt - Date.now()));
+          if (delay > 0) await sleep(delay);
+          if (Date.now() >= deadlineAt) { req.removeListener("close", onClose); break; }
+          // 等待期间客户端可能断开：中断重试
+          if (res.writableEnded || res.destroyed) { req.removeListener("close", onClose); return; }
+          req.removeListener("close", onClose);
           continue;
         }
         pool.recordRateLimit(chosen.id, retryAfterMs);
@@ -312,9 +376,11 @@ export async function handleGateway(req, res, url) {
       if (upRes.status >= 500 && upRes.status < 600) {
         lastStatus = upRes.status;
         lastBody = mapError(upRes.status, text).body;
-        if (!retriedOnce5xx && attempts < maxAttempts) {
+        if (!retriedOnce5xx && attempts < maxAttempts && Date.now() < deadlineAt) {
           retriedOnce5xx = true;
-          await sleep(500);
+          await sleep(Math.min(500, Math.max(0, deadlineAt - Date.now())));
+          if (res.writableEnded || res.destroyed) { req.removeListener("close", onClose); return; }
+          req.removeListener("close", onClose);
           continue;
         }
         req.removeListener("close", onClose);

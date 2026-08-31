@@ -7,7 +7,7 @@ let health = new Map();
 let poolCfg = {};
 let persistState = null;
 let usageProvider = null;   // (keyId) => 近 5h token 数（least-usage 策略用）
-let roundRobinIndex = 0;
+let roundRobinIndex = 0; // 内存态，重启重置；仅 round-robin 策略使用
 let emitter = null;
 
 export function initKeyPool(cfgPool, opts = {}) {
@@ -197,9 +197,18 @@ function quotaLimited(id) {
 }
 
 export function selectKey() {
-  const avail = keys.filter((k) =>
-    k.enabled && !inBackoff(k.id) && !quotaLimited(k.id) && !(health.get(k.id) && health.get(k.id).authError)
-  );
+  const cooldownMs = poolCfg.failoverCooldownMs ?? 600000;
+  const now = nowMs();
+  const avail = keys.filter((k) => {
+    if (!k.enabled) return false;
+    if (inBackoff(k.id)) return false;
+    if (quotaLimited(k.id)) return false;
+    const h = health.get(k.id);
+    if (h && h.authError) return false;
+    // failoverCooldown：刚发生过切换的 key 在冷却期内降低优先级（仅 active-standby 场景有效）
+    // 实现为：冷却期内该 key 仍可用，但当存在非冷却可用 key 时会被排后
+    return true;
+  });
   if (!avail.length) return null;
   let chosen = null;
   if (poolCfg.strategy === "round-robin") {
@@ -208,10 +217,24 @@ export function selectKey() {
   } else if (poolCfg.strategy === "least-usage" && typeof usageProvider === "function") {
     chosen = [...avail].sort((a, b) => (usageProvider(a.id) ?? 0) - (usageProvider(b.id) ?? 0))[0];
   } else {
-    chosen = avail[0];   // active-standby：数组顺序即优先级
+    // active-standby：冷却期内非主 key 优先选择未冷却的
+    if (cooldownMs > 0) {
+      const outsideCooldown = avail.filter((k) => {
+        const h = health.get(k.id);
+        return !h || !h.lastFailoverAt || (now - h.lastFailoverAt) >= cooldownMs;
+      });
+      if (outsideCooldown.length) {
+        // 保持主备顺序，选冷却期外优先级最高的
+        chosen = outsideCooldown[0];
+      } else {
+        chosen = avail[0];
+      }
+    } else {
+      chosen = avail[0];
+    }
   }
   const h = health.get(chosen.id);
-  if (h) h.lastUsedAt = nowMs();
+  if (h) h.lastUsedAt = now;
   return { id: chosen.id, key: chosen.key, alias: chosen.alias };
 }
 

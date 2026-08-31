@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CommandCode Proxy Manager</title>
+<link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+<header id="topbar" hidden>
+  <div class="brand">CC Proxy Manager</div>
+  <nav>
+    <button data-view="dashboard">总览</button>
+    <button data-view="keys">Key 管理</button>
+    <button data-view="history">历史记录</button>
+    <button data-view="settings">设置</button>
+    <button data-view="logs">日志</button>
+  </nav>
+  <div class="top-right">
+    <span id="tick"></span>
+    <button id="btn-logout" class="ghost">退出</button>
+  </div>
+</header>
+<main id="app"></main>
+<footer id="foot">commandcode-proxy-manager · 上游零改动打包 · 仅限学习研究</footer>
+<script type="module" src="/admin/app.mjs"></script>
+</body>
+</html>

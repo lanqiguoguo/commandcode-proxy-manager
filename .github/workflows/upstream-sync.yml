@@ -1,0 +1,38 @@
+name: upstream-sync
+on:
+  schedule:
+    - cron: "0 4 * * *"      # 决策 10：每天轮询上游正式版
+  workflow_dispatch:
+  repository_dispatch:
+    types: [upstream-release]
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Check latest upstream
+        id: check
+        run: |
+          CURRENT_TAG=$(cut -d@ -f1 UPSTREAM_VERSION)
+          CURRENT_COMMIT=$(cut -d@ -f2 UPSTREAM_VERSION)
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/MAXeaglet/commandcode-proxy/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*: *"//;s/"$//')
+          MASTER_HEAD=$(git ls-remote https://github.com/MAXeaglet/commandcode-proxy.git refs/heads/master | cut -f1)
+          NEED_SYNC=0
+          if [ -n "$LATEST_RELEASE" ] && [ "$LATEST_RELEASE" != "$CURRENT_TAG" ]; then NEED_SYNC=1; fi
+          if [ -z "$LATEST_RELEASE" ] && [ -n "$MASTER_HEAD" ] && [ "$MASTER_HEAD" != "$CURRENT_COMMIT" ]; then NEED_SYNC=1; fi
+          echo "need_sync=$NEED_SYNC" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT_TAG@$CURRENT_COMMIT latest_release=$LATEST_RELEASE master_head=$MASTER_HEAD"
+      - name: Sync upstream and commit
+        if: steps.check.outputs.need_sync == "1"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash scripts/sync-upstream.sh
+          git add upstream UPSTREAM_VERSION
+          git commit -m "chore: sync upstream $(cat UPSTREAM_VERSION)" || echo "nothing to commit"
+          git push

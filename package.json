@@ -1,0 +1,18 @@
+{
+  "name": "commandcode-proxy-manager",
+  "version": "0.1.0",
+  "description": "Multi-key management gateway for commandcode-proxy: active/standby key pool, 429 backoff, quota dashboard, zero-build admin SPA. Bundles the upstream proxy as-is.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "sync:upstream": "bash scripts/sync-upstream.sh",
+    "docker:build": "docker build -t commandcode-proxy-manager:latest .",
+    "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy-manager:latest ."
+  }
+}

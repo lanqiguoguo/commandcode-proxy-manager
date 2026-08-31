@@ -17,9 +17,13 @@ jobs:
         run: |
           V_TAG=$(cut -d@ -f1 UPSTREAM_VERSION)
           V_COMMIT=$(cut -d@ -f2 UPSTREAM_VERSION | cut -c1-12)
-          echo "tags=latest
-upstream-$V_TAG
-upstream-$V_COMMIT" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<TAGS_EOF"
+            echo "ghcr.io/${GITHUB_REPOSITORY}:latest"
+            echo "ghcr.io/${GITHUB_REPOSITORY}:upstream-${V_TAG}"
+            echo "ghcr.io/${GITHUB_REPOSITORY}:upstream-${V_COMMIT}"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Buildx
@@ -36,7 +40,4 @@ upstream-$V_COMMIT" >> "$GITHUB_OUTPUT"
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:upstream-$V_TAG
-            ghcr.io/${{ github.repository }}:upstream-$V_COMMIT
+          tags: ${{ steps.upstream.outputs.tags }}

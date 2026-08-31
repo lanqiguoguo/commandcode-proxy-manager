@@ -20,7 +20,7 @@ jobs:
         run: |
           CURRENT_TAG=$(cut -d@ -f1 UPSTREAM_VERSION)
           CURRENT_COMMIT=$(cut -d@ -f2 UPSTREAM_VERSION)
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/MAXeaglet/commandcode-proxy/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*: *"//;s/"$//')
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/MAXeaglet/commandcode-proxy/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
           MASTER_HEAD=$(git ls-remote https://github.com/MAXeaglet/commandcode-proxy.git refs/heads/master | cut -f1)
           NEED_SYNC=0
           if [ -n "$LATEST_RELEASE" ] && [ "$LATEST_RELEASE" != "$CURRENT_TAG" ]; then NEED_SYNC=1; fi
@@ -28,7 +28,7 @@ jobs:
           echo "need_sync=$NEED_SYNC" >> "$GITHUB_OUTPUT"
           echo "current=$CURRENT_TAG@$CURRENT_COMMIT latest_release=$LATEST_RELEASE master_head=$MASTER_HEAD"
       - name: Sync upstream and commit
-        if: steps.check.outputs.need_sync == "1"
+        if: steps.check.outputs.need_sync == '1'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

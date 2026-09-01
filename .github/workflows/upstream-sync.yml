@@ -7,6 +7,7 @@ on:
     types: [upstream-release]
 permissions:
   contents: write
+  pull-requests: write
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -22,17 +23,35 @@ jobs:
           CURRENT_COMMIT=$(cut -d@ -f2 UPSTREAM_VERSION)
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/MAXeaglet/commandcode-proxy/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
           MASTER_HEAD=$(git ls-remote https://github.com/MAXeaglet/commandcode-proxy.git refs/heads/master | cut -f1)
+          # 与新 sync-upstream.sh 语义一致：
+          # 有 release → 只比较 release tag；无 release → 回退比较 master HEAD（且当前记录须为 master，避免有 release 后每天空转）
           NEED_SYNC=0
-          if [ -n "$LATEST_RELEASE" ] && [ "$LATEST_RELEASE" != "$CURRENT_TAG" ]; then NEED_SYNC=1; fi
-          if [ -z "$LATEST_RELEASE" ] && [ -n "$MASTER_HEAD" ] && [ "$MASTER_HEAD" != "$CURRENT_COMMIT" ]; then NEED_SYNC=1; fi
+          if [ -n "$LATEST_RELEASE" ]; then
+            if [ "$LATEST_RELEASE" != "$CURRENT_TAG" ]; then NEED_SYNC=1; fi
+          else
+            if [ -n "$MASTER_HEAD" ] && [ "$MASTER_HEAD" != "$CURRENT_COMMIT" ] && [ "$CURRENT_TAG" = "master" ]; then NEED_SYNC=1; fi
+          fi
           echo "need_sync=$NEED_SYNC" >> "$GITHUB_OUTPUT"
           echo "current=$CURRENT_TAG@$CURRENT_COMMIT latest_release=$LATEST_RELEASE master_head=$MASTER_HEAD"
-      - name: Sync upstream and commit
+      - name: Sync upstream and open PR
         if: steps.check.outputs.need_sync == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           bash scripts/sync-upstream.sh
           git add upstream UPSTREAM_VERSION
-          git commit -m "chore: sync upstream $(cat UPSTREAM_VERSION)" || echo "nothing to commit"
-          git push
+          if git diff --cached --quiet; then
+            echo "No actual changes; skip PR."
+            exit 0
+          fi
+          BRANCH="chore/upstream-sync-$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+          git checkout -b "$BRANCH"
+          git commit -m "chore: sync upstream $(cat UPSTREAM_VERSION)"
+          git push origin "$BRANCH"
+          gh pr create \
+            --base "$GITHUB_REF_NAME" \
+            --head "$BRANCH" \
+            --title "chore: sync upstream $(cat UPSTREAM_VERSION)" \
+            --body "自动上游同步 PR：本 PR 由 upstream-sync workflow 生成，替换 vendored 的上游代码（upstream/ 目录）并更新 UPSTREAM_VERSION。属于第三方代码变更，请人工审阅后再合并。"

@@ -11,7 +11,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
-    "test": "node scripts/unit.mjs && node scripts/e2e.mjs",
+    "test": "node scripts/unit.mjs && node scripts/e2e.mjs && bash scripts/test-sync-upstream.sh",
     "test:unit": "node scripts/unit.mjs",
     "test:e2e": "node scripts/e2e.mjs",
     "sync:upstream": "bash scripts/sync-upstream.sh",

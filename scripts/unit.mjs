@@ -159,6 +159,30 @@ if (SC === "quota") {
   globalThis.fetch = async () => ({ ok: false, status: 401 });
   const t = await testKey("k1");
   check(t.ok === false && t.status === 401, "testKey → {ok:false,status:401}", JSON.stringify(t));
+
+  // ══ 真实 API 错误封装：HTTP 200 + success:false（实测 whoami 边缘节点抖动）══
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({ success: false, error: { code: "UNAUTHORIZED", status: 401, message: "x" } })
+  });
+  const t2 = await testKey("k1");
+  check(t2.ok === false, "testKey 识别 200+success:false 封装为失败（不再误报有效）", JSON.stringify(t2));
+
+  // 新 Key（无 prev）首次探测即失败 → updatedAt=null + error（前端据此显示"获取失败"而非"过期"）
+  quotaCalls.length = 0;
+  const r9 = await probeKey("k9"); // t2 桩：所有请求 200+success:false(UNAUTHORIZED)
+  check(r9 && r9.stale === true && r9.updatedAt === null && typeof r9.error === "string" && r9.error.includes("UNAUTHORIZED"), "首次探测失败 → stale 且 updatedAt=null + error", JSON.stringify(r9));
+  // 用 credits 200 封装验证 stale 报告带 error：
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/alpha/whoami")) return { ok: true, status: 200, json: async () => ({ success: true, data: { org: { id: "o1" } } }) };
+    return { ok: true, status: 200, json: async () => ({ success: false, error: { code: "RATE_UNAVAILABLE", status: 503 } }) };
+  };
+  quotaCalls.length = 0;
+  const r10 = await probeKey("k1");
+  check(r10.stale === true && typeof r10.error === "string" && r10.error.includes("RATE_UNAVAILABLE"), "stale 报告附带失败原因 error 字段", JSON.stringify(r10).slice(0, 200));
+  check(quotaCalls.length === 0, "stale 不触发额度限制", JSON.stringify(quotaCalls));
+  check(r10.fiveHour !== null && r10.fiveHour.percent === 50, "stale 保留上次成功的 fiveHour", JSON.stringify(r10.fiveHour));
 }
 
 // ════ keyPool ════

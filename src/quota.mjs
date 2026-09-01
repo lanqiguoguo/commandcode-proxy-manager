@@ -40,14 +40,34 @@ function startTimer() {
   if (timer.unref) timer.unref();
 }
 
+// 探测结果：{ data } 成功，{ err, status } 失败（err 供上层记入 stale 报告展示）。
+// 官方 API 存在两种失败形态：① HTTP 4xx/5xx；② HTTP 200 但 body 是
+// {"success":false,"error":{code,status,message}} 业务封装（实测 whoami 偶发，
+// 边缘节点/鉴权抖动）。fetchJson 只看 res.ok 会把后者当成功解析，导致
+// 下游读不到 credits/windowLimits 而误标 stale 却无原因可查。
 async function fetchJson(url, key) {
-  const res = await fetch(url, {
-    headers: { Accept: "application/json", Authorization: "Bearer " + key },
-    redirect: "error",
-    signal: AbortSignal.timeout(PROBE_TIMEOUT)
-  });
-  if (!res.ok) return null;
-  return res.json();
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { Accept: "application/json", Authorization: "Bearer " + key },
+      redirect: "error",
+      signal: AbortSignal.timeout(PROBE_TIMEOUT)
+    });
+  } catch (e) {
+    return { err: "network: " + (e.cause?.code || e.message), status: 0 };
+  }
+  if (!res.ok) {
+    let code = "";
+    try { const j = await res.json(); code = (j.error && (j.error.code || j.error.message)) || ""; } catch {}
+    return { err: "HTTP " + res.status + (code ? " " + code : ""), status: res.status };
+  }
+  let j;
+  try { j = await res.json(); } catch { return { err: "bad JSON", status: res.status }; }
+  if (j && j.success === false && j.error) {
+    // HTTP 200 但业务层报错：按失败处理（真实额度数据不会带 success:false 封装）
+    return { err: "api " + (j.error.code || j.error.status || "error"), status: j.error.status || res.status };
+  }
+  return { data: j };
 }
 
 function num(v) {
@@ -78,14 +98,17 @@ export async function probeKey(keyId) {
   const prev = cache.get(keyId) || null;
   const report = { fiveHour: null, weekly: null, creditsUsd: null, updatedAt: Date.now(), stale: true };
   let ok = false;
+  let probeErr = "";
   try {
-    const whoami = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
-    const w = (whoami && (whoami.data || whoami)) || {};
+    const whoamiR = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
+    if (whoamiR.err) probeErr = "whoami: " + whoamiR.err;
+    const w = (whoamiR.data && (whoamiR.data.data || whoamiR.data)) || {};
     const orgId = w.org && typeof w.org.id === "string" && w.org.id ? w.org.id : null;
     const orgQuery = orgId ? "?orgId=" + encodeURIComponent(orgId) : "";
 
-    const credits = await fetchJson(API_BASE + PATH_CREDITS + orgQuery, rec.key);
-    const body = credits ? (credits.data || credits) : null;
+    const creditsR = await fetchJson(API_BASE + PATH_CREDITS + orgQuery, rec.key);
+    if (creditsR.err) probeErr = "credits: " + creditsR.err;
+    const body = creditsR.data ? (creditsR.data.data || creditsR.data) : null;
     const creditsObj = body ? (body.credits || null) : null;
     const limits = body ? (body.windowLimits || null) : null;
     if (creditsObj || limits) {
@@ -95,12 +118,12 @@ export async function probeKey(keyId) {
       }
 
       // 订阅周期内美元额度（软失败，无周期起点时不展示）
-      const subs = await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key);
-      const sub = subs ? (subs.data || subs) : null;
+      const subsR = await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key);
+      const sub = subsR.data ? (subsR.data.data || subsR.data) : null;
       const periodStart = sub && typeof sub.currentPeriodStart === "string" ? sub.currentPeriodStart : "";
       if (periodStart && creditsObj) {
-        const usage = await fetchJson(API_BASE + PATH_USAGE + orgQuery + "&since=" + encodeURIComponent(periodStart), rec.key);
-        const u = usage ? (usage.data || usage) : null;
+        const usageR = await fetchJson(API_BASE + PATH_USAGE + orgQuery + "&since=" + encodeURIComponent(periodStart), rec.key);
+        const u = usageR.data ? (usageR.data.data || usageR.data) : null;
         const used = u && u.totalCost !== undefined ? num(u.totalCost) : num(u && u.totalMonthlyCredits);
         const pools = ["monthlyCredits", "purchasedCredits", "freeCredits"]
           .map((k) => num(creditsObj[k]))
@@ -119,17 +142,22 @@ export async function probeKey(keyId) {
         }
       }
       ok = true;
+      probeErr = "";
+    } else if (!probeErr) {
+      probeErr = "credits: no quota fields in response";
     }
   } catch (e) {
+    probeErr = probeErr || ("exception: " + e.message);
     // 探测失败：走下方统一失败路径
   }
   // 决策 3：失败时保留上次成功值并标记 stale，绝不丢数据
-  // updatedAt：保留上次成功时间戳，避免前端误判为"刚刚更新"
+  // updatedAt：保留上次成功时间戳；从未成功过时为 null（前端显示"获取失败"而非"过期"）
   const final = ok ? { ...report, stale: false } : {
     fiveHour: prev && prev.fiveHour ? prev.fiveHour : null,
     weekly: prev && prev.weekly ? prev.weekly : null,
     creditsUsd: prev && prev.creditsUsd ? prev.creditsUsd : null,
-    updatedAt: prev ? prev.updatedAt : report.updatedAt,
+    updatedAt: prev && prev.updatedAt ? prev.updatedAt : null,
+    error: probeErr || "probe failed",
     stale: true
   };
   cache.set(keyId, final);
@@ -188,12 +216,9 @@ export async function testKey(keyId) {
   const rec = pool.getKeyRecord(keyId);
   if (!rec) throw new Error("Key 不存在");
   try {
-    const res = await fetch(API_BASE + PATH_WHOAMI, {
-      headers: { Accept: "application/json", Authorization: "Bearer " + rec.key },
-      redirect: "error",
-      signal: AbortSignal.timeout(PROBE_TIMEOUT)
-    });
-    return { ok: res.ok, status: res.status };
+    const r = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
+    // fetchJson 已识别 HTTP 4xx 与 200+success:false 两种失败形态
+    return { ok: !r.err, status: r.err ? (r.status || 0) : 200 };
   } catch {
     return { ok: false, status: 0 };
   }

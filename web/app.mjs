@@ -221,7 +221,14 @@ function keyCard(k) {
   const five = q && q.fiveHour;
   const weekly = q && q.weekly;
   const usd = q && q.creditsUsd;
-  let quotaHtml = '<div class="muted small">额度数据：' + (q ? (q.stale ? "过期（上次 " + fmtTime(q.updatedAt) + "）" : "更新于 " + fmtTime(q.updatedAt)) : "未获取") + "</div>";
+  let quotaHtml = "";
+  if (q && q.stale) {
+    quotaHtml += '<div class="muted small">额度数据：' + (q.updatedAt ? "已过期（上次 " + fmtTime(q.updatedAt) + "）" : "获取失败") + (q.error ? ' · 原因: <span class="mono">' + esc(q.error) + "</span>" : "") + "</div>";
+  } else if (q) {
+    quotaHtml += '<div class="muted small">额度数据：更新于 ' + fmtTime(q.updatedAt) + "</div>";
+  } else {
+    quotaHtml += '<div class="muted small">额度数据：未获取</div>';
+  }
   if (five) quotaHtml += barHtml("5h 窗口", five.percent, five.used + " / " + five.cap + (five.resetAt ? " · 重置 " + fmtTime(Date.parse(five.resetAt)) : ""));
   else quotaHtml += '<div class="muted small">5h 窗口：无数据</div>';
   if (weekly) quotaHtml += barHtml("每周窗口", weekly.percent, weekly.used + " / " + weekly.cap + (weekly.resetAt ? " · 重置 " + fmtTime(Date.parse(weekly.resetAt)) : ""));

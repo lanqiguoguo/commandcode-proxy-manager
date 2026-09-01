@@ -22,6 +22,7 @@ const DEFAULTS = {
     sameKeyRetryMaxWaitMs: 5000,  // 上游 Retry-After 超过该值则视为真实限流直接切换
     backoffBaseMs: 5000,          // 退避基数（指数退避）
     backoffMaxMs: 120000,
+    connectTimeoutMs: 120000,     // 单尝试等待上游响应头的上限（需 > 上游自身 90s 非流式/30s 流式超时，纯兜底）
     failoverCooldownMs: 600000,   // 切换冷却，防止抖动
     fiveHourHardStop: 90,         // 5h 窗口硬阈值（%）
     weeklyHardStop: 90,           // 每周窗口硬阈值（%）

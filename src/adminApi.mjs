@@ -55,11 +55,11 @@ function readJsonBody(req, opts = {}) {
 
 const POOL_FIELDS = [
   "strategy", "maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs",
-  "backoffBaseMs", "backoffMaxMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
+  "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
   "softStop", "quotaRefreshMs", "zeroOutputCountsAs429", "historyRetentionDays"
 ];
 const INT_FIELDS = ["maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs",
-  "backoffBaseMs", "backoffMaxMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
+  "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
   "softStop", "quotaRefreshMs", "historyRetentionDays"];
 
 function sanitizePoolPatch(body) {
@@ -75,6 +75,7 @@ function sanitizePoolPatch(body) {
       else if (k === "sameKeyRetryMaxWaitMs") v = Math.max(500, Math.min(30000, Math.round(v)));
       else if (k === "backoffBaseMs") v = Math.max(1000, Math.min(30000, Math.round(v)));
       else if (k === "backoffMaxMs") v = Math.max(5000, Math.min(600000, Math.round(v)));
+      else if (k === "connectTimeoutMs") v = Math.max(1000, Math.min(300000, Math.round(v)));
       else if (k === "failoverCooldownMs") v = Math.max(0, Math.min(3600000, Math.round(v)));
       else if (k === "fiveHourHardStop") v = Math.max(50, Math.min(100, Math.round(v)));
       else if (k === "weeklyHardStop") v = Math.max(50, Math.min(100, Math.round(v)));

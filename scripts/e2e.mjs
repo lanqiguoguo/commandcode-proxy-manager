@@ -251,23 +251,41 @@ async function main() {
   r = await http1(MG + "/health", "GET", {});
   r.status === 200 ? ok("断连场景后 manager 存活") : bad("断连存活", "health=" + r.status);
 
-  // ── T11 慢非流式（KNOWN: P1-1）──
+  // ── T11 慢非流式（P1-1 修复后：合法慢生成不再被误杀）──
   console.log("\n=== T11 slow non-stream ===");
   await restartClean();
   ks = await keysList();
   const idB11 = ks.find((k) => k.alias === "keyB").id;
-  await admin("/admin/api/keys/" + idB11, "PUT", { enabled: false }); // 单 Key 池场景：超时即终局
+  await admin("/admin/api/keys/" + idB11, "PUT", { enabled: false }); // 单 Key 池场景
+  await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "delay", delayMs: 18000 }] });
   t0 = Date.now();
   r = await gw({ model: "m-slow", messages: [] });
   const dt11 = Date.now() - t0;
+  r.status === 200 && r.body.includes("slow-ok") && dt11 >= 17000
+    ? ok("18s 慢生成完整返回 200（P1-1 已修复）", dt11 + "ms") : bad("P1-1 慢生成", "status=" + r.status + " dt=" + dt11 + " body=" + r.body.slice(0, 120));
+  ks = await keysList();
+  ks.find((k) => k.alias === "keyA").health.failCount === 0
+    ? ok("慢生成成功不误伤 Key 健康") : bad("慢生成健康", JSON.stringify(ks.find((k) => k.alias === "keyA").health));
   await admin("/admin/api/keys/" + idB11, "PUT", { enabled: true });
-  // KNOWN-ISSUE P1-1：当前 15s 头超时误杀慢生成（真实上游非流式在生成完成前不写头）
-  knownIssue(
-    r.status === 502 && /timeout/i.test(r.body) && dt11 < 16000,
-    "P1-1 18s 慢生成被 15s 头超时误杀 — 修复后应完整返回 200",
-    "status=" + r.status + " dt=" + dt11 + " body=" + r.body.slice(0, 120)
-  );
+
+  // ── T11b 真超时：connectTimeoutMs=3000 时挂死上游 → 超时退避 + 切换备 Key ──
+  await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 3000 });
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "hang" }] });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "ok" }] });
+  t0 = Date.now();
+  r = await gw({ model: "m-timeout", messages: [] });
+  const dt11b = Date.now() - t0;
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  r.status === 200 && calls.length === 2 && dt11b >= 2500 && dt11b < 8000
+    ? ok("connectTimeout=3s：挂死 → 超时退避 → 切 keyB 成功", dt11b + "ms") : bad("超时切换", "status=" + r.status + " dt=" + dt11b + " calls=" + calls.length);
+  r = await admin("/admin/api/history?errorKind=timeout");
+  JSON.parse(r.body).total >= 1 ? ok("timeout 事件记录") : bad("timeout 事件", r.body.slice(0, 120));
+  ks = await keysList();
+  ks.find((k) => k.alias === "keyA").health.backoffUntilMs > Date.now()
+    ? ok("超时 Key 进入退避") : bad("超时退避", "");
+  await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 120000 });
 
   // ── T12 maxRetries 预算 ──
   console.log("\n=== T12 retry budget ===");

@@ -206,7 +206,7 @@ export async function handleGateway(req, res, url) {
   let lastStatus = 429;
   let lastBody = null;
   const startedAt = Date.now();
-  const requestBudgetMs = 30000; // 单请求总预算，避免多 key 各 15s 串行过久
+  const requestBudgetMs = 30000; // 同Key重试/退避等待的总预算（不限制单次等待上游响应头，见 connectTimeoutMs）
   const deadlineAt = startedAt + requestBudgetMs;
 
   while (attempts < maxAttempts) {
@@ -242,8 +242,9 @@ export async function handleGateway(req, res, url) {
         if (req.headers["x-session-id"]) headers["x-session-id"] = req.headers["x-session-id"];
         if (req.headers["x-claude-code-session-id"]) headers["x-claude-code-session-id"] = req.headers["x-claude-code-session-id"];
         let t;
-        const remainingMs = Math.max(1000, deadlineAt - Date.now());
-        const perAttemptMs = Math.min(15000, remainingMs);
+        // 等待上游响应头的超时：connectTimeoutMs 默认 120s（上游非流式 90s / 流式 30s 自身超时
+        // 会先返回 JSON，网关侧纯兜底），不能用 30s 总预算压缩单次等待——否则合法的慢生成会被误杀
+        const perAttemptMs = poolCfg.connectTimeoutMs ?? 120000;
         const timeoutP = new Promise((_, rej) => {
           t = setTimeout(() => {
             try { ac.abort(); } catch {}

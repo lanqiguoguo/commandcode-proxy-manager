@@ -3,6 +3,7 @@
 //   1) 请求 body 的 testMode 字段（经网关原样转发的 body 传递）
 //   2) POST /__control {auth, responses:[{mode,...}]} 设置该 Key 的响应队列（优先）
 // 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | server5xx | hang | delay(delayMs)
+//          | cutstream（200 SSE 写数帧后 destroy，模拟上游流中途断连）| cutbody（200 JSON 写半身后 destroy）
 // 管理端点：GET /__calls 调用记录；GET /__slow slowsse 断流观测；POST /__reset 清空
 import http from "http";
 import { setTimeout as sleep } from "timers/promises";
@@ -118,6 +119,24 @@ const server = http.createServer((req, res) => {
       if (!aborted) { res.write("data: [DONE]\n\n"); res.end(); }
       slowLog.push({ frames, aborted, auth });
       console.log(`[mock] slowsse finished frames=${frames} abortedEarly=${aborted}`);
+      return;
+    }
+    if (spec.mode === "cutstream") {
+      // 上游在 200 SSE 吐出若干帧后 socket 死亡（客户端仍在）：P1-1 复现用
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      res.write('data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"to"},"finish_reason":null}]}\n\n');
+      await sleep(30);
+      res.write('data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"ken"},"finish_reason":null}]}\n\n');
+      await sleep(50);
+      try { res.destroy(); } catch {}
+      return;
+    }
+    if (spec.mode === "cutbody") {
+      // 非流式：200 头 + 半个 JSON body 后 socket 死亡：P1-1 复现用
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"id":"chatcmpl-cut","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"half');
+      await sleep(30); // 确保头+部分内容已递交网关（真实场景为上游生成中途断流）
+      try { res.destroy(); } catch {}
       return;
     }
     if (spec.mode === "sse") {

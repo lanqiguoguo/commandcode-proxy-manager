@@ -122,17 +122,24 @@ function parseUsageFromSseLine(line) {
   return null;
 }
 
-async function pipeBody(upRes, res, isStream, onAbort) {
+// 返回 { usage, err }：err = null（正常完成）| "client"（客户端断开）| "upstream"（上游中途断连）。
+// isClientGone(): 调用方闭包，判定客户端是否已断开（断开检测优先于分类，避免误判上游故障）。
+async function pipeBody(upRes, res, isStream, isClientGone) {
+  // 已 broken 的流上 cancel() 返回 rejected promise（undici "terminated"），同步 try/catch 接不住，
+  // 会成为 unhandledRejection —— 统一挂 noop catch 消除次生拒绝噪音。
+  const safeCancel = (reader) => {
+    try { const p = reader.cancel(); if (p && typeof p.catch === "function") p.catch(() => {}); } catch {}
+  };
   if (!isStream) {
     let text;
     try {
       text = await upRes.text();
-    } catch (e) {
-      if (onAbort) onAbort();
-      throw e;
+    } catch {
+      // body 读取中断：客户端断开（abort 致 text 拒绝）或上游 socket 死亡
+      return { usage: null, err: isClientGone() ? "client" : "upstream" };
     }
     res.end(text);
-    return parseUsageFromJson(text);
+    return { usage: parseUsageFromJson(text), err: null };
   }
   const reader = upRes.body.getReader();
   const decoder = new TextDecoder();
@@ -154,21 +161,20 @@ async function pipeBody(upRes, res, isStream, onAbort) {
       buffer = lines.pop() || "";
       for (const line of lines) {
         merge(parseUsageFromSseLine(line));
-        try { res.write(line + "\n"); } catch { try { reader.cancel(); } catch {} if (onAbort) onAbort(); return usage; }
+        try { res.write(line + "\n"); } catch { safeCancel(reader); return { usage, err: "client" }; }
       }
     }
     if (buffer.trim()) {
       merge(parseUsageFromSseLine(buffer.trim()));
-      try { res.write(buffer); } catch {}
+      try { res.write(buffer); } catch { safeCancel(reader); return { usage, err: "client" }; }
     }
-  } catch (e) {
-    // 客户端断开或上游中止
-    try { reader.cancel(); } catch {}
-    if (onAbort) onAbort();
-    return usage;
+  } catch {
+    // read() 拒绝：客户端断开（res close → abort）或上游 socket 死亡
+    safeCancel(reader);
+    return { usage, err: isClientGone() ? "client" : "upstream" };
   }
   try { res.end(); } catch {}
-  return usage;
+  return { usage, err: null };
 }
 
 function sleep(ms) {
@@ -310,23 +316,28 @@ export async function handleGateway(req, res, url) {
         }
         // 客户端断开检测复用 res 'close'（activeAc 已指向本尝试的 controller）：
         // 断开即 abort 上游拉取，pipeBody 走中断路径；不记成功事件。
-        let pipeFailed = false;
+        const isClientGone = () => clientGone || ac.signal.aborted;
         res.writeHead(200, headers);
         let usage = null;
+        let pipeErr = null;
         try {
-          usage = await pipeBody(upRes, res, isStream, null);
+          ({ usage, err: pipeErr } = await pipeBody(upRes, res, isStream, isClientGone));
         } catch {
-          // pipeBody 内已处理；此处兜底（例如非流式读 body 抛错）
-          pipeFailed = true;
+          // pipeBody 已不抛出；此处纯兜底（如 writeHead/end 意外抛错）
+          pipeErr = isClientGone() ? "client" : "upstream";
         }
         activeAc = null;
         if (clientGone) {
           // 客户端已断开：不计成功、不记 stats（无法确认真实结果）
           return;
         }
-        if (pipeFailed) {
-          // 透传失败：不算成功（例如非流式 body 读取中断）
+        if (pipeErr === "client") return;
+        if (pipeErr === "upstream") {
+          // 上游中途断连：200 头 + 部分内容已写出，不能重试（会重复输出）；
+          // 必须收尾 res——否则客户端在 keep-alive 下收不到流终止信号，挂起到自身超时。
+          // destroy 前 activeAc 已置 null，'close' 置位的 clientGone 不再影响本请求（已 return）。
           stats.appendEvent({ keyId: chosen.id, model, stream: isStream, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+          try { res.destroy(); } catch {}
           return;
         }
         pool.recordSuccess(chosen.id);

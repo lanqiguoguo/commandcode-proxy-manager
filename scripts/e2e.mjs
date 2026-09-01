@@ -53,16 +53,39 @@ async function waitUp(url, timeout = 20000) {
 }
 
 let mgr;
+let mgrStderr = ""; // 始终捕获：供 P1-1 用例断言无 unhandledRejection 噪音
 async function startMgr(env = {}) {
   mgr = spawn("node", [resolve(ROOT, "src/server.mjs")], {
     env: { ...process.env, DATA_DIR: DATA, PORT: "3088", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP, ...env },
     stdio: ["ignore", "pipe", "pipe"]
   });
+  mgrStderr = "";
+  mgr.stderr.on("data", (d) => { mgrStderr += d; if (process.env.E2E_VERBOSE) process.stderr.write("[mgr!] " + d); });
   if (process.env.E2E_VERBOSE) {
     mgr.stdout.on("data", (d) => process.stdout.write("[mgr] " + d));
-    mgr.stderr.on("data", (d) => process.stderr.write("[mgr!] " + d));
   }
   if (!await waitUp(MG + "/health")) throw new Error("manager not up");
+}
+// 原始 HTTP 请求 + 超时 race：验证连接被有限时间内终止（end/aborted/ECONNRESET），
+// 而非挂死到 race 超时（HANG）。resolve 永不 reject。
+function rawGwOnce(bodyObj, timeoutMs = 8000) {
+  const t0 = performance.now();
+  return Promise.race([
+    new Promise((resolveP) => {
+      const req = http.request(MG + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT }
+      }, (res) => {
+        let txt = "";
+        res.on("data", (c) => (txt += c));
+        res.on("end", () => resolveP({ outcome: "end", ms: Math.round(performance.now() - t0), txt }));
+        res.on("aborted", () => resolveP({ outcome: "aborted", ms: Math.round(performance.now() - t0), txt }));
+      });
+      req.on("error", (e) => resolveP({ outcome: "error:" + (e.code || e.message), ms: Math.round(performance.now() - t0), txt: "" }));
+      req.end(JSON.stringify(bodyObj));
+    }),
+    sleep(timeoutMs).then(() => ({ outcome: "HANG", ms: timeoutMs, txt: "" }))
+  ]);
 }
 function stopMgr() { return new Promise((r) => { if (!mgr) return r(); mgr.on("exit", r); try { mgr.kill("SIGTERM"); } catch { return r(); } setTimeout(r, 3000); }); }
 async function restartClean() {
@@ -247,6 +270,64 @@ async function main() {
   ev = JSON.parse(r.body).items[0];
   ev && ev.stream && ev.ok && ev.inputTokens === 3 && ev.outputTokens === 4 && ev.cachedTokens === 2
     ? ok("流式 usage 3/4/2") : bad("流式 usage", JSON.stringify(ev));
+
+  // ── T9b 上游流中途断连（P1-1 修复后：客户端不挂起、不误记成功、记 upstream 失败）──
+  console.log("\n=== T9b upstream mid-stream cut (P1-1) ===");
+  await restartClean();
+  // 预置 failCount=1：hang → connectTimeout(1.2s) → recordTimeout。
+  // 修复后若误走 recordSuccess 会被清零——用非零基线才能区分“未误清”与“误清后再次退避”。
+  await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 1200, backoffBaseMs: 1000 });
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "hang" }] });
+  await gw({ model: "m-seed-fail", messages: [] }).catch(() => {});
+  await sleep(300);
+  ks = await keysList();
+  const hSeed = ks.find((k) => k.alias === "keyA").health;
+  const idA9b = ks.find((k) => k.alias === "keyA").id;
+  hSeed.failCount === 1 ? ok("基线：keyA failCount=1（timeout 退避）") : bad("基线 failCount", JSON.stringify(hSeed));
+  await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 120000 });
+  await sleep(1300); // 退避（base=1s）过期，keyA 可再次被选中但不清零 failCount
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "cutstream" }] });
+  const stderrMark = mgrStderr.length;
+  t0 = performance.now();
+  const cutRes = await rawGwOnce({ model: "m-cut", messages: [], stream: true });
+  const cutDt = Math.round(performance.now() - t0);
+  cutRes.outcome !== "HANG" && cutDt < 6000 && cutRes.txt.includes("chat.completion.chunk")
+    ? ok("上游断流：客户端有限时间终止（" + cutRes.outcome + " " + cutDt + "ms，已收到部分内容）")
+    : bad("P1-1 流式挂起", "outcome=" + cutRes.outcome + " dt=" + cutDt + " txt=" + JSON.stringify(cutRes.txt.slice(0, 60)));
+  await sleep(250);
+  r = await admin("/admin/api/history?keyId=" + idA9b + "&errorKind=upstream&status=502");
+  let upstreamEv = JSON.parse(r.body);
+  upstreamEv.total === 1 && upstreamEv.items[0].ok === false && upstreamEv.items[0].model === "m-cut"
+    ? ok("恰 1 条 ok:false errorKind=upstream status:502 事件") : bad("upstream 事件", JSON.stringify(upstreamEv).slice(0, 200));
+  r = await admin("/admin/api/history?keyId=" + idA9b + "&status=200");
+  JSON.parse(r.body).items.every((e) => e.model !== "m-cut")
+    ? ok("无 m-cut 成功事件（未误走 recordSuccess 分支）") : bad("误记成功", r.body.slice(0, 200));
+  ks = await keysList();
+  ks.find((k) => k.alias === "keyA").health.failCount === 1
+    ? ok("failCount 未被 recordSuccess 误清（仍=1）") : bad("误清退避", JSON.stringify(ks.find((k) => k.alias === "keyA").health));
+  mgrStderr.slice(stderrMark).includes("unhandledRejection")
+    ? bad("P1-1 拒绝噪音", mgrStderr.slice(stderrMark).trim().split("\n").slice(0, 3).join(" | "))
+    : ok("上游断流无 unhandledRejection 噪音");
+  r = await http1(MG + "/health", "GET", {});
+  r.status === 200 ? ok("断流场景后 manager 存活") : bad("断流存活", "health=" + r.status);
+
+  // ── T9c 非流式 body 中途断连（P1-1：pipeFailed 路径收尾 res）──
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "cutbody" }] });
+  const stderrMark2 = mgrStderr.length;
+  const cutbRes = await rawGwOnce({ model: "m-cutb", messages: [] });
+  cutbRes.outcome !== "HANG" && cutbRes.ms < 6000
+    ? ok("非流式半身断连：客户端有限时间终止（" + cutbRes.outcome + " " + cutbRes.ms + "ms）")
+    : bad("P1-1 非流式挂起", "outcome=" + cutbRes.outcome + " ms=" + cutbRes.ms);
+  await sleep(250);
+  r = await admin("/admin/api/history?keyId=" + idA9b + "&errorKind=upstream&status=502");
+  JSON.parse(r.body).total === 2
+    ? ok("cutbody 也记 ok:false upstream 事件（累计 2 条）") : bad("cutbody 事件", r.body.slice(0, 200));
+  mgrStderr.slice(stderrMark2).includes("unhandledRejection")
+    ? bad("cutbody 拒绝噪音", mgrStderr.slice(stderrMark2).trim().split("\n").slice(0, 3).join(" | "))
+    : ok("非流式断连无 unhandledRejection 噪音");
 
   // ── T10 客户端断连（KNOWN: P2-1）──
   console.log("\n=== T10 client disconnect ===");

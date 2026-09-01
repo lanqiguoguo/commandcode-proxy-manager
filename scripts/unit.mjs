@@ -3,7 +3,8 @@
 //   keyPool 选 Key（主备/退避/authError/软限制降级/排除已试/冷却）
 //   stats 保留清理（回放/prune/retention clamp/权限）
 //   logs 持久化 + 上游 proxy 日志捕获（时序/去重/脱敏/src 过滤）
-// 用法：node scripts/unit.mjs [quota|pool|stats|logs]   （缺省依次全部跑，每场景独立子进程）
+//   state 防抖写盘 flush 语义（P2-4：立即落盘/幂等/清 timer/未调度 no-op）
+// 用法：node scripts/unit.mjs [quota|pool|stats|logs|state]   （缺省依次全部跑，每场景独立子进程）
 import { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -13,7 +14,7 @@ const SC = process.argv[2];
 if (!SC) {
   // runner 模式：逐场景子进程执行（DATA_DIR 在各子进程 import 前注入，互不污染）
   let failed = false;
-  for (const s of ["quota", "pool", "stats", "logs", "tokens"]) {
+  for (const s of ["quota", "pool", "stats", "logs", "tokens", "state"]) {
     const code = await new Promise((resolveP) => {
       const p = spawn(process.execPath, [fileURLToPath(import.meta.url), s], { stdio: "inherit" });
       p.on("exit", (c) => resolveP(c));
@@ -387,6 +388,60 @@ if (SC === "tokens") {
   check(safeEqual(null, null) === false, "null×2 → false");
   check(safeEqual(123, "123") === false, "非字符串数字 → false");
   check(safeEqual({}, {}) === false, "对象入参 → false");
+}
+
+// ════ state（P2-4 防抖 flush 语义）════
+if (SC === "state") {
+  console.log("=== state 防抖写盘 flush（P2-4） ===");
+  // DATA_DIR 在本进程 import state.mjs 前已设（见文件头），config.mjs 冻结的就是临时目录
+  const { debouncedWriter, flushAllPending, readJson } = await import("../src/state.mjs");
+  const delayMs = 2000; // 远大于用例内等待 → 落盘只可能来自 flush，而非 timer 触发
+
+  // 1) schedule() 后不等 delayMs，flush 立即落盘且内容 = flush 时刻的 getData()
+  let payload = { v: 1 };
+  const w1 = debouncedWriter("t1.json", () => payload, delayMs);
+  w1();
+  payload = { v: 2 }; // getData 在 flush 时才取值 → 应写入 2
+  const t0 = Date.now();
+  flushAllPending();
+  const dt = Date.now() - t0;
+  check(dt < 500, "flush 即时返回（未等 2000ms 防抖）", "dt=" + dt + "ms");
+  check(readJson("t1.json", null) && readJson("t1.json", null).v === 2, "flush 立即落盘且取 flush 时刻数据", JSON.stringify(readJson("t1.json", null)));
+
+  // 2) 同一 writer 重复 flush 幂等：不报错、不重复写（第二次不得用新数据再写）
+  w1.flush();
+  payload = { v: 3 };
+  flushAllPending(); // w1 已无 timer → no-op；内容必须仍是 2
+  check(readJson("t1.json", null).v === 2, "重复 flush 幂等 no-op（数据不变不报错）", JSON.stringify(readJson("t1.json", null)));
+
+  // 3) flush 必须 clear旧 timer：payload 已改为 v=3，若 2000ms 后文件仍是 2，
+  //    证明 flush 调用了 clearTimeout（否则残留 timer 会用 getData()=3 回写）
+  payload = { v: 3 };
+  await new Promise((r) => setTimeout(r, delayMs + 500));
+  check(readJson("t1.json", null).v === 2, "flush 后残留 timer 已清除（超时后不回写新数据）", JSON.stringify(readJson("t1.json", null)));
+  const w3 = debouncedWriter("t3.json", () => ({ v: "auto" }), 200);
+  w3(); // 未 flush 的短延迟 writer：验证 timer 仍照常自动落盘（原语义不回归）
+  await new Promise((r) => setTimeout(r, 400));
+  check(readJson("t3.json", null) && readJson("t3.json", null).v === "auto", "未 flush 时防抖 timer 自动落盘（旧行为保留）");
+  // flush 后可再 schedule/flush；全量 flushAllPending 对混合状态 writer 均不抛错
+  w1();
+  w1.flush();
+  flushAllPending();
+  check(readJson("t1.json", null).v === 3, "flush 后可再 schedule，数据更新可再次落盘", JSON.stringify(readJson("t1.json", null)));
+
+  // 4) 从未 schedule 的 writer：flush 是 no-op，不产生文件
+  const w4 = debouncedWriter("t4.json", () => ({ x: 1 }), delayMs);
+  w4.flush();
+  check(readJson("t4.json", "MISSING") === "MISSING", "未调度的 writer flush 不写盘", String(readJson("t4.json", "MISSING")));
+
+  // 5) 信号路径模拟：schedule 后进程"退出前"flushAllPending → 数据不丢
+  let live = { backoff: 42 };
+  const w5 = debouncedWriter("t5.json", () => live, delayMs);
+  w5();
+  live = { backoff: 43 };
+  flushAllPending();
+  const saved = readJson("t5.json", null);
+  check(saved && saved.backoff === 43, "防抖窗口内 flushAllPending 不丢待写数据（信号路径前提）", JSON.stringify(saved));
 }
 
 console.log(`\n=== unit(${SC}) summary: ${pass} passed, ${fail} failed ===`);

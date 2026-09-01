@@ -4,7 +4,7 @@
 import http from "http";
 import { performance } from "perf_hooks";
 import { spawn } from "child_process";
-import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from "fs";
+import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -195,6 +195,109 @@ async function main() {
   await restartClean();
   r = await gw({ model: "m-recover", messages: [] });
   r.status === 200 ? ok("退避清除后恢复服务") : bad("恢复", "status=" + r.status);
+
+  // ── T5c SIGTERM 退出前 flush 防抖待写（P2-4 端到端，真实信号验证）──
+  // 修复前的竞争窗口：markAuthError 仅 schedule()（1000ms 防抖），SIGTERM 后
+  // server.close() 回调（Node ≥18.4 立即销毁空闲 keep-alive 连接，已实测）几乎瞬时
+  // process.exit(0) —— 防抖 timer 从未触发 → authError 丢失。修复后信号处理进入即
+  // flushAllPending() 同步写盘 → 磁盘含 authError。本用例修复前必红、修复后必绿，
+  // 且 killLag<950ms 断言证明落盘来自 flush 而非 timer（timer 在 1000ms 后才可能触发）。
+  console.log("\n=== T5c SIGTERM flush (P2-4) ===");
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "auth" }] });
+  r = await gw({ model: "m-flush", messages: [] });
+  r.status === 401 ? ok("T5c 预置 401（markAuthError 已 schedule 1s 防抖待写）") : bad("T5c 预置 401", "status=" + r.status);
+  ks = await keysList(); // 一次进程内快速 HTTP（≪100ms），不破坏防抖窗口
+  const idA5c = ks.find((k) => k.alias === "keyA").id;
+  const t5cKill0 = performance.now();
+  await new Promise((re) => { mgr.on("exit", re); mgr.kill("SIGTERM"); setTimeout(re, 4000); });
+  const killLag = Math.round(performance.now() - t5cKill0);
+  killLag < 950 ? ok("T5c 进程在防抖窗口(<1000ms)内退出，timer 不可能已触发", killLag + "ms") : bad("T5c 退出时序", killLag + "ms ≥ 防抖窗口，无法证明 flush 价值");
+  const st5c = JSON.parse(readFileSync(resolve(DATA, "state.json"), "utf-8"));
+  const h5c = (st5c.keys || {})[idA5c] || {};
+  h5c.authError === true && h5c.backoffUntilMs > Date.now()
+    ? ok("T5c SIGTERM flush 已落盘 authError（修复前此处必为旧值/缺失）", JSON.stringify(h5c))
+    : bad("T5c flush 落盘", JSON.stringify(h5c));
+  // 手工清理 authError（不 restartClean：mgr 已退出，其 stopMgr 会白等 3s 兜底）
+  {
+    const stPath = resolve(DATA, "state.json");
+    const st = JSON.parse(readFileSync(stPath, "utf-8"));
+    for (const h of Object.values(st.keys || {})) { h.backoffUntilMs = 0; h.failCount = 0; h.quotaLimitedUntil = 0; h.authError = false; }
+    writeFileSync(stPath, JSON.stringify(st));
+  }
+  await startMgr();
+  await mock("/__reset");
+
+  // ── T5d 损坏 config.json 备份（P2-1：不再静默覆盖致凭证永久丢失）──
+  // 独立 DATA/端口，手工 spawn，不触碰主流程 DATA 与全局 mgr。
+  console.log("\n=== T5d corrupt config backup (P2-1) ===");
+  {
+    const D5d = "/tmp/ccpm-e2e-corrupt";
+    rmSync(D5d, { recursive: true, force: true });
+    mkdirSync(D5d, { recursive: true });
+    writeFileSync(resolve(D5d, "config.json"), "{ not json");
+    const TOK5d = "e2e-fixed-admin-tok-9f8e";
+    const U5d = "http://" + HOST + ":3089";
+    const p5d = spawn("node", [resolve(ROOT, "src/server.mjs")], {
+      env: { ...process.env, DATA_DIR: D5d, PORT: "3089", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: TOK5d, CLIENT_TOKEN: TOK5d, CC_QUOTA_BASE: UP },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let out5d = "";
+    p5d.stdout.on("data", (d) => { out5d += d; });
+    p5d.stderr.on("data", (d) => { out5d += d; });
+    (await waitUp(U5d + "/health")) ? ok("T5d 损坏 config 下服务正常启动（默认值+env）") : bad("T5d 启动", out5d.slice(0, 300));
+    const corruptFiles = readdirSync(D5d).filter((f) => /^config\.json\.corrupt-\d+$/.test(f));
+    const backupRaw = corruptFiles.length === 1 ? readFileSync(resolve(D5d, corruptFiles[0]), "utf-8") : null;
+    corruptFiles.length === 1 && backupRaw === "{ not json"
+      ? ok("T5d 损坏文件备份为 config.json.corrupt-<ts> 且原内容逐字保留", corruptFiles[0])
+      : bad("T5d 备份", "files=" + corruptFiles.join(",") + " content=" + JSON.stringify(backupRaw));
+    out5d.includes("解析失败，已备份为") ? ok("T5d 启动日志含明确备份警告") : bad("T5d 日志", out5d.slice(0, 300));
+    r = await http1(U5d + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5d }));
+    r.status === 200 ? ok("T5d 磁盘无 token → env 填充（衔接 P2-2），FIXED 令牌登录成功") : bad("T5d login", "status=" + r.status);
+    let cfg5d = null;
+    try { cfg5d = JSON.parse(readFileSync(resolve(D5d, "config.json"), "utf-8")); } catch {}
+    cfg5d && cfg5d.adminToken === TOK5d ? ok("T5d 新 config.json 为合法 JSON 且已持久化 token") : bad("T5d 新 config", JSON.stringify(cfg5d).slice(0, 150));
+    p5d.kill("SIGTERM");
+    await new Promise((re) => { p5d.on("exit", re); setTimeout(re, 3000); });
+    rmSync(D5d, { recursive: true, force: true });
+  }
+
+  // ── T5e env 令牌不再回滚磁盘凭证（P2-2）──
+  // 独立 DATA：首启用 env A 建立磁盘令牌 → 保留 DATA 换 env B 重启 → A 仍可登录、B 被拒。
+  // 修复前：B 启动即把磁盘覆写回 B → A 登录 401（红）。不用 restartClean/主 DATA，避免清理干扰。
+  console.log("\n=== T5e env token no-rollback (P2-2) ===");
+  {
+    const D5e = "/tmp/ccpm-e2e-tokenkeep";
+    const TOK5eA = "e2e-disk-token-A-aaaa";
+    const TOK5eB = "e2e-env-token-B-bbbb";
+    const U5e = "http://" + HOST + ":3090";
+    const spawn5e = (tok) => spawn("node", [resolve(ROOT, "src/server.mjs")], {
+      env: { ...process.env, DATA_DIR: D5e, PORT: "3090", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: tok, CLIENT_TOKEN: tok, CC_QUOTA_BASE: UP },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const kill5e = (p) => new Promise((re) => { p.on("exit", re); p.kill("SIGTERM"); setTimeout(re, 3000); });
+    rmSync(D5e, { recursive: true, force: true });
+    mkdirSync(D5e, { recursive: true });
+    let p5e = spawn5e(TOK5eA);
+    const upA5e = await waitUp(U5e + "/health");
+    upA5e ? ok("T5e 首次启动（env=A）正常") : bad("T5e 首次启动", D5e);
+    let cfg5e = null;
+    try { cfg5e = JSON.parse(readFileSync(resolve(D5e, "config.json"), "utf-8")); } catch {}
+    cfg5e && cfg5e.adminToken === TOK5eA ? ok("T5e 磁盘 config.json 已建立 token=A") : bad("T5e 首启落盘", JSON.stringify(cfg5e && cfg5e.adminToken));
+    await kill5e(p5e);
+    p5e = spawn5e(TOK5eB);
+    const upB5e = await waitUp(U5e + "/health");
+    if (!upB5e) bad("T5e 二次启动（env=B）", D5e);
+    r = await http1(U5e + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5eA }));
+    const okA = r.status === 200;
+    okA ? ok("T5e env=B 重启后磁盘 token=A 仍有效（未回滚）") : bad("T5e A 登录", "status=" + r.status);
+    r = await http1(U5e + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5eB }));
+    const okB = r.status === 401;
+    okB ? ok("T5e env=B 未获得登录权（env 不覆写非空磁盘值）") : bad("T5e B 登录应 401", "status=" + r.status);
+    upB5e && okA && okB ? ok("T5e 综合：P2-2 语义正确") : bad("T5e 综合", "up=" + upB5e + " A=" + okA + " B=" + okB);
+    await kill5e(p5e);
+    rmSync(D5e, { recursive: true, force: true });
+  }
 
   // ── T6 上游 401 → authError、不重试不切换、透传 401 ──
   console.log("\n=== T6 auth error ===");
@@ -623,18 +726,28 @@ async function main() {
   // ── T18d model 类型/长度校验（P1-4 源头）──
   console.log("\n=== T18d model validation (P1-4) ===");
   await restartClean();
+  // 注意：gateway 在 res.end() 之后才 appendEvent，且同毫秒事件排序并列——
+  // 取 items[0] + 固定 sleep 在负载下有竞态，改为按谓词轮询（ts 下限排除历史事件）。
+  const waitForEvent = async (pred, timeoutMs = 6000) => {
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeoutMs) {
+      const rr = await admin("/admin/api/history?pageSize=20");
+      const hit = JSON.parse(rr.body).items.find(pred);
+      if (hit) return hit;
+      await sleep(100);
+    }
+    return null;
+  };
   const longModel = "m-" + "x".repeat(200);
+  let tMark = Date.now();
   r = await gw({ model: longModel, messages: [] });
-  await sleep(200);
-  r = await admin("/admin/api/history?pageSize=1");
-  ev = JSON.parse(r.body).items[0];
-  r.status === 200 && ev && ev.model === longModel.slice(0, 128) && ev.model.length === 128
-    ? ok("超长 model → 历史记录截断为 128 字符", "len=" + (ev && ev.model.length)) : bad("model 截断", JSON.stringify(ev && ev.model.slice(0, 40)));
+  ev = await waitForEvent((e) => e.model === longModel.slice(0, 128) && e.ts >= tMark);
+  r.status === 200 && ev && ev.model.length === 128
+    ? ok("超长 model → 历史记录截断为 128 字符", "len=" + (ev && ev.model.length)) : bad("model 截断", "status=" + r.status + " ev=" + JSON.stringify(ev && ev.model.slice(0, 40)));
+  tMark = Date.now();
   r = await gw({ model: { evil: true }, messages: [] });
-  await sleep(200);
-  r = await admin("/admin/api/history?pageSize=1");
-  ev = JSON.parse(r.body).items[0];
-  r.status === 200 && ev && ev.model === "" ? ok("非字符串 model → 记录空串且请求正常代理") : bad("model 非字符串", "status=" + r.status + " ev=" + JSON.stringify(ev));
+  ev = await waitForEvent((e) => e.model === "" && e.ts >= tMark);
+  r.status === 200 && ev && ev.ok === true ? ok("非字符串 model → 记录空串且请求正常代理") : bad("model 非字符串", "status=" + r.status + " ev=" + JSON.stringify(ev));
 
   // ── T19 /v1/models + /v1/messages 路由 ──
   console.log("\n=== T19 routes ===");

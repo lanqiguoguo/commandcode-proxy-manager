@@ -24,13 +24,35 @@ export function writeJson(name, data) {
   }
 }
 
+// P2-4：模块级待写注册表。每个 debouncedWriter 创建时自注册，进程收到
+// SIGTERM/SIGINT 时由 flushAllPending() 在退出前同步落盘，防止恰好处于
+// 防抖窗口的退避/健康/额度数据丢失。quota.mjs/keyPool.mjs 无需改动。
+const pending = new Set();
+
 export function debouncedWriter(name, getData, delayMs = 1000) {
   let timer = null;
-  return function schedule() {
+  const schedule = function () {
     if (timer) return;
     timer = setTimeout(() => {
       timer = null;
       writeJson(name, getData());
     }, delayMs);
   };
+  // 附带 .flush()：有未决 timer 时取消并立即同步写盘；无 timer（从未调度/
+  // 已写）幂等 no-op。writeJson 为同步 writeFileSync+renameSync，信号回调
+  // （事件循环 tick 边界）里调用安全。
+  schedule.flush = function () {
+    if (!timer) return;
+    clearTimeout(timer);
+    timer = null;
+    writeJson(name, getData());
+  };
+  pending.add(schedule);
+  return schedule;
+}
+
+export function flushAllPending() {
+  for (const fn of pending) {
+    try { fn.flush && fn.flush(); } catch (e) { console.error("[state] flush failed:", e.message); }
+  }
 }

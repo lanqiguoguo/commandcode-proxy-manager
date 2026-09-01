@@ -1,4 +1,5 @@
-// ── 管理端配置加载（config.json 位于 DATA_DIR，环境变量优先） ─────
+// ── 管理端配置加载（config.json 位于 DATA_DIR；基础设施 env 覆写磁盘，
+//    令牌 env 仅在磁盘无值时初始化填充——磁盘凭证优先，防改密后被 env 回滚） ─────
 import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from "fs";
 import { resolve } from "path";
 import crypto from "crypto";
@@ -40,6 +41,9 @@ export function loadConfig() {
   mkdirSync(DATA_DIR, { recursive: true });
   const path = resolve(DATA_DIR, "config.json");
   const data = JSON.parse(JSON.stringify(DEFAULTS));
+  // P2-1：解析失败先把损坏文件备份为 config.json.corrupt-<ts> 再落默认值，
+  // 防止结尾 saveConfig() 用默认/新生成凭证原子覆盖磁盘导致旧凭证永久丢失（锁死）。
+  let configCorrupt = false;
   if (existsSync(path)) {
     try {
       const user = JSON.parse(readFileSync(path, "utf-8"));
@@ -49,15 +53,38 @@ export function loadConfig() {
       }
     } catch (e) {
       console.error("[config] failed to parse config.json:", e.message);
+      configCorrupt = true;
+    }
+    if (configCorrupt) {
+      const backup = path + ".corrupt-" + Date.now();
+      try {
+        renameSync(path, backup);
+        console.warn("[config] config.json 解析失败，已备份为 " + backup.split("/").pop() + "，本次以默认值启动");
+      } catch (be) {
+        // 备份失败也不能崩：继续用默认值启动，但明确警告凭证可能丢失
+        console.error("[config] 损坏的 config.json 备份失败: " + be.message + " —— 旧配置未能备份，凭证可能丢失");
+      }
     }
   }
-  // 环境变量覆写
+  // 环境变量覆写（基础设施配置）
   if (process.env.PORT) data.port = parseInt(process.env.PORT, 10) || data.port;
   if (process.env.HOST) data.host = process.env.HOST;
-  if (process.env.ADMIN_TOKEN) data.adminToken = process.env.ADMIN_TOKEN;
-  if (process.env.CLIENT_TOKEN) data.clientToken = process.env.CLIENT_TOKEN;
   if (process.env.UPSTREAM_PORT) data.upstreamPort = parseInt(process.env.UPSTREAM_PORT, 10) || data.upstreamPort;
   if (process.env.UPSTREAM_HOST) data.upstreamHost = process.env.UPSTREAM_HOST;
+  // P2-2：令牌 env 仅在磁盘无值时填充（初始化语义）。此前无条件覆写会让
+  // UI 经 /admin/api/security 改密后、带遗留 env 重启时把令牌静默回滚为旧 env 值。
+  if (process.env.ADMIN_TOKEN) {
+    if (!data.adminToken) data.adminToken = process.env.ADMIN_TOKEN;
+    else if (data.adminToken !== process.env.ADMIN_TOKEN) {
+      console.warn("[config] 忽略环境变量 ADMIN_TOKEN（磁盘 config.json 已有值，如需以 env 为准请先清空磁盘令牌）");
+    }
+  }
+  if (process.env.CLIENT_TOKEN) {
+    if (!data.clientToken) data.clientToken = process.env.CLIENT_TOKEN;
+    else if (data.clientToken !== process.env.CLIENT_TOKEN) {
+      console.warn("[config] 忽略环境变量 CLIENT_TOKEN（磁盘 config.json 已有值，如需以 env 为准请先清空磁盘令牌）");
+    }
+  }
 
   if (!data.adminToken) {
     data.adminToken = crypto.randomBytes(24).toString("hex");

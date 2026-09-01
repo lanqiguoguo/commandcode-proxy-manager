@@ -11,6 +11,7 @@ import { initStats, usageProviderForPool } from "./stats.mjs";
 import { initLogs, attachConsoleCapture } from "./logs.mjs";
 import { handleGateway } from "./gateway.mjs";
 import { initAdminApi, handleAdmin } from "./adminApi.mjs";
+import { flushAllPending } from "./state.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -148,9 +149,13 @@ server.listen(cfg.port, cfg.host, () => {
   }
 });
 
+// P2-4：进入即先同步 flush 防抖待写数据（state.json/quota-cache.json），再走优雅
+// 关闭。SSE 常连接会让 server.close 回调永不触发——2s 兜底硬退出前数据已落盘。
+// 重复信号（连按 Ctrl-C）安全：flushAllPending 对已 flush 的 writer 幂等 no-op。
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
     console.log("[manager] received " + sig + ", shutting down");
+    flushAllPending();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
   });

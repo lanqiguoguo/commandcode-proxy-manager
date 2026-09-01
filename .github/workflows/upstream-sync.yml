@@ -1,7 +1,7 @@
 name: upstream-sync
 on:
   schedule:
-    - cron: "0 4 * * *"      # 决策 10：每天轮询上游正式版
+    - cron: "0 20 * * *"     # 决策 10：每天轮询上游正式版（UTC 20:00 = 北京时间次日凌晨 4 点）
   workflow_dispatch:
   repository_dispatch:
     types: [upstream-release]

@@ -14,7 +14,9 @@ function sendJson(res, status, data, extraHeaders) {
   if (res.writableEnded || res.destroyed) return;
   const headers = { "Content-Type": "application/json" };
   if (extraHeaders) Object.assign(headers, extraHeaders);
-  if (data && data.retry_after !== undefined) headers["Retry-After"] = String(data.retry_after);
+  // 显式传入的 Retry-After（出口按最新池状态计算）优先于 body 中可能过期的 retry_after
+  if (data && data.retry_after !== undefined && headers["Retry-After"] === undefined)
+    headers["Retry-After"] = String(data.retry_after);
   res.writeHead(status, headers);
   res.end(JSON.stringify(data));
 }

@@ -11,7 +11,7 @@ export function initAdminApi(emitterRef) {
   emitter = emitterRef;
   emitter.on("log", (entry) => {
     logRing.push({ ts: Date.now(), level: entry.level || "info", msg: entry.msg });
-    if (logRing.length > 500) logRing.shift();
+    if (logRing.length > 2000) logRing.shift(); // DESIGN §6：内存环形缓冲 2000 条
   });
 }
 

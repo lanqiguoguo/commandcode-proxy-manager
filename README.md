@@ -115,6 +115,7 @@ Anthropic SDK：base_url 指向 http://127.0.0.1:3080 ，x-api-key 填 clientTok
 ## 开发
 
     npm run dev       # watch 模式
+    npm test          # 单元测试（scripts/unit.mjs）+ 端到端测试（scripts/e2e.mjs，mock 上游）
 
 ## 安全说明
 

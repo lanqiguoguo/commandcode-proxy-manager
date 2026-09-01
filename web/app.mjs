@@ -460,6 +460,9 @@ async function exportCsv() {
   a.download = "ccpm-history-" + new Date().toISOString().slice(0, 10) + ".csv";
   a.click();
   URL.revokeObjectURL(a.href);
+  if (data.total > (data.items || []).length) {
+    alert("已导出 " + data.items.length + " 条（上限 500/次），共匹配 " + data.total + " 条；请用时间/Key 筛选缩小范围后分批导出");
+  }
 }
 function csvCell(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
 
@@ -477,6 +480,7 @@ function renderSettings() {
     field("sameKeyRetryMaxWaitMs", "同 Key 重试最大等待 ms", "number", null, p.sameKeyRetryMaxWaitMs) +
     field("backoffBaseMs", "退避基数 ms", "number", null, p.backoffBaseMs) +
     field("backoffMaxMs", "退避上限 ms", "number", null, p.backoffMaxMs) +
+    field("connectTimeoutMs", "上游响应头超时 ms", "number", null, p.connectTimeoutMs) +
     field("failoverCooldownMs", "切换冷却 ms", "number", null, p.failoverCooldownMs) +
     field("fiveHourHardStop", "5h 硬阈值 %", "number", null, p.fiveHourHardStop) +
     field("weeklyHardStop", "每周硬阈值 %", "number", null, p.weeklyHardStop) +
@@ -512,7 +516,7 @@ function field(id, label, type, options, value) {
 }
 
 async function savePool() {
-  const ids = ["strategy", "maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs", "backoffBaseMs", "backoffMaxMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop", "softStop", "quotaRefreshMs", "historyRetentionDays"];
+  const ids = ["strategy", "maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs", "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop", "softStop", "quotaRefreshMs", "historyRetentionDays"];
   const body = {};
   for (const id of ids) {
     const el = document.getElementById("f-" + id);
@@ -544,12 +548,22 @@ async function saveSecurity() {
   }
 }
 
-// ── 日志 ──
+// ── 日志 ──（DESIGN §6：按 Key 过滤；SSE log 事件与轮询共用同一渲染）
 function renderLogs() {
+  const sel = state.logFilterKeyId || "";
+  const filtered = sel ? state.logs.filter((l) => l.msg.includes(sel)) : state.logs;
   app.innerHTML = "<h2>日志</h2>" +
+    '<div class="card mb"><label>按 Key 过滤：</label>' +
+    '<select id="log-filter"><option value="">全部</option>' +
+    state.keys.map((k) => '<option value="' + esc(k.id) + '"' + (k.id === sel ? " selected" : "") + ">" + esc(k.alias || k.maskedKey) + "</option>").join("") +
+    "</select></div>" +
     '<div class="card"><div class="log-list" id="log-list">' +
-    state.logs.map((l) => "<div>[" + fmtTime(l.ts) + "] " + esc(l.msg) + "</div>").join("") +
+    filtered.map((l) => "<div>[" + fmtTime(l.ts) + "] " + esc(l.msg) + "</div>").join("") +
     "</div></div>";
+  document.getElementById("log-filter").addEventListener("change", (e) => {
+    state.logFilterKeyId = e.target.value;
+    renderLogs();
+  });
 }
 
 async function loadLogs() {

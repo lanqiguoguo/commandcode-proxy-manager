@@ -178,3 +178,20 @@
 3. **P1-3/P1-4/P1-5 凭证与注入面**（恒定时间比较 + login 限速 + csvCell 中和 + model 截断 + Secure cookie）。
 4. **P1-6**：usage 数值强转一行修 + `/admin/*` CSP（需先做 P2-7 的 onclick 重构）。
 5. P2-1/P2-2 凭证持久化语义、P2-4 优雅关闭 flush。
+
+---
+
+## 修复落地记录（2026-09-02，按上述顺序串行执行）
+
+每项均由子代理实施 + 主代理复核 diff + 独立全量回归 + dev 服务端对端验证后提交。测试规模从基线 100（e2e）增长到 144（e2e）+ 87（unit）+ 8（sync fixture），全程 0 失败。
+
+| 修复项 | 覆盖缺陷 | commit | 验证要点 |
+|---|---|---|---|
+| 1 CI 供应链 | P1-2、P2-9 | `2c9b909` | sync 脚本 release-tag 优先 + file:// fixture 3 场景 8 断言；workflow 改开 PR + npm test 门禁；NEED_SYNC 决策矩阵 6 组仿真 |
+| 2 流中断收尾 | P1-1 | `1ae22ee` | pipeBody 返回 {usage,err} 三态分类；e2e T9b/T9c（红→绿：failCount 非零基线防误清、事件计数、stderr 噪音断言）；dev curl 断流 104ms 终止（exit 18）、正常 SSE [DONE]+usage 不回退 |
+| 3 凭证与注入 | P1-3、P1-4、P1-5 | `bf155af` | src/tokens.mjs safeEqual（SHA-256+timingSafeEqual）4 处替换；login 按 IP 限速（15min/10 次，成功复位）；model 截 128+类型守卫；csvCell 公式中和；SECURE_COOKIES 条件 Secure；dev 实测 10×401→429→正确登录复位、两种模式 Set-Cookie/logout 属性一致 |
+| 4 数据面净化+CSP | P1-6、P2-7（附带 P2-8 源头） | `768af56` | gateway num() 全 usage 路径强转 + JSON.parse null 守卫；stats sanitizeNumeric 六字段；web fmtTok 双保险；8 onclick+1 ontoggle → document 委托（click 冒泡/toggle 捕获）；esc 补 &#39;；/admin/* CSP(noscript 级 script-src 'self') + nosniff；badusage mock 注入实测净化为 0；委托路由 vm 假 DOM 10 断言 |
+| 5 配置与关闭 | P2-4、P2-1、P2-2 | `39e8f29` | debouncedWriter 自注册 + schedule.flush() 幂等；信号处理器进入即 flushAllPending；损坏 config 备份 .corrupt-<ts>；令牌 env 仅磁盘空时初始化+不等告警。T5c 真实 SIGTERM <1000ms 退出后 authError 落盘（含反向红测验证用例可红）。附带：主代理定位 T18d 为既存测试脆弱性（items[0]+固定 sleep 在同毫秒排序下竞态）并加固为按谓词轮询 |
+| 文档 | P2-2 措辞 | `b439208` | README 环境变量表：令牌类"仅磁盘无值时初始化生效" |
+
+未处理项（本次范围外，留待后续）：P2-3（CORS `*` 收窄，涉及部署兼容性需用户决策）、P2-5/6/10/11/12/13 及各 P3 条目。

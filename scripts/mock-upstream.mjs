@@ -19,6 +19,8 @@ function json(res, status, data, headers) {
 }
 
 const server = http.createServer((req, res) => {
+  res.on("error", () => {}); // 客户端（网关）abort 后写响应以异步 error 失败，静默
+  req.on("error", () => {});
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", async () => {

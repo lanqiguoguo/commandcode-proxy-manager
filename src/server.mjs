@@ -12,6 +12,14 @@ import { handleGateway } from "./gateway.mjs";
 import { initAdminApi, handleAdmin } from "./adminApi.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// 客户端断连 abort 会让 undici 以 AbortError 拒绝内部 promise；无此守卫时（EMBED_UPSTREAM=0
+// 或上游先于守卫注册前的启动窗口）进程会被未处理拒绝打崩。与上游 proxy.mjs 同款兜底。
+process.on("unhandledRejection", (reason) => {
+  if (reason && (reason.name === "AbortError" || reason.code === "ABORT_ERR")) return;
+  console.error("[manager] unhandledRejection:", (reason && reason.message) || String(reason));
+});
+
 const cfg = loadConfig();
 
 // 1) 启动上游（vendored，同进程动态 import，零改动）

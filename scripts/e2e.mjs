@@ -82,6 +82,10 @@ async function main() {
   mkdirSync(DATA, { recursive: true });
   const mockProc = spawn("node", [resolve(ROOT, "scripts/mock-upstream.mjs")], { env: { ...process.env, MOCK_PORT: "3051", MOCK_HOST: HOST }, stdio: ["ignore", "pipe", "pipe"] });
   if (process.env.E2E_VERBOSE) mockProc.stdout.on("data", (d) => process.stdout.write("[mock] " + d));
+  else mockProc.stdout.resume();
+  mockProc.stderr.on("data", (d) => process.stderr.write("[mock!] " + d));
+  let e2eDone = false;
+  mockProc.on("exit", (code, sig) => { if (!e2eDone) { console.error("mock died code=" + code + " sig=" + sig); process.exitCode = 2; } });
   if (!await waitUp(UP + "/health")) { console.error("mock not up"); process.exit(2); }
   await startMgr();
 
@@ -242,12 +246,9 @@ async function main() {
   });
   await sleep(1000);
   const slow = JSON.parse((await mockGet("/__slow")).body).slowLog;
-  // KNOWN-ISSUE P2-1：当前实现断连后不中断上游拉取（req close 竞态）
-  knownIssue(
-    slow.length === 1 && slow[0].aborted === false && slow[0].frames === 15,
-    "P2-1 客户端断开后上游流未被中断（mock 观测 frames=15 aborted=false）— 修复后应 aborted=true",
-    JSON.stringify(slow)
-  );
+  // P2-1 修复后：断连应中断上游拉取（aborted=true，frames<15）
+  slow.length === 1 && slow[0].aborted === true && slow[0].frames < 15
+    ? ok("客户端断开中断上游拉取（P2-1 已修复）", "frames=" + slow[0].frames) : bad("P2-1 断连中断", JSON.stringify(slow));
   r = await http1(MG + "/health", "GET", {});
   r.status === 200 ? ok("断连场景后 manager 存活") : bad("断连存活", "health=" + r.status);
 
@@ -440,6 +441,7 @@ async function main() {
   console.log(`\n=== summary: ${pass} passed, ${fail} failed, ${known} known-issue ===`);
   if (failures.length) { console.log("Failures:"); for (const f of failures) console.log(" - " + f.name + ": " + f.detail); }
   await stopMgr();
+  e2eDone = true;
   try { mockProc.kill("SIGTERM"); } catch {}
   await sleep(300);
   process.exit(fail ? 1 : 0);

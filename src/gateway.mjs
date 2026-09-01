@@ -10,6 +10,8 @@ function upstreamBase() {
 }
 
 function sendJson(res, status, data, extraHeaders) {
+  // 客户端已断开：不再写入（避免 destroyed 响应上的 end 触发异步 error）
+  if (res.writableEnded || res.destroyed) return;
   const headers = { "Content-Type": "application/json" };
   if (extraHeaders) Object.assign(headers, extraHeaders);
   if (data && data.retry_after !== undefined) headers["Retry-After"] = String(data.retry_after);
@@ -198,6 +200,20 @@ export async function handleGateway(req, res, url) {
     } catch {}
   }
 
+  // 客户端断开检测绑在 res 上：req 可读流被 readBody 消费完后即 destroy，其 'close'
+  // 事件往往在后文注册监听之前就已发射（监听永不触发）；res 随连接结束才关闭，事件可靠。
+  // 注意 res 'close' 在正常 end 之后同样会发射，必须用 writableEnded 区分“已完成”与“被掐断”。
+  let clientGone = false;
+  let activeAc = null;
+  // 断开后对 res 的写入会以异步 error 事件失败（EPIPE 等）；无 listener 的 'error' 会抛穿进程，
+  // 这里静默吞掉（连接已死，无法也无需再报告给客户端）。
+  res.on("error", () => {});
+  res.on("close", () => {
+    if (res.writableEnded) return;
+    clientGone = true;
+    if (activeAc) { try { activeAc.abort(); } catch {} }
+  });
+
   const poolCfg = pool.getPoolCfg();
   // 文档语义：maxRetries = 额外重试次数（总尝试 = maxRetries + 1）
   const maxAttempts = Math.max(1, (poolCfg.maxRetries ?? 3) + 1);
@@ -227,10 +243,7 @@ export async function handleGateway(req, res, url) {
     while (true) {
       attempts++;
       const ac = new AbortController();
-      const onClose = () => {
-        if (!res.writableEnded) { try { ac.abort(); } catch {} }
-      };
-      req.on("close", onClose);
+      activeAc = ac;
       let upRes = null;
       try {
         const url2 = upstreamBase() + upstreamPath;
@@ -260,9 +273,9 @@ export async function handleGateway(req, res, url) {
           clearTimeout(t);
         }
       } catch (e) {
-        req.removeListener("close", onClose);
-        if (res.writableEnded || res.destroyed) {
+        if (clientGone || res.writableEnded || res.destroyed) {
           // 客户端已断开：停止一切重试与响应写入
+          activeAc = null;
           return;
         }
         const isTimeout = e && (e.code === "CONNECT_TIMEOUT" || /timeout/i.test(e.message || ""));
@@ -289,26 +302,18 @@ export async function handleGateway(req, res, url) {
           headers["cache-control"] = "no-cache";
           headers["connection"] = "keep-alive";
         }
-        let clientGone = false;
+        // 客户端断开检测复用 res 'close'（activeAc 已指向本尝试的 controller）：
+        // 断开即 abort 上游拉取，pipeBody 走中断路径；不记成功事件。
         let pipeFailed = false;
-        const onDisconnect = () => {
-          clientGone = true;
-          try { ac.abort(); } catch {}
-        };
-        // 客户端断开时立即中断上游拉取（避免继续消耗 token/带宽），
-        // 并让 pipeBody 走中断路径；onClose 保持挂到管道结束为止。
-        // 必须在 writeHead 之前挂载，避免 writeHead 与挂监听之间的微任务间隙漏掉关闭事件。
-        req.on("close", onDisconnect);
         res.writeHead(200, headers);
         let usage = null;
         try {
-          usage = await pipeBody(upRes, res, isStream, onDisconnect);
+          usage = await pipeBody(upRes, res, isStream, null);
         } catch {
           // pipeBody 内已处理；此处兜底（例如非流式读 body 抛错）
           pipeFailed = true;
         }
-        req.removeListener("close", onDisconnect);
-        req.removeListener("close", onClose);
+        activeAc = null;
         if (clientGone) {
           // 客户端已断开：不计成功、不记 stats（无法确认真实结果）
           return;
@@ -335,7 +340,7 @@ export async function handleGateway(req, res, url) {
 
       if (upRes.status === 401 || upRes.status === 403) {
         pool.markAuthError(chosen.id);
-        req.removeListener("close", onClose);
+        activeAc = null;
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "auth", retries: attempts - 1, latencyMs: Date.now() - startedAt });
         const mapped = mapError(upRes.status, text);
         sendJson(res, mapped.status, mapped.body);
@@ -361,15 +366,15 @@ export async function handleGateway(req, res, url) {
         if (retryable) {
           const delay = Math.min(retryAfterMs ?? 2000, poolCfg.sameKeyRetryDelayMs ?? 2000, Math.max(0, deadlineAt - Date.now()));
           if (delay > 0) await sleep(delay);
-          if (Date.now() >= deadlineAt) { req.removeListener("close", onClose); break; }
+          activeAc = null;
+          if (Date.now() >= deadlineAt) break;
           // 等待期间客户端可能断开：中断重试
-          if (res.writableEnded || res.destroyed) { req.removeListener("close", onClose); return; }
-          req.removeListener("close", onClose);
+          if (clientGone || res.writableEnded || res.destroyed) return;
           continue;
         }
         pool.recordRateLimit(chosen.id, retryAfterMs);
         pool.recordFailover(chosen.id);
-        req.removeListener("close", onClose);
+        activeAc = null;
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 429, errorKind: "rate_limit", retries: attempts - 1, latencyMs: Date.now() - startedAt });
         break;
       }
@@ -380,17 +385,17 @@ export async function handleGateway(req, res, url) {
         if (!retriedOnce5xx && attempts < maxAttempts && Date.now() < deadlineAt) {
           retriedOnce5xx = true;
           await sleep(Math.min(500, Math.max(0, deadlineAt - Date.now())));
-          if (res.writableEnded || res.destroyed) { req.removeListener("close", onClose); return; }
-          req.removeListener("close", onClose);
+          activeAc = null;
+          if (clientGone || res.writableEnded || res.destroyed) return;
           continue;
         }
-        req.removeListener("close", onClose);
+        activeAc = null;
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
         break;
       }
 
       // 其余状态（400/404/422...）：透传，不重试
-      req.removeListener("close", onClose);
+      activeAc = null;
       stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "client", retries: attempts - 1, latencyMs: Date.now() - startedAt });
       const mapped = mapError(upRes.status, text);
       sendJson(res, mapped.status, mapped.body);
@@ -398,6 +403,7 @@ export async function handleGateway(req, res, url) {
     }
   }
 
+  if (clientGone || res.writableEnded || res.destroyed) return;
   const wait = Math.max(1, Math.ceil((pool.nextRetryAfterMs() || 5000) / 1000));
   const finalBody = lastBody || { error: { message: "All API keys unavailable", type: "rate_limit_error" }, retry_after: wait };
   sendJson(res, lastStatus === 502 ? 502 : 429, finalBody, { "Retry-After": String(wait) });

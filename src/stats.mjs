@@ -64,7 +64,8 @@ export function appendEvent(ev) {
   const event = { ts: Date.now(), ...ev };
   events.push(event);
   try {
-    appendFileSync(resolve(DATA_DIR, FILE), JSON.stringify(event) + "\n");
+    // mode 0o600：文件已存在时忽略，仅创建时生效（DESIGN §9.4 全部数据文件 600）
+    appendFileSync(resolve(DATA_DIR, FILE), JSON.stringify(event) + "\n", { mode: 0o600 });
   } catch (e) {
     console.error("[stats] append failed:", e.message);
   }

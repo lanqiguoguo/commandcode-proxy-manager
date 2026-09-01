@@ -2,6 +2,7 @@
 // 覆盖鉴权/主备切换/同Key重试/退避持久化/额度感知/统计/管理 API/流式/断连。
 // KNOWN-ISSUE 用例如实断言当前缺陷行为，修复对应项后应翻正（见 docs/CODE_REVIEW_2026-09-01.md）。
 import http from "http";
+import { performance } from "perf_hooks";
 import { spawn } from "child_process";
 import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
@@ -46,8 +47,8 @@ const gw = (body, token = CLIENT) => http1(MG + "/v1/chat/completions", "POST", 
 const keysList = async () => JSON.parse((await admin("/admin/api/keys")).body).keys;
 
 async function waitUp(url, timeout = 20000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeout) { try { const r = await http1(url, "GET", {}); if (r.status < 500) return true; } catch {} await sleep(150); }
+  const t0 = performance.now();
+  while (performance.now() - t0 < timeout) { try { const r = await http1(url, "GET", {}); if (r.status < 500) return true; } catch {} await sleep(150); }
   return false;
 }
 
@@ -129,11 +130,11 @@ async function main() {
   console.log("\n=== T3 same-key retry ===");
   await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "rate_limit", retryAfter: 1 }, { mode: "ok" }] });
-  let t0 = Date.now();
+  let t0 = performance.now();
   r = await gw({ model: "m-retry", messages: [] });
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   r.status === 200 && calls.length === 2 && calls.every((c) => c.auth === "user_keyA")
-    ? ok("429(RA=1) 同 Key 重试成功未切换", Date.now() - t0 + "ms") : bad("同 Key 重试", "status=" + r.status + " calls=" + JSON.stringify(calls.map((c) => c.auth)));
+    ? ok("429(RA=1) 同 Key 重试成功未切换", Math.round(performance.now() - t0) + "ms") : bad("同 Key 重试", "status=" + r.status + " calls=" + JSON.stringify(calls.map((c) => c.auth)));
   r = await admin("/admin/api/history?errorKind=rate_limit");
   JSON.parse(r.body).total === 0 ? ok("重试成功不留 rate_limit 失败事件") : bad("重试事件", r.body.slice(0, 150));
 
@@ -142,9 +143,9 @@ async function main() {
   await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "rate_limit", retryAfter: 30 }] });
   await mock("/__control", { auth: "user_keyB", responses: [{ mode: "rate_limit", retryAfter: 30 }] });
-  t0 = Date.now();
+  t0 = performance.now();
   r = await gw({ model: "m-fail", messages: [] });
-  const dt4 = Date.now() - t0;
+  const dt4 = performance.now() - t0;
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   r.status === 429 && dt4 < 3000 ? ok("两 Key 全限流 → 快速 429", dt4 + "ms RA=" + r.headers["retry-after"]) : bad("failover 429", "status=" + r.status + " dt=" + dt4);
   calls.length === 2 && calls[0].auth === "user_keyA" && calls[1].auth === "user_keyB"
@@ -157,17 +158,17 @@ async function main() {
 
   // ── T5 全退避时新请求快速 429 + state.json 持久化 + 重启保留 ──
   console.log("\n=== T5 backoff fast-429 & persistence ===");
-  t0 = Date.now();
+  t0 = performance.now();
   r = await gw({ model: "m-blocked", messages: [] });
-  r.status === 429 && Date.now() - t0 < 1500 && Number(r.headers["retry-after"]) > 20
+  r.status === 429 && performance.now() - t0 < 1500 && Number(r.headers["retry-after"]) > 20
     ? ok("全退避 → 快速 429 + Retry-After") : bad("全退避 429", "status=" + r.status + " RA=" + r.headers["retry-after"]);
   await sleep(1300);
   const stFile = JSON.parse(readFileSync(resolve(DATA, "state.json"), "utf-8"));
   Object.values(stFile.keys).every((h) => h.backoffUntilMs > 0) ? ok("state.json 落盘含退避") : bad("state.json", JSON.stringify(stFile).slice(0, 200));
   await stopMgr(); await startMgr();
-  t0 = Date.now();
+  t0 = performance.now();
   r = await gw({ model: "m-restart", messages: [] });
-  r.status === 429 && Date.now() - t0 < 2000 ? ok("重启后退避状态保留") : bad("重启保留", "status=" + r.status + " dt=" + (Date.now() - t0));
+  r.status === 429 && performance.now() - t0 < 2000 ? ok("重启后退避状态保留") : bad("重启保留", "status=" + r.status + " dt=" + Math.round(performance.now() - t0));
   await restartClean();
   r = await gw({ model: "m-recover", messages: [] });
   r.status === 200 ? ok("退避清除后恢复服务") : bad("恢复", "status=" + r.status);
@@ -276,11 +277,11 @@ async function main() {
   await admin("/admin/api/keys/" + idB11, "PUT", { enabled: false }); // 单 Key 池场景
   await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "delay", delayMs: 18000 }] });
-  t0 = Date.now();
+  t0 = performance.now();
   r = await gw({ model: "m-slow", messages: [] });
-  const dt11 = Date.now() - t0;
+  const dt11 = performance.now() - t0;
   r.status === 200 && r.body.includes("slow-ok") && dt11 >= 17000
-    ? ok("18s 慢生成完整返回 200（P1-1 已修复）", dt11 + "ms") : bad("P1-1 慢生成", "status=" + r.status + " dt=" + dt11 + " body=" + r.body.slice(0, 120));
+    ? ok("18s 慢生成完整返回 200（P1-1 已修复）", Math.round(dt11) + "ms") : bad("P1-1 慢生成", "status=" + r.status + " dt=" + dt11 + " body=" + r.body.slice(0, 120));
   ks = await keysList();
   ks.find((k) => k.alias === "keyA").health.failCount === 0
     ? ok("慢生成成功不误伤 Key 健康") : bad("慢生成健康", JSON.stringify(ks.find((k) => k.alias === "keyA").health));
@@ -291,12 +292,13 @@ async function main() {
   await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "hang" }] });
   await mock("/__control", { auth: "user_keyB", responses: [{ mode: "ok" }] });
-  t0 = Date.now();
+  t0 = performance.now();
   r = await gw({ model: "m-timeout", messages: [] });
-  const dt11b = Date.now() - t0;
+  const dt11b = performance.now() - t0;
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   r.status === 200 && calls.length === 2 && dt11b >= 2500 && dt11b < 8000
-    ? ok("connectTimeout=3s：挂死 → 超时退避 → 切 keyB 成功", dt11b + "ms") : bad("超时切换", "status=" + r.status + " dt=" + dt11b + " calls=" + calls.length);
+    ? ok("connectTimeout=3s：挂死 → 超时退避 → 切 keyB 成功", Math.round(dt11b) + "ms")
+    : bad("超时切换", "status=" + r.status + " dt=" + dt11b + " calls=" + JSON.stringify(calls.map((c) => [c.auth, c.mode])));
   r = await admin("/admin/api/history?errorKind=timeout");
   JSON.parse(r.body).total >= 1 ? ok("timeout 事件记录") : bad("timeout 事件", r.body.slice(0, 120));
   ks = await keysList();

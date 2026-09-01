@@ -139,25 +139,36 @@ export async function probeKey(keyId) {
   return final;
 }
 
-// 决策 2：额度感知限制——5h/每周硬阈值、美元耗尽 → quota_limited
+// 决策 2：额度感知限制——5h/每周硬阈值、美元耗尽 → quota_limited；≥softStop → 软限制降级
+// 阈值实时读 keyPool 当前配置（admin PUT 即生效），stale 报告不参与限制
 function applyLimits(keyId, report) {
   if (!pool || report.stale) return;   // stale 不启用额度限制，避免误伤
+  const now = Date.now();
+  const live = typeof pool.getPoolCfg === "function" ? pool.getPoolCfg() : cfg;
   const five = report.fiveHour;
   const weekly = report.weekly;
   const usd = report.creditsUsd;
-  if (five && five.percent >= (cfg.fiveHourHardStop ?? 90) && toMs(five.resetAt) > Date.now()) {
+  const fiveHot = five && five.percent >= (live.fiveHourHardStop ?? 90) && toMs(five.resetAt) > now;
+  const weeklyHot = weekly && weekly.percent >= (live.weeklyHardStop ?? 90) && toMs(weekly.resetAt) > now;
+  const usdExhausted = usd && usd.remaining <= 0;
+  if (fiveHot) {
     pool.setQuotaLimited(keyId, toMs(five.resetAt), "fiveHour");
-    return;
-  }
-  if (weekly && weekly.percent >= (cfg.weeklyHardStop ?? 90) && toMs(weekly.resetAt) > Date.now()) {
+  } else if (weeklyHot) {
     pool.setQuotaLimited(keyId, toMs(weekly.resetAt), "weekly");
-    return;
+  } else if (usdExhausted) {
+    // 美元耗尽：优先订阅周期结束；缺失/已过期时退到最近的窗口 resetAt；
+    // 再不行限制一个探测周期（下个周期重新评估），绝不因字段缺失而直接放行（P3-3）
+    let until = toMs(usd.expiresAt);
+    if (until <= now) until = Math.max(toMs(weekly && weekly.resetAt), toMs(five && five.resetAt));
+    if (until <= now) until = now + Math.max(60000, live.quotaRefreshMs || 60000);
+    pool.setQuotaLimited(keyId, until, "credits");
+  } else {
+    pool.clearQuotaLimited(keyId);
   }
-  if (usd && usd.remaining <= 0) {
-    pool.setQuotaLimited(keyId, toMs(usd.expiresAt), "credits");
-    return;
-  }
-  pool.clearQuotaLimited(keyId);
+  // 软限制档（DESIGN §5.2B）：任一窗口 ≥softStop 或美元耗尽但未触硬停 → 保留可用、排到最后
+  const soft = live.softStop ?? 80;
+  const softHit = (five && five.percent >= soft) || (weekly && weekly.percent >= soft) || usdExhausted;
+  pool.setSoftLimited(keyId, !!softHit);
 }
 
 export async function refreshKey(keyId) {

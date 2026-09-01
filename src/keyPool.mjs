@@ -30,6 +30,7 @@ export function initKeyPool(cfgPool, opts = {}) {
       authError: !!h.authError,
       quotaLimitedUntil: Number(h.quotaLimitedUntil) || 0,
       quotaLimitedReason: h.quotaLimitedReason || "",
+      softLimited: !!h.softLimited,
       failoverCount: Number(h.failoverCount) || 0,
       lastFailoverAt: Number(h.lastFailoverAt) || 0,
       lastUsedAt: Number(h.lastUsedAt) || 0
@@ -75,7 +76,7 @@ export function addKey({ alias = "", key = "", note = "" }) {
   persistKeys();
   health.set(rec.id, {
     backoffUntilMs: 0, failCount: 0, authError: false,
-    quotaLimitedUntil: 0, quotaLimitedReason: "",
+    quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false,
     failoverCount: 0, lastFailoverAt: 0, lastUsedAt: 0
   });
   emitLog("新增 Key: " + maskKey(rec.key));
@@ -168,11 +169,28 @@ export function clearAuthError(id) {
 export function setQuotaLimited(id, untilMs, reason) {
   const h = health.get(id);
   if (!h) return;
+  const now = nowMs();
+  const wasLimited = now < h.quotaLimitedUntil;
+  const prevReason = h.quotaLimitedReason;
   h.quotaLimitedUntil = untilMs || 0;
   h.quotaLimitedReason = reason || "";
   persistState();
-  if (untilMs) emitLog("Key " + id + " 额度受限（" + reason + "），暂停使用至窗口重置");
-  else emitLog("Key " + id + " 额度限制解除");
+  const isLimited = now < h.quotaLimitedUntil;
+  // 探测每周期都会重设限制（credits 自延长场景），仅在状态翻转/原因变化时记日志防刷屏
+  if (isLimited && (!wasLimited || prevReason !== reason)) emitLog("Key " + id + " 额度受限（" + reason + "），暂停使用至窗口重置");
+  else if (!isLimited && wasLimited) emitLog("Key " + id + " 额度限制解除");
+}
+
+// 软限制（决策 2 / DESIGN §5.2B）：额度 ≥softStop 时该 Key 保留可用，但优先级降到
+// 所有非软限制 Key 之后；池内无健康 Key 可用时仍会兜底使用。仅在状态翻转时记日志（探测高频）。
+export function setSoftLimited(id, val) {
+  const h = health.get(id);
+  if (!h) return;
+  const next = !!val;
+  if (h.softLimited === next) return;
+  h.softLimited = next;
+  persistState();
+  emitLog("Key " + id + (next ? " 额度将尽（软限制），降级为后备" : " 软限制解除"));
 }
 
 export function clearQuotaLimited(id) { setQuotaLimited(id, 0, ""); }
@@ -218,9 +236,13 @@ export function selectKey(excludeIds = null) {
   } else if (poolCfg.strategy === "least-usage" && typeof usageProvider === "function") {
     chosen = [...avail].sort((a, b) => (usageProvider(a.id) ?? 0) - (usageProvider(b.id) ?? 0))[0];
   } else {
-    // active-standby：冷却期内非主 key 优先选择未冷却的
+    // active-standby：软限制（额度≥softStop）Key 降到最后，仅在无正常 Key 时兜底
+    let candidates = avail;
+    const notSoft = avail.filter((k) => !(health.get(k.id) || {}).softLimited);
+    if (notSoft.length) candidates = notSoft;
+    // 冷却期内非主 key 优先选择未冷却的
     if (cooldownMs > 0) {
-      const outsideCooldown = avail.filter((k) => {
+      const outsideCooldown = candidates.filter((k) => {
         const h = health.get(k.id);
         return !h || !h.lastFailoverAt || (now - h.lastFailoverAt) >= cooldownMs;
       });
@@ -228,10 +250,10 @@ export function selectKey(excludeIds = null) {
         // 保持主备顺序，选冷却期外优先级最高的
         chosen = outsideCooldown[0];
       } else {
-        chosen = avail[0];
+        chosen = candidates[0];
       }
     } else {
-      chosen = avail[0];
+      chosen = candidates[0];
     }
   }
   const h = health.get(chosen.id);

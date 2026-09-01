@@ -56,15 +56,15 @@ docker compose：
 
 ## 配置
 
-环境变量（优先于 data/config.json）：
+环境变量（基础设施类优先于 data/config.json；**令牌类仅在磁盘 config.json 无值时初始化填充**，磁盘已有不同值时忽略 env 并打告警——UI 改密后重启不会被旧 env 静默回滚）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | PORT | 3080 | 管理网关端口 |
 | HOST | 0.0.0.0 | 监听地址 |
 | DATA_DIR | ./data（容器内 /data） | 持久化目录（keys.json / state.json / quota-cache.json / stats.jsonl / config.json） |
-| ADMIN_TOKEN | 自动生成 | 管理端令牌 |
-| CLIENT_TOKEN | 空（回退 ADMIN_TOKEN） | /v1/* 客户端令牌 |
+| ADMIN_TOKEN | 自动生成 | 管理端令牌（仅磁盘无值时初始化生效） |
+| CLIENT_TOKEN | 空（回退 ADMIN_TOKEN） | /v1/* 客户端令牌（仅磁盘无值时初始化生效） |
 | UPSTREAM_PORT / UPSTREAM_HOST | 3050 / 127.0.0.1 | 上游代理内部地址 |
 | EMBED_UPSTREAM | 1 | 设为 0 时不嵌入上游（上游独立部署/测试场景） |
 | SECURE_COOKIES | 空 | 设为 `1`/`true` 时给登录 SSE cookie 追加 `Secure` 属性（TLS 反代部署应开启，见「安全说明」） |

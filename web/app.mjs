@@ -163,7 +163,7 @@ function healthOf(k) {
   if (h.authError) return { cls: "bad", label: "认证异常" };
   if (h.quotaLimitedUntil && now < h.quotaLimitedUntil) return { cls: "bad", label: "额度受限" };
   if (h.backoffUntilMs && now < h.backoffUntilMs) return { cls: "warn", label: "退避中" };
-  if (k.quota && k.quota.stale) return { cls: "warn", label: k.quota.updatedAt ? "额度数据过期" : "额度获取失败" };
+  if (k.quota && k.quota.stale) return { cls: "warn", label: k.quota.updatedAt ? "额度自动刷新失败" : "额度获取失败" };
   return { cls: "ok", label: "健康" };
 }
 
@@ -239,7 +239,7 @@ function keyCard(k) {
   const usd = q && q.creditsUsd;
   let quotaHtml = "";
   if (q && q.stale) {
-    quotaHtml += '<div class="muted small">额度数据：' + (q.updatedAt ? "已过期（上次 " + fmtTime(q.updatedAt) + "）" : "获取失败") + (q.error ? ' · 原因: <span class="mono">' + esc(q.error) + "</span>" : "") + "</div>";
+    quotaHtml += '<div class="muted small">额度数据：' + (q.updatedAt ? "自动刷新失败（以下仍为上次成功数据，" + fmtTime(q.updatedAt) + "）" : "获取失败") + (q.error ? ' · 原因: <span class="mono">' + esc(q.error) + "</span>" : "") + "</div>";
   } else if (q) {
     quotaHtml += '<div class="muted small">额度数据：更新于 ' + fmtTime(q.updatedAt) + "</div>";
   } else {
@@ -254,7 +254,8 @@ function keyCard(k) {
   } else {
     quotaHtml += '<div class="muted small">每月限额（账期）：无数据</div>';
   }
-  if (q && !q.stale && q.totals) {
+  // totals/窗口数据在探测失败时保留上次成功值，stale 期间仍展示（顶部已注明数据时点）
+  if (q && q.totals) {
     const t = q.totals;
     quotaHtml += '<div class="row small muted" style="flex-wrap:wrap;gap:10px">' +
       "<span>本账期调用 <b>" + fmtNum(t.runs) + "</b> 次</span>" +
@@ -644,7 +645,8 @@ window.addEventListener("hashchange", () => {
   render();
 });
 
-document.getElementById("btn-logout").addEventListener("click", () => {
+document.getElementById("btn-logout").addEventListener("click", async () => {
+  try { await fetch("/admin/api/logout", { method: "POST" }); } catch {} // 撤销 HttpOnly SSE cookie
   state.token = "";
   sessionStorage.removeItem("ccpm_token");
   location.reload();
@@ -663,7 +665,7 @@ function stopLogPoller() {
 }
 
 // ── SSE 实时事件（DESIGN §6：quota/health/usage/切换事件推送）──
-// 后端 /admin/api/events 接受 ?token= 查询参数（EventSource 无法带 header）。
+// 鉴权走登录时下发的 HttpOnly 专用 cookie（同源请求自动携带，URL 不含令牌）。
 // 10s tick 与日志轮询保留为断线兜底。
 let eventSource = null;
 let statsDebounce = null;
@@ -671,8 +673,14 @@ let quotaRenderTimer = null;
 function startEventStream() {
   if (eventSource) { try { eventSource.close(); } catch {} }
   try {
-    eventSource = new EventSource("/admin/api/events?token=" + encodeURIComponent(state.token));
+    eventSource = new EventSource("/admin/api/events");
   } catch { return; }
+  // cookie 缺失/过期（如服务端换过令牌）时持续 401：关掉重试，轮询通道兜底
+  let sseErrors = 0;
+  eventSource.onerror = () => {
+    if (++sseErrors >= 3) { try { eventSource.close(); } catch {} eventSource = null; }
+  };
+  eventSource.onopen = () => { sseErrors = 0; };
   eventSource.addEventListener("log", (e) => {
     let d;
     try { d = JSON.parse(e.data); } catch { return; }

@@ -423,23 +423,39 @@ async function main() {
   sse.includes(": connected") && sse.includes("event: stats") ? ok("SSE 推送 stats 事件") : bad("SSE", JSON.stringify(sse.slice(0, 200)));
   r = await http1(MG + "/admin/api/events", "GET", {});
   r.status === 401 ? ok("SSE 未鉴权 401") : bad("SSE 401", "status=" + r.status);
-  // EventSource 无法带 header → events 端点支持 ?token= 查询参数（前端 SSE 消费依赖此）
-  const sseQ = await new Promise((resolveP) => {
-    const req = http.request(MG + "/admin/api/events?token=" + encodeURIComponent(ADMIN), {}, (res) => {
-      res.destroy(); resolveP(res.statusCode);
+  // ── SSE HttpOnly cookie 鉴权（query token 已因泄漏风险移除）──
+  const loginRes = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: ADMIN }));
+  const setCookie = loginRes.headers["set-cookie"] || "";
+  const m = String(setCookie).match(/ccpm_sse=([a-f0-9]{64})/);
+  loginRes.status === 200 && m ? ok("login 下发 ccpm_sse cookie") : bad("login cookie", "status=" + loginRes.status + " sc=" + JSON.stringify(setCookie));
+  if (m) {
+    const attrs = String(setCookie);
+    /HttpOnly/.test(attrs) && /Path=\/admin\/api\/events/.test(attrs) && /SameSite=Strict/.test(attrs)
+      ? ok("cookie 属性 HttpOnly+Path限定+SameSite=Strict") : bad("cookie 属性", attrs);
+    !attrs.includes(ADMIN) ? ok("cookie 值不含明文令牌（SHA-256 摘要）") : bad("cookie 明文泄漏", attrs);
+    const sseCookie = await new Promise((resolveP) => {
+      const req = http.request(MG + "/admin/api/events", { headers: { Cookie: "ccpm_sse=" + m[1] } }, (res) => {
+        let text = "";
+        res.on("data", (c) => { text += c; if (text.includes(": connected")) { try { req.destroy(); } catch {} resolveP(res.statusCode); } });
+        setTimeout(() => { try { req.destroy(); } catch {} resolveP(res.statusCode); }, 2000);
+      });
+      req.on("error", () => resolveP(0));
+      req.end();
     });
-    req.on("error", () => resolveP(0));
-    req.end();
-  });
-  sseQ === 200 ? ok("SSE ?token= 鉴权通过") : bad("SSE query token", "status=" + sseQ);
-  const sseBad = await new Promise((resolveP) => {
-    const req = http.request(MG + "/admin/api/events?token=wrong-token-xx", {}, (res) => { res.resume(); resolveP(res.statusCode); });
-    req.on("error", () => resolveP(0));
-    req.end();
-  });
-  sseBad === 401 ? ok("SSE 错误 query token → 401") : bad("SSE query 负例", "status=" + sseBad);
-  const qKeys = await http1(MG + "/admin/api/keys?token=" + encodeURIComponent(ADMIN), "GET", {});
-  qKeys.status === 401 ? ok("query token 仅限 events 端点（keys 仍拒绝）") : bad("query token 隔离", "status=" + qKeys.status);
+    sseCookie === 200 ? ok("SSE cookie 鉴权通过") : bad("SSE cookie", "status=" + sseCookie);
+    const wrong = await http1(MG + "/admin/api/events", "GET", { Cookie: "ccpm_sse=" + "0".repeat(64) });
+    wrong.status === 401 ? ok("错误 cookie → 401") : bad("cookie 负例", "status=" + wrong.status);
+    // query token 通道已移除（令牌不得出现在 URL）
+    const sseQ = await http1(MG + "/admin/api/events?token=" + encodeURIComponent(ADMIN), "GET", {});
+    sseQ.status === 401 ? ok("query ?token= 已拒绝（安全修复）") : bad("query token 未移除", "status=" + sseQ.status);
+    // logout 撤销 cookie
+    await http1(MG + "/admin/api/logout", "POST", {});
+    const afterLogout = String((await http1(MG + "/admin/api/logout", "POST", {})).headers["set-cookie"] || "");
+    /Max-Age=0/.test(afterLogout) ? ok("logout 撤销 cookie") : bad("logout 撤销", afterLogout);
+  }
+  // 空 header 不能通过（x-admin-token: "" 不得被当成匹配空值）
+  r = await http1(MG + "/admin/api/keys", "GET", { "x-admin-token": "" });
+  r.status === 401 ? ok("空 header 值被拒") : bad("空 header", "status=" + r.status);
 
   // ── T19 /v1/models + /v1/messages 路由 ──
   console.log("\n=== T19 routes ===");

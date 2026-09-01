@@ -1,4 +1,5 @@
 // ── 管理 REST API + SSE + 日志环形缓冲 ─────────────────
+import crypto from "crypto";
 import { getConfig, saveConfig } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as quota from "./quota.mjs";
@@ -6,6 +7,24 @@ import * as stats from "./stats.mjs";
 
 const logRing = [];
 let emitter = null;
+
+// SSE 专用 cookie：EventSource 无法带自定义 header，token 走 query 会泄漏到
+// URL（DevTools 连接面板/代理访问日志/Referer）。改用 HttpOnly cookie：
+// 值为 adminToken 的 SHA-256 摘要（cookie 中不出现明文），Path 限定仅 events
+// 端点会回传，SameSite=Strict 阻断跨站页面借用户会话偷连事件流。
+const SSE_COOKIE = "ccpm_sse";
+function sseCookieValue() {
+  return crypto.createHash("sha256").update(getConfig().adminToken).digest("hex");
+}
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie || "";
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
 
 export function initAdminApi(emitterRef) {
   emitter = emitterRef;
@@ -102,6 +121,15 @@ export async function handleAdmin(req, res, url) {
   const cfg = getConfig();
   const p = url.pathname;
 
+  if (p === "/admin/api/logout") {
+    if (req.method !== "POST") { sendJson(res, 405, { error: { message: "Method not allowed" } }); return true; }
+    // 退出登录时撤销 SSE cookie（HttpOnly cookie 前端 JS 删不掉）；
+    // 此端点无需鉴权：撤销凭证本身是幂等安全操作
+    res.setHeader("Set-Cookie", SSE_COOKIE + "=; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=0");
+    sendJson(res, 200, { ok: true });
+    return true;
+  }
+
   if (p === "/admin/api/login") {
     if (req.method !== "POST") { sendJson(res, 405, { error: { message: "Method not allowed" } }); return true; }
     const body = await readJsonBody(req);
@@ -109,17 +137,25 @@ export async function handleAdmin(req, res, url) {
       sendJson(res, 401, { error: { message: "Invalid admin token", type: "auth_error" } });
       return true;
     }
+    // HttpOnly：JS 读不到；Path 限定 events 端点：其余请求浏览器不回传，
+    // 缩小泄漏面；SameSite=Strict：跨站页面无法携带此 cookie 建 SSE
+    res.setHeader("Set-Cookie", SSE_COOKIE + "=" + sseCookieValue() +
+      "; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=86400");
     sendJson(res, 200, { ok: true });
     return true;
   }
 
   if (!p.startsWith("/admin/api/")) return false;
 
-  // EventSource 无法携带自定义 header，/admin/api/events 额外接受 ?token= 查询参数
-  // （仅这一个 GET-only 只读流端点；其余管理 API 仍只认 X-Admin-Token header）
-  const token = req.headers["x-admin-token"] ||
-    (p === "/admin/api/events" && req.method === "GET" ? url.searchParams.get("token") : "");
-  if (!token || token !== cfg.adminToken) {
+  // 鉴权：X-Admin-Token header（管理 API 主通道）；仅 SSE 端点额外接受
+  // 登录时下发的 HttpOnly 专用 cookie（EventSource 带不了 header，且 token
+  // 已不再出现在 URL 中）。query ?token= 通道已移除——URL 会被 DevTools
+  // 连接面板、反代 access log、Referer 等记录，明文令牌不应暴露。
+  let authed = req.headers["x-admin-token"] === cfg.adminToken && !!req.headers["x-admin-token"];
+  if (!authed && p === "/admin/api/events" && req.method === "GET") {
+    authed = parseCookies(req)[SSE_COOKIE] === sseCookieValue();
+  }
+  if (!authed) {
     sendJson(res, 401, { error: { message: "Unauthorized", type: "auth_error" } });
     return true;
   }

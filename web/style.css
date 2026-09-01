@@ -40,7 +40,33 @@ h3 { margin: 0 0 10px; font-size: 14px; }
 .bar { background: var(--panel2); border-radius: 6px; height: 10px; overflow: hidden; margin: 4px 0 2px; }
 .bar-fill { height: 100%; border-radius: 6px; }
 .bar-fill.q0 { background: var(--quota0); } .bar-fill.q1 { background: var(--quota1); } .bar-fill.q2 { background: var(--quota2); }
-.bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); }
+.bar-label { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 12px; color: var(--dim); }
+/* ── 总览 Key 卡片：分组 + 层级（额度 / 本账期 / 实测用量折叠）── */
+.key-card .kc-head { margin-bottom: 4px; }
+.kc-sec { border-top: 1px dashed var(--border); margin-top: 10px; padding-top: 8px; }
+.kc-sec-t { font-size: 11px; color: var(--dim); letter-spacing: .08em; margin-bottom: 6px; }
+.kc-updated { margin-bottom: 6px; }
+.kc-bar + .kc-bar { margin-top: 10px; }
+.kc-money { color: var(--text); }
+.pct { margin-left: 6px; }
+.pct.q0 { color: var(--quota0); } .pct.q1 { color: var(--quota1); } .pct.q2 { color: var(--quota2); font-weight: 700; }
+.kc-cd { color: var(--dim); margin-left: 6px; font-size: 11px; }
+.mini-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 12px; }
+.mini-stats .ms-v { font-size: 15px; font-weight: 700; white-space: nowrap; }
+.mini-stats .ms-k { font-size: 11px; color: var(--dim); margin-top: 1px; white-space: nowrap; }
+details.kc-usage > summary { cursor: pointer; list-style: none; user-select: none; }
+details.kc-usage > summary::-webkit-details-marker { display: none; }
+details.kc-usage > summary::before { content: "▸ "; color: var(--dim); }
+details.kc-usage[open] > summary::before { content: "▾ "; }
+details.kc-usage > summary:hover { color: var(--text); }
+.kc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.kc-chips span { background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; font-size: 11px; color: var(--dim); }
+.kc-chips b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+/* 数字与单位/窗口标签区分：单位灰小字跟在亮色数字后 */
+.kc-unit { font-weight: 400; margin-left: 4px; font-size: 10px; opacity: .85; }
+/* 折叠态摘要：与标题同行的小号胶囊 */
+.kc-chips-sum { display: inline-flex; gap: 6px; margin-left: 10px; margin-top: 0; vertical-align: middle; }
+.kc-chips-sum span { padding: 0 7px; font-size: 10px; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); color: var(--dim); }
 .badge.ok { color: var(--ok); border-color: var(--ok); }
 .badge.warn { color: var(--warn); border-color: var(--warn); }
@@ -51,6 +77,10 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 th { color: var(--dim); font-weight: 500; white-space: nowrap; }
 tr:hover td { background: var(--panel2); }
+/* 策略说明表：策略列固定不压缩、文本展开；说明列自动收缩占剩余宽度 */
+.strategy-table { table-layout: fixed; }
+.strategy-table th:first-child, .strategy-table td:first-child { width: 160px; white-space: normal; word-break: keep-all; }
+.strategy-table td:last-child { white-space: normal; word-break: break-word; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .muted { color: var(--dim); }
 .small { font-size: 12px; }
@@ -62,9 +92,15 @@ tr:hover td { background: var(--panel2); }
 .alert.info { background: rgba(88,166,255,.08); border: 1px solid var(--border); color: var(--dim); }
 .filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 12px; align-items: end; }
 .filters input, .filters select { width: 100%; min-width: 0; }
+/* 添加 Key 行：别名/Key/备注/按钮整体撑满，Key 框占比最大 */
+.kadd-row { flex-wrap: nowrap; }
+.kadd-row input { flex: 1 1 0; min-width: 0; }
+.kadd-row .kadd-key { flex: 2.2 1 0; }
+.kadd-row button { flex: 0 0 auto; }
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .log-list { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-height: 60vh; overflow: auto; }
-.log-list div { padding: 3px 6px; border-bottom: 1px solid var(--border); white-space: pre-wrap; word-break: break-all; }
+/* 日志单行不换行，超长时容器横向滚动；行底色与分隔线随内容宽度延伸 */
+.log-list div { padding: 3px 6px; border-bottom: 1px solid var(--border); white-space: pre; width: max-content; min-width: 100%; }
 .log-list .lv-warn { color: var(--warn); }
 .log-list .lv-error { color: var(--bad); }
 .badge.log-src { padding: 0 6px; font-size: 10px; margin-right: 6px; vertical-align: 1px; }
@@ -81,4 +117,10 @@ tr:hover td { background: var(--panel2); }
   .card { padding: 12px; }
   .login-wrap { margin: 8vh 12px auto; }
   .key-actions { width: 100%; justify-content: flex-start; }
+  /* 窄屏下迷你统计改纵向行式，避免大数字三列挤压换行 */
+  .mini-stats { grid-template-columns: 1fr; gap: 6px; }
+  .mini-stats .ms { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+  .mini-stats .ms-v { font-size: 14px; }
+  .kadd-row { flex-wrap: wrap; }
+  .kadd-row input, .kadd-row .kadd-key { flex: 1 1 100%; }
 }

@@ -68,7 +68,7 @@ async function refresh() {
 }
 
 // 自动刷新前保存/恢复“添加 Key”表单未提交内容，避免 10s tick 清空正在输入的值（P3-5）
-const KEY_FORM_IDS = ["k-alias", "k-key", "k-note", "k-bulk"];
+const KEY_FORM_IDS = ["k-alias", "k-key", "k-note"];
 function withFormPreserved(fn) {
   const saved = {};
   for (const id of KEY_FORM_IDS) {
@@ -134,7 +134,13 @@ async function doLogin() {
 function esc(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-function fmtTime(ts) { return ts ? new Date(ts).toLocaleString() : "-"; }
+// 统一时间格式：2026/09/02 00:45:38（24 小时制，不随浏览器 locale 变化）
+function fmtTime(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
 function fmtNum(n) { return (n == null ? 0 : n).toLocaleString(); }
 function fmtCountdown(targetMs) {
   const s = Math.round((targetMs - Date.now()) / 1000);
@@ -146,17 +152,32 @@ function fmtCountdown(targetMs) {
 }
 function fmtUsd(n) { return "$" + (Number(n) || 0).toFixed(2); }
 function windowBar(label, w) {
-  if (!w) return '<div class="muted small">' + label + "：无数据</div>";
+  if (!w) return barHtml(label, null, "无数据");
   const cd = w.resetAt ? fmtCountdown(Date.parse(w.resetAt)) : "";
   const sub = fmtUsd(w.used) + " / " + fmtUsd(w.cap) + " · " + round2(w.percent) + "%" + (cd ? " · " + cd : "");
   return barHtml(label, w.percent, sub);
 }
 function round2(n) { return Math.round((n || 0) * 100) / 100; }
 function barClass(p) { return p >= 90 ? "q2" : p >= 70 ? "q1" : "q0"; }
+// 数值/百分比拆分着色：sub 形如 "$5.60 / $14.00 · 40% · 3 小时后重置"
+// 金额段提为正文色，百分比按绿/黄/红着色，倒计时保持灰色小字
+function barSubHtml(p, sub) {
+  if (!sub) return "";
+  const parts = String(sub).split(" · ");
+  if (parts.length === 1 && parts[0] === "无数据") return '<span class="muted">' + esc(sub) + "</span>";
+  const money = parts[0] == null ? "" : parts[0];
+  const pct = parts[1] != null && parts[1].endsWith("%") ? parts[1] : "";
+  const cd = parts.slice(pct ? 2 : 1).join(" ·");
+  let out = '<span class="mono kc-money">' + esc(money) + "</span>";
+  if (pct) out += '<span class="mono pct ' + barClass(p) + '">' + esc(pct) + "</span>";
+  if (cd) out += '<span class="kc-cd">' + esc(cd) + "</span>";
+  return out;
+}
 function barHtml(label, p, sub) {
-  p = Math.max(0, Math.min(100, p || 0));
-  return '<div class="bar-label"><span>' + esc(label) + '</span><span class="mono">' + esc(sub || "") + "</span></div>" +
-    '<div class="bar"><div class="bar-fill ' + barClass(p) + '" style="width:' + p + '%"></div></div>';
+  const noData = p == null;
+  const v = noData ? 0 : Math.max(0, Math.min(100, p || 0));
+  return '<div class="kc-bar"><div class="bar-label"><span>' + esc(label) + "</span><span>" + barSubHtml(v, sub) + "</span></div>" +
+    '<div class="bar"><div class="bar-fill ' + barClass(v) + '" style="width:' + v + '%"></div></div></div>';
 }
 // 每 Key 的即时状态（updating/testing）：本地操作置位 + SSE quota-status 事件
 // 同步（他人触发的自动刷新/测试也能看到"更新中"），done/error/idle 清除；
@@ -179,6 +200,10 @@ function sweepBusy() {
   }
   return changed;
 }
+// 实测用量折叠状态：dashboard 每 10s 全量重渲染，<details> 的 open 状态须持久化，
+// 否则用户刚展开就被自动刷新折回去
+const usageOpen = {};
+window.ccpmUsageToggle = (id, open) => { if (open) usageOpen[id] = true; else delete usageOpen[id]; };
 function healthOf(k) {
   const h = k.health || {};
   const now = Date.now();
@@ -263,13 +288,14 @@ function keyCard(k) {
   const five = q && q.fiveHour;
   const weekly = q && q.weekly;
   const usd = q && q.creditsUsd;
+  // ── 额度分组 ──
   let quotaHtml = "";
   if (q && q.stale) {
-    quotaHtml += '<div class="muted small">额度数据：' + (q.updatedAt ? "自动刷新失败（以下仍为上次成功数据，" + fmtTime(q.updatedAt) + "）" : "获取失败") + (q.error ? ' · 原因: <span class="mono">' + esc(q.error) + "</span>" : "") + "</div>";
+    quotaHtml += '<div class="muted small kc-updated">额度数据：' + (q.updatedAt ? "自动刷新失败（以下仍为上次成功数据，" + fmtTime(q.updatedAt) + "）" : "获取失败") + (q.error ? ' · 原因: <span class="mono">' + esc(q.error) + "</span>" : "") + "</div>";
   } else if (q) {
-    quotaHtml += '<div class="muted small">额度数据：更新于 ' + fmtTime(q.updatedAt) + "</div>";
+    quotaHtml += '<div class="muted small kc-updated">额度数据：更新于 ' + fmtTime(q.updatedAt) + "</div>";
   } else {
-    quotaHtml += '<div class="muted small">额度数据：未获取</div>';
+    quotaHtml += '<div class="muted small kc-updated">额度数据：未获取</div>';
   }
   // 上游三窗口均为美元限额（官方口径：5h/weekly/monthly limit = $ of usage）
   quotaHtml += windowBar("5 小时限额", five);
@@ -278,29 +304,35 @@ function keyCard(k) {
     const cd = usd.expiresAt ? fmtCountdown(Date.parse(usd.expiresAt)) : "";
     quotaHtml += barHtml("每月限额（账期）", usd.percent, fmtUsd(usd.used) + " / " + fmtUsd(usd.limit) + " · " + round2(usd.percent) + "%" + (cd ? " · " + cd : ""));
   } else {
-    quotaHtml += '<div class="muted small">每月限额（账期）：无数据</div>';
+    quotaHtml += barHtml("每月限额（账期）", null, "无数据");
   }
   // totals/窗口数据在探测失败时保留上次成功值，stale 期间仍展示（顶部已注明数据时点）
+  let totalsHtml = '<div class="muted small">暂无账期汇总数据</div>';
   if (q && q.totals) {
     const t = q.totals;
-    quotaHtml += '<div class="row small muted" style="flex-wrap:wrap;gap:10px">' +
-      "<span>本账期调用 <b>" + fmtNum(t.runs) + "</b> 次</span>" +
-      (t.successRate != null ? "<span>成功率 <b>" + t.successRate + "%</b></span>" : "") +
-      "<span>总 Token <b>" + fmtNum(t.tokens) + "</b>（入 " + fmtNum(t.tokensIn) + " / 出 " + fmtNum(t.tokensOut) + "）</span>" +
+    totalsHtml = '<div class="mini-stats">' +
+      '<div class="ms"><div class="ms-v mono">' + fmtNum(t.runs) + '</div><div class="ms-k">本账期调用（次）</div></div>' +
+      (t.successRate != null ? '<div class="ms"><div class="ms-v mono">' + t.successRate + "%</div><div class=\"ms-k\">成功率</div></div>" : "") +
+      '<div class="ms"><div class="ms-v mono">' + fmtNum(t.tokens) + '</div><div class="ms-k">总 Token</div></div>' +
       "</div>";
   }
+  // 实测用量：默认折叠，summary 给出关键摘要数字
   const w5 = u.h5 || {}, w7 = u.d7 || {}, w30 = u.d30 || {};
   const d30Label = u.d30Valid ? "30d" : "保留期";
-  const usageHtml =
-    '<div class="muted small">实测用量</div>' +
-    '<div class="row small muted">' +
-    "<span>5h: " + w5.requests + " 请求 / " + fmtNum((w5.input || 0) + (w5.output || 0)) + " tok</span>" +
-    "<span>7d: " + w7.requests + " 请求</span>" +
-    "<span>" + d30Label + ": " + w30.requests + " 请求" + (u.d30Valid ? "" : "（保留期内）") + "</span>" +
-    "</div>" +
-    '<div class="row small muted">429: ' + (w7.err429 || 0) + " · 其他错误: " + (w7.errOther || 0) + " · 切换次数: " + ((k.health && k.health.failoverCount) || 0) + "</div>";
-  return '<div class="card">' +
-    '<div class="row spread mb">' +
+  // 摘要与详情共用同一 chip 构造：数字亮色 + 单位灰小字，标签用 .kc-unit 与数字区分
+  const chip = (v, unit, label) => "<b>" + v + "</b><span class='kc-unit'>" + unit + (label ? " · " + label : "") + "</span>";
+  const usageChips = [
+    chip(w5.requests, "请求", "5h"),
+    chip(fmtNum((w5.input || 0) + (w5.output || 0)), "tok", "5h"),
+    chip(w7.requests, "请求", "7d"),
+    chip(w30.requests, "请求", d30Label + (u.d30Valid ? "" : "（保留期内）")),
+    chip(w7.err429 || 0, "× 429", "7d"),
+    chip(w7.errOther || 0, "其他错误", "7d"),
+    chip((k.health && k.health.failoverCount) || 0, "次切换", ""),
+  ];
+  const usageDetail = '<div class="kc-chips">' + usageChips.map((c) => "<span>" + c + "</span>").join("") + "</div>";
+  return '<div class="card key-card">' +
+    '<div class="row spread kc-head">' +
     '<div class="row">' +
     '<span class="badge pri">' + (k.priority === 0 ? "主" : "备" + k.priority) + "</span>" +
     "<strong>" + esc(k.alias || "未命名") + "</strong>" +
@@ -313,8 +345,9 @@ function keyCard(k) {
     '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
     "</div>" +
     "</div>" +
-    '<div class="mb">' + quotaHtml + "</div>" +
-    usageHtml +
+    '<div class="kc-sec">' + quotaHtml + "</div>" +
+    '<div class="kc-sec"><div class="kc-sec-t">本账期</div>' + totalsHtml + "</div>" +
+    '<details class="kc-sec kc-usage"' + (usageOpen[k.id] ? " open" : "") + ' ontoggle="ccpmUsageToggle(\'' + k.id + '\', this.open)"><summary class="kc-sec-t">实测用量<span class="kc-chips kc-chips-sum">' + [usageChips[2], usageChips[4]].map((c) => "<span>" + c + "</span>").join("") + "</span></summary>" + usageDetail + "</details>" +
     "</div>";
 }
 
@@ -323,15 +356,11 @@ function renderKeys() {
   let html = "<h2>Key 管理</h2>";
   html += '<div class="card mb">' +
     "<h3>添加 Key</h3>" +
-    '<div class="row">' +
+    '<div class="row kadd-row">' +
     '<input id="k-alias" placeholder="别名（如 主账号）">' +
-    '<input id="k-key" placeholder="user_xxxx" style="min-width:260px">' +
+    '<input id="k-key" class="kadd-key" placeholder="user_xxxx">' +
     '<input id="k-note" placeholder="备注（可选）">' +
     '<button id="btn-add-key">添加</button>' +
-    "</div>" +
-    '<div class="row mt">' +
-    '<textarea id="k-bulk" placeholder="批量导入：每行一个 Key，支持 别名,Key 或 仅 Key" style="flex:1;min-height:70px"></textarea>' +
-    '<button id="btn-bulk" class="ghost">批量导入</button>' +
     "</div>" +
     '<div id="key-msg"></div>' +
     "</div>";
@@ -358,7 +387,6 @@ function renderKeys() {
   html += "</tbody></table></div></div>";
   app.innerHTML = html;
   document.getElementById("btn-add-key").addEventListener("click", addKey);
-  document.getElementById("btn-bulk").addEventListener("click", bulkImport);
 }
 
 async function addKey() {
@@ -372,48 +400,6 @@ async function addKey() {
   } catch (e) {
     document.getElementById("key-msg").innerHTML = '<div class="alert err">' + esc(e.message) + "</div>";
   }
-}
-
-async function bulkImport() {
-  const text = document.getElementById("k-bulk").value;
-  const rawLines = text.split("\n").map((s) => s.trim()).filter(Boolean);
-  // 去重（按 key 去重，保留首个别名）
-  const seen = new Set();
-  const lines = [];
-  for (const line of rawLines) {
-    const key = line.includes(",") ? line.split(",")[1].trim() : line.trim();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    lines.push(line);
-  }
-  let okCount = 0, failCount = 0;
-  const errors = [];
-  // 限制并发 5，避免批量导入打爆后端
-  const concurrency = 5;
-  let idx = 0;
-  async function worker() {
-    while (idx < lines.length) {
-      const i = idx++;
-      const line = lines[i];
-      let alias = "", key = line;
-      if (line.includes(",")) {
-        const parts = line.split(",");
-        alias = parts[0].trim();
-        key = parts[1].trim();
-      }
-      try {
-        await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ alias, key }) });
-        okCount++;
-      } catch (e) {
-        failCount++;
-        if (errors.length < 3) errors.push(e.message);
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, lines.length) }, () => worker()));
-  document.getElementById("key-msg").innerHTML = '<div class="alert ' + (failCount ? "err" : "ok") + '">成功 ' + okCount + " 个，失败 " + failCount + " 个" + (errors.length ? "：" + esc(errors.join("；")) : "") + "</div>";
-  document.getElementById("k-bulk").value = "";
-  await refresh(); render();
 }
 
 // ── 历史记录 ──
@@ -562,7 +548,7 @@ function renderSettings() {
     '<div class="row mt"><label style="margin:0"><input type="checkbox" id="f-zeroOutputCountsAs429" ' + (p.zeroOutputCountsAs429 ? "checked" : "") + '> 零输出计入 429</label></div>' +
     '<div class="mt"><button id="btn-save-pool">保存池配置</button> <span id="pool-msg"></span></div>' +
     "</div>";
-  html += '<div class="card mb"><h3>选 Key 策略说明</h3><table><thead><tr><th>策略</th><th>说明</th></tr></thead><tbody>' +
+  html += '<div class="card mb"><h3>选 Key 策略说明</h3><table class="strategy-table"><thead><tr><th>策略</th><th>说明</th></tr></thead><tbody>' +
     Object.entries(STRATEGY_INFO).map(([k, v]) =>
       "<tr><td><b>" + esc(v.label) + "</b><div class='muted small mono'>" + esc(k) + "</div></td><td class='small'>" + esc(v.desc) + "</td></tr>"
     ).join("") +
@@ -797,6 +783,8 @@ if (!state.token) {
     startEventStream();
     startLogPoller();
     if (state.view === "history") loadHistory().catch(() => {});
+    // 直接刷新进日志页时立即拉一次，否则要等 3s 轮询首跳才见内容
+    if (state.view === "logs") loadLogs().catch(() => {});
     render();
   })();
 }

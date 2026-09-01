@@ -131,8 +131,15 @@ async function doLogin() {
 }
 
 // ── 工具 ──
+// P2-7：补转义单引号（&#39;）——重构后 id 等值以属性形式输出，防止属性上下文逃逸
 function esc(s) {
-  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+// P1-6：token 数值渲染兜底——历史事件可能含修复前落盘的脏数据（字符串/对象），
+// 非有限数一律显示 "-"，绝不经未转义通道进 HTML（双保险：源头 stats 已净化）
+function fmtTok(v) {
+  if (v == null || !Number.isFinite(Number(v))) return "-";
+  return esc(String(v));
 }
 // 统一时间格式：2026/09/02 00:45:38（24 小时制，不随浏览器 locale 变化）
 function fmtTime(ts) {
@@ -201,9 +208,9 @@ function sweepBusy() {
   return changed;
 }
 // 实测用量折叠状态：dashboard 每 10s 全量重渲染，<details> 的 open 状态须持久化，
-// 否则用户刚展开就被自动刷新折回去
+// 否则用户刚展开就被自动刷新折回去（P2-7 后：展开态由顶层 toggle 捕获委托写入，
+// 见文件末尾事件委托区；渲染时通过 <details data-usage> + open 属性恢复）
 const usageOpen = {};
-window.ccpmUsageToggle = (id, open) => { if (open) usageOpen[id] = true; else delete usageOpen[id]; };
 function healthOf(k) {
   const h = k.health || {};
   const now = Date.now();
@@ -340,14 +347,14 @@ function keyCard(k) {
     (busyPhase(k.id) ? '<span class="badge accent busy-badge">' + BUSY_LABEL[busyPhase(k.id)] + "</span>" : '<span class="badge ' + h.cls + '">' + h.label + "</span>") +
     "</div>" +
     '<div class="row key-actions">' +
-    '<button class="small ghost" onclick="ccpmRefreshQuota(\'' + k.id + '\')" ' + (busyPhase(k.id) ? "disabled" : "") + '>' + (busyPhase(k.id) === "updating" ? "更新中…" : "刷新额度") + "</button>" +
-    '<button class="small ghost" onclick="ccpmToggle(\'' + k.id + '\')">' + (k.enabled ? "停用" : "启用") + "</button>" +
-    '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
+    '<button class="small ghost" data-act="refresh-quota" data-id="' + esc(k.id) + '" ' + (busyPhase(k.id) ? "disabled" : "") + '>' + (busyPhase(k.id) === "updating" ? "更新中…" : "刷新额度") + "</button>" +
+    '<button class="small ghost" data-act="toggle" data-id="' + esc(k.id) + '">' + (k.enabled ? "停用" : "启用") + "</button>" +
+    '<button class="small danger" data-act="delete" data-id="' + esc(k.id) + '">删除</button>' +
     "</div>" +
     "</div>" +
     '<div class="kc-sec">' + quotaHtml + "</div>" +
     '<div class="kc-sec"><div class="kc-sec-t">本账期</div>' + totalsHtml + "</div>" +
-    '<details class="kc-sec kc-usage"' + (usageOpen[k.id] ? " open" : "") + ' ontoggle="ccpmUsageToggle(\'' + k.id + '\', this.open)"><summary class="kc-sec-t">实测用量<span class="kc-chips kc-chips-sum">' + [usageChips[2], usageChips[4]].map((c) => "<span>" + c + "</span>").join("") + "</span></summary>" + usageDetail + "</details>" +
+    '<details class="kc-sec kc-usage" data-usage="' + esc(k.id) + '"' + (usageOpen[k.id] ? " open" : "") + '><summary class="kc-sec-t">实测用量<span class="kc-chips kc-chips-sum">' + [usageChips[2], usageChips[4]].map((c) => "<span>" + c + "</span>").join("") + "</span></summary>" + usageDetail + "</details>" +
     "</div>";
 }
 
@@ -371,17 +378,17 @@ function renderKeys() {
     const h = healthOf(k);
     html += "<tr>" +
       "<td>" +
-      '<button class="small ghost" onclick="ccpmMove(\'' + k.id + '\',' + (-1) + ')" ' + (k.priority === 0 ? "disabled" : "") + ">↑</button> " +
-      '<button class="small ghost" onclick="ccpmMove(\'' + k.id + '\',' + 1 + ')" ' + (k.priority === state.keys.length - 1 ? "disabled" : "") + ">↓</button> " +
+      '<button class="small ghost" data-act="move-up" data-id="' + esc(k.id) + '" ' + (k.priority === 0 ? "disabled" : "") + ">↑</button> " +
+      '<button class="small ghost" data-act="move-down" data-id="' + esc(k.id) + '" ' + (k.priority === state.keys.length - 1 ? "disabled" : "") + ">↓</button> " +
       '<span class="badge pri">' + (k.priority === 0 ? "主" : "备" + k.priority) + "</span></td>" +
       "<td>" + esc(k.alias || "未命名") + "</td>" +
       '<td class="mono">' + esc(k.maskedKey) + "</td>" +
       '<td>' + (busyPhase(k.id) ? '<span class="badge accent busy-badge">' + BUSY_LABEL[busyPhase(k.id)] + "</span>" : '<span class="badge ' + h.cls + '">' + h.label + "</span>") + " " + (k.enabled ? "" : '<span class="badge">已停用</span>') + "</td>" +
       '<td class="muted small">' + esc(k.note || "") + "</td>" +
       "<td>" +
-      '<button class="small ghost" onclick="ccpmTest(\'' + k.id + '\')" ' + (busyPhase(k.id) ? "disabled" : "") + ">" + (busyPhase(k.id) === "testing" ? "测试中…" : "测试") + "</button> " +
-      '<button class="small ghost" onclick="ccpmToggle(\'' + k.id + '\')">' + (k.enabled ? "停用" : "启用") + "</button> " +
-      '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
+      '<button class="small ghost" data-act="test" data-id="' + esc(k.id) + '" ' + (busyPhase(k.id) ? "disabled" : "") + ">" + (busyPhase(k.id) === "testing" ? "测试中…" : "测试") + "</button> " +
+      '<button class="small ghost" data-act="toggle" data-id="' + esc(k.id) + '">' + (k.enabled ? "停用" : "启用") + "</button> " +
+      '<button class="small danger" data-act="delete" data-id="' + esc(k.id) + '">删除</button>' +
       "</td></tr>";
   }
   html += "</tbody></table></div></div>";
@@ -409,7 +416,7 @@ function renderHistory() {
     "不是 commandcode.ai 官网 settings/usage 的账号级账单明细——上游 API 不向第三方暴露逐条调用记录（仅汇总统计，已在本账期卡片展示）。" +
     "未走本网关的 CLI 直连调用不会出现在这里。</div>";
   html += '<div class="card mb"><div class="filters">' +
-    '<div><label>Key</label><select id="h-key">' + '<option value="">全部</option>' + state.keys.map((k) => '<option value="' + k.id + '">' + esc(k.alias || k.maskedKey) + "</option>").join("") + "</select></div>" +
+    '<div><label>Key</label><select id="h-key">' + '<option value="">全部</option>' + state.keys.map((k) => '<option value="' + esc(k.id) + '">' + esc(k.alias || k.maskedKey) + "</option>").join("") + "</select></div>" +
     '<div><label>状态</label><select id="h-status"><option value="">全部</option><option>200</option><option>401</option><option>429</option><option>502</option></select></div>' +
     '<div><label>错误类型</label><select id="h-err"><option value="">全部</option><option value="rate_limit">rate_limit</option><option value="auth">auth</option><option value="upstream">upstream</option><option value="client">client</option><option value="timeout">timeout</option></select></div>' +
     '<div><label>开始</label><input type="datetime-local" id="h-from"></div>' +
@@ -426,7 +433,7 @@ function renderHistory() {
       "<td>" + (it.stream ? "是" : "否") + "</td>" +
       '<td><span class="badge ' + (it.ok ? "ok" : "bad") + '">' + it.status + "</span></td>" +
       '<td class="muted small">' + esc(it.errorKind || "") + "</td>" +
-      '<td class="mono small">' + (it.inputTokens ?? "-") + " / " + (it.outputTokens ?? "-") + " / " + (it.cachedTokens ?? "-") + "</td>" +
+      '<td class="mono small">' + fmtTok(it.inputTokens) + " / " + fmtTok(it.outputTokens) + " / " + fmtTok(it.cachedTokens) + "</td>" +
       "<td>" + (it.retries || 0) + "</td>" +
       "<td>" + (it.latencyMs != null ? Math.round(it.latencyMs) + "ms" : "-") + "</td>" +
       "</tr>";
@@ -688,12 +695,31 @@ async function loadLogs() {
   }
 }
 
-// ── 全局 onclick 绑定 ──
-window.ccpmRefreshQuota = refreshKeyQuota;
-window.ccpmToggle = toggleKey;
-window.ccpmDelete = delKey;
-window.ccpmTest = testKey;
-window.ccpmMove = moveKey;
+// ── 事件委托（P2-7：替代内联 onclick/ontoggle，配合 CSP script-src 'self'）──
+// 动作名 → 既有函数一一映射；监听注册在 document 上（模块顶层一次），
+// 渲染以 innerHTML 替换 #app 不影响委托。toggleKey 原签名接收 Key 对象，按 id 查找回等。
+const KEY_ACTIONS = {
+  "refresh-quota": (id) => refreshKeyQuota(id),
+  "toggle": (id) => { const k = state.keys.find((x) => x.id === id); if (k) toggleKey(k); },
+  "delete": (id) => delKey(id),
+  "test": (id) => testKey(id),
+  "move-up": (id) => moveKey(id, -1),
+  "move-down": (id) => moveKey(id, 1)
+};
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-act]");
+  if (!el) return;
+  const fn = KEY_ACTIONS[el.dataset.act];
+  if (fn) fn(el.dataset.id);
+});
+// toggle 事件不冒泡，必须捕获阶段监听；details 由 data-usage 携带 key id。
+// 维持 usageOpen 跨渲染展开态（与原内联 ccpmUsageToggle(id, this.open) 行为等价）。
+document.addEventListener("toggle", (e) => {
+  const el = e.target.closest && e.target.closest("details[data-usage]");
+  if (!el) return;
+  const id = el.dataset.usage;
+  if (el.open) usageOpen[id] = true; else delete usageOpen[id];
+}, true);
 
 // ── 启动 ──
 window.addEventListener("hashchange", () => {

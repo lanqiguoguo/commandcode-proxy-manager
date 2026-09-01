@@ -84,15 +84,23 @@ function mapError(status, text) {
   return { status, body: { error: { message: message || "Upstream error (" + status + ")", type: "proxy_error" } } };
 }
 
+// P1-6：上游 usage 字段数值强转——上游应答方给什么收什么（EMBED_UPSTREAM=0 时
+// UPSTREAM_HOST 可控），字符串/对象/null 若不净化会经 merge 拼接、落盘污染统计与前端渲染。
+// 语义与 quota.mjs 的 num() 相同（本地实现避免跨模块耦合）：非有限数 → 0。
+function num(v) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function parseUsageFromJson(text) {
   try {
     const j = JSON.parse(text);
     const u = j.usage;
-    if (!u) return null;
+    if (!u || typeof u !== "object") return null;
     return {
-      inputTokens: u.prompt_tokens ?? u.input_tokens ?? 0,
-      outputTokens: u.completion_tokens ?? u.output_tokens ?? 0,
-      cachedTokens: u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens ?? 0
+      inputTokens: num(u.prompt_tokens ?? u.input_tokens ?? 0),
+      outputTokens: num(u.completion_tokens ?? u.output_tokens ?? 0),
+      cachedTokens: num(u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens ?? 0)
     };
   } catch {
     return null;
@@ -105,19 +113,19 @@ function parseUsageFromSseLine(line) {
   if (!payload || payload === "[DONE]") return null;
   try {
     const j = JSON.parse(payload);
-    if (j.usage && (j.object === "chat.completion.chunk" || j.usage.prompt_tokens !== undefined)) {
+    if (j && j.usage && typeof j.usage === "object" && (j.object === "chat.completion.chunk" || j.usage.prompt_tokens !== undefined)) {
       const u = j.usage;
       return {
-        inputTokens: u.prompt_tokens ?? 0,
-        outputTokens: u.completion_tokens ?? 0,
-        cachedTokens: (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0
+        inputTokens: num(u.prompt_tokens ?? 0),
+        outputTokens: num(u.completion_tokens ?? 0),
+        cachedTokens: num((u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) ?? 0)
       };
     }
-    if (j.type === "message_start" && j.message && j.message.usage) {
-      return { inputTokens: j.message.usage.input_tokens ?? 0, outputTokens: 0, cachedTokens: j.message.usage.cache_read_input_tokens ?? 0 };
+    if (j && j.type === "message_start" && j.message && j.message.usage) {
+      return { inputTokens: num(j.message.usage.input_tokens ?? 0), outputTokens: 0, cachedTokens: num(j.message.usage.cache_read_input_tokens ?? 0) };
     }
-    if (j.type === "message_delta" && j.usage) {
-      return { inputTokens: 0, outputTokens: j.usage.output_tokens ?? 0, cachedTokens: j.usage.cache_read_input_tokens ?? 0 };
+    if (j && j.type === "message_delta" && j.usage && typeof j.usage === "object") {
+      return { inputTokens: 0, outputTokens: num(j.usage.output_tokens ?? 0), cachedTokens: num(j.usage.cache_read_input_tokens ?? 0) };
     }
   } catch {}
   return null;

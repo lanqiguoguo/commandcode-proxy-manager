@@ -283,6 +283,26 @@ if (SC === "stats") {
   check(fileLines === 1, "prune 重写文件", "file=" + fileLines);
   appendEvent({ keyId: "k1", ok: true, status: 200, model: "app" });
   check(queryEvents({}).total === 2, "appendEvent 落盘");
+  // P1-6：appendEvent 入口数值净化——脏类型不落盘，有限数（含数字字符串）归一为 number
+  appendEvent({
+    keyId: "k1", ok: true, status: "200", model: "dirty",
+    inputTokens: "12/><img src=x>", outputTokens: { evil: 1 }, cachedTokens: null,
+    latencyMs: 42.5, retries: Infinity
+  });
+  const dirty = queryEvents({}).items.find((e) => e.model === "dirty");
+  check(dirty.model === "dirty", "净化用例事件已入库");
+  check(dirty.inputTokens === undefined, "字符串 usage → 字段删除", JSON.stringify(dirty.inputTokens));
+  check(dirty.outputTokens === undefined, "对象 usage → 字段删除", JSON.stringify(dirty.outputTokens));
+  check(dirty.cachedTokens === undefined, "null usage → 字段删除（保持缺省语义）", JSON.stringify(dirty.cachedTokens));
+  check(dirty.retries === undefined, "Infinity retries → 字段删除", JSON.stringify(dirty.retries));
+  check(dirty.latencyMs === 42.5 && typeof dirty.latencyMs === "number", "合法 latencyMs 原样保留");
+  check(dirty.status === 200 && typeof dirty.status === "number", "数字字符串 status → 归一 number（429 判定不回退）", JSON.stringify(dirty.status));
+  appendEvent({ keyId: "k1", ok: false, status: 429, errorKind: "rate_limit", model: "keep" });
+  const kept = queryEvents({}).items.find((e) => e.model === "keep");
+  check(kept.status === 429 && kept.ok === false, "正常 status/ok 语义不回退");
+  // 聚合不被脏事件污染：dirty 事件 token 字段删除后窗口聚合仍只计合法事件
+  const u2 = usageByKey("k1");
+  check(u2.h5.input === 100, "脏数据不进 token 聚合", "input=" + u2.h5.input);
   const mode = (statSync(DATA + "/stats.jsonl").mode & 0o777).toString(8);
   check(mode === "600", "stats.jsonl 权限 600", mode);
   setRetention(999); // clamp 31

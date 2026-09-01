@@ -329,6 +329,21 @@ async function main() {
     ? bad("cutbody 拒绝噪音", mgrStderr.slice(stderrMark2).trim().split("\n").slice(0, 3).join(" | "))
     : ok("非流式断连无 unhandledRejection 噪音");
 
+  // ── T9d 上游脏 usage 净化（P1-6：字符串/对象/null usage 不得入 stats/历史）──
+  console.log("\n=== T9d bad usage sanitization (P1-6) ===");
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "badusage" }] });
+  r = await gw({ model: "m-badusage", messages: [] });
+  r.status === 200 ? ok("badusage 请求仍 200") : bad("badusage status", "got " + r.status);
+  await sleep(200);
+  r = await admin("/admin/api/history?pageSize=1");
+  ev = JSON.parse(r.body).items[0];
+  ev && ev.model === "m-badusage" && typeof ev.inputTokens === "number" && typeof ev.outputTokens === "number" && typeof ev.cachedTokens === "number" &&
+    ev.inputTokens === 0 && ev.outputTokens === 0 && ev.cachedTokens === 0
+    ? ok("history usage 净化为数值 0（非字符串/对象/null）", JSON.stringify([ev.inputTokens, ev.outputTokens, ev.cachedTokens]))
+    : bad("badusage 净化", JSON.stringify(ev));
+  !r.body.includes("onerror") && !r.body.includes("<img") ? ok("history 响应体无原始脏串残留") : bad("badusage 泄漏", r.body.slice(0, 200));
+
   // ── T10 客户端断连（KNOWN: P2-1）──
   console.log("\n=== T10 client disconnect ===");
   await restartClean();
@@ -481,8 +496,20 @@ async function main() {
   r.status === 401 ? ok("login 错 token 401") : bad("login 401", "status=" + r.status);
   r = await http1(MG + "/admin", "GET", {});
   r.status === 200 && r.body.includes("<html") ? ok("/admin 页面") : bad("/admin", "status=" + r.status);
+  // ── P2-7 CSP + nosniff：仅管理面（含 /admin/api/*），/v1/* 不加 ──
+  r.headers["content-security-policy"] && /script-src 'self'/.test(r.headers["content-security-policy"])
+    ? ok("/admin CSP（script-src 'self'）") : bad("/admin CSP", JSON.stringify(r.headers["content-security-policy"]));
+  r.headers["x-content-type-options"] === "nosniff" ? ok("/admin nosniff") : bad("/admin nosniff", JSON.stringify(r.headers["x-content-type-options"]));
   r = await http1(MG + "/admin/app.mjs", "GET", {});
   r.status === 200 && (r.headers["content-type"] || "").includes("javascript") ? ok("app.mjs content-type") : bad("app.mjs", "status=" + r.status);
+  r.headers["content-security-policy"] && r.headers["x-content-type-options"] === "nosniff"
+    ? ok("/admin/app.mjs CSP+nosniff") : bad("app.mjs CSP", JSON.stringify([r.headers["content-security-policy"], r.headers["x-content-type-options"]]));
+  r = await http1(MG + "/admin/style.css", "GET", {});
+  !!r.headers["content-security-policy"] ? ok("/admin/style.css CSP") : bad("style.css CSP", "");
+  r = await http1(MG + "/admin/api/keys", "GET", { "X-Admin-Token": ADMIN });
+  !!r.headers["content-security-policy"] ? ok("/admin/api/* CSP") : bad("api CSP", "");
+  r = await http1(MG + "/health", "GET", {});
+  r.headers["content-security-policy"] === undefined ? ok("/health 不加 CSP（仅 /admin 面）") : bad("/health CSP 越界", JSON.stringify(r.headers["content-security-policy"]));
   r = await http1(MG + "/nope", "GET", {});
   r.status === 404 ? ok("未知路径 404") : bad("404", "status=" + r.status);
   r = await http1(MG + "/", "GET", {});
@@ -615,6 +642,7 @@ async function main() {
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "ok" }] });
   r = await http1(MG + "/v1/models", "GET", { Authorization: "Bearer " + CLIENT });
   r.status === 200 ? ok("/v1/models 透传") : bad("/v1/models", "status=" + r.status + " " + r.body.slice(0, 120));
+  r.headers["content-security-policy"] === undefined ? ok("/v1/models 无 CSP（网关面不加）") : bad("/v1 CSP 越界", JSON.stringify(r.headers["content-security-policy"]));
   r = await http1(MG + "/v1/models", "GET", {});
   r.status === 401 ? ok("/v1/models 鉴权") : bad("/v1/models auth", "status=" + r.status);
   r = await http1(MG + "/v1/messages", "POST", { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT }, JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "x" }] }));

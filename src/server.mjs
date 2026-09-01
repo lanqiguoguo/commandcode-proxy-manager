@@ -75,6 +75,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const p = url.pathname;
+  // P2-7：CSP 仅作用于管理面（/admin 页面、静态资源、/admin/api/*——含 SSE，
+  // writeHead 会与 setHeader 初始状态合并故统一在此挂头）。app.mjs 重构为事件委托后
+  // 已无内联脚本，script-src 收紧到 'self'；样式有动态内联 style 属性（bar width:NN%）
+  // 故 style-src 需 'unsafe-inline'。connect-src 'self' 覆盖同源 fetch 与 EventSource。
+  // /v1/* 为网关代理上游响应，不加（保守：只加 admin 面）。
+  if (p === "/admin" || p.startsWith("/admin/")) {
+    res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+  }
   try {
     if (p === "/health") {
       let ok = false;

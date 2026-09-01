@@ -60,8 +60,28 @@ function scheduleCompact() {
   if (compactTimer.unref) compactTimer.unref();
 }
 
+// P1-6：数值字段入口净化——调用方（或经上游数据间接）可能带出字符串/对象/null，
+// 落盘后无法回收且污染窗口聚合与前端渲染。有限数（含可无损转换的数字字符串）归一为
+// number；其余（NaN/Infinity/null/undefined/布尔/对象/空串）删除字段——与既有
+// “无 usage 数据 = 字段缺省”的语义一致（聚合侧 `|| 0`、渲染侧 `?? "-"` 均有兜底）。
+// ok/status 判定语义不回退：status 为有限数时原样保留（429 等状态判定依赖它）。
+function sanitizeNumeric(event, fields) {
+  for (const f of fields) {
+    const v = event[f];
+    if (v === undefined) continue;
+    if (typeof v === "number") {
+      if (!Number.isFinite(v)) delete event[f];
+      continue;
+    }
+    const n = typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+    if (Number.isFinite(n)) event[f] = n;
+    else delete event[f];
+  }
+}
+
 export function appendEvent(ev) {
   const event = { ts: Date.now(), ...ev };
+  sanitizeNumeric(event, ["inputTokens", "outputTokens", "cachedTokens", "latencyMs", "retries", "status"]);
   events.push(event);
   try {
     // mode 0o600：文件已存在时忽略，仅创建时生效（DESIGN §9.4 全部数据文件 600）

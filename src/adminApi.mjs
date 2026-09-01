@@ -1,11 +1,11 @@
-// ── 管理 REST API + SSE + 日志环形缓冲 ─────────────────
+// ── 管理 REST API + SSE + 系统日志（logs.mjs 持久化） ─────
 import crypto from "crypto";
 import { getConfig, saveConfig } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as quota from "./quota.mjs";
 import * as stats from "./stats.mjs";
+import { getLogs, setRetention as logsSetRetention } from "./logs.mjs";
 
-const logRing = [];
 let emitter = null;
 
 // SSE 专用 cookie：EventSource 无法带自定义 header，token 走 query 会泄漏到
@@ -28,10 +28,7 @@ function parseCookies(req) {
 
 export function initAdminApi(emitterRef) {
   emitter = emitterRef;
-  emitter.on("log", (entry) => {
-    logRing.push({ ts: Date.now(), level: entry.level || "info", msg: entry.msg });
-    if (logRing.length > 2000) logRing.shift(); // DESIGN §6：内存环形缓冲 2000 条
-  });
+  // log 事件的落盘/环缓在 logs.mjs initLogs 中统一订阅处理
 }
 
 function sendJson(res, status, data, extraHeaders) {
@@ -75,11 +72,11 @@ function readJsonBody(req, opts = {}) {
 const POOL_FIELDS = [
   "strategy", "maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs",
   "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
-  "softStop", "quotaRefreshMs", "zeroOutputCountsAs429", "historyRetentionDays"
+  "softStop", "quotaRefreshMs", "quotaRefreshGapMs", "zeroOutputCountsAs429", "historyRetentionDays"
 ];
 const INT_FIELDS = ["maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs",
   "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
-  "softStop", "quotaRefreshMs", "historyRetentionDays"];
+  "softStop", "quotaRefreshMs", "quotaRefreshGapMs", "historyRetentionDays"];
 
 function sanitizePoolPatch(body) {
   const patch = {};
@@ -100,6 +97,7 @@ function sanitizePoolPatch(body) {
       else if (k === "weeklyHardStop") v = Math.max(50, Math.min(100, Math.round(v)));
       else if (k === "softStop") v = Math.max(50, Math.min(100, Math.round(v)));
       else if (k === "quotaRefreshMs") v = Math.max(5000, Math.min(3600000, Math.round(v)));
+      else if (k === "quotaRefreshGapMs") v = Math.max(0, Math.min(60000, Math.round(v)));
       else if (k === "historyRetentionDays") v = Math.max(1, Math.min(31, Math.round(v)));
       else v = Math.round(v);
       // 语义约束：backoffMax 必须 >= backoffBase，阈值需 softStop <= hardStop 在调用方处理
@@ -266,7 +264,10 @@ export async function handleAdmin(req, res, url) {
       pool.setPoolCfg(patch);
       saveConfig();
       if (patch.quotaRefreshMs !== undefined) quota.setRefreshMs(patch.quotaRefreshMs);
-      if (patch.historyRetentionDays !== undefined) stats.setRetention(patch.historyRetentionDays);
+      if (patch.historyRetentionDays !== undefined) {
+        stats.setRetention(patch.historyRetentionDays);
+        logsSetRetention(patch.historyRetentionDays); // 系统日志同保留策略
+      }
       sendJson(res, 200, { ok: true, poolCfg: pool.getPoolCfg() });
       return true;
     }
@@ -286,10 +287,12 @@ export async function handleAdmin(req, res, url) {
       return true;
     }
 
-    // ── logs ──
+    // ── logs ──（logs.mjs 持久化环：启动回放 + 按保留天数清理，跨重启不丢；src=manager|proxy 过滤）
     if (p === "/admin/api/logs" && req.method === "GET") {
       const since = Number(url.searchParams.get("since")) || 0;
-      sendJson(res, 200, { logs: logRing.filter((l) => l.ts > since) });
+      const limit = Number(url.searchParams.get("limit")) || 2000;
+      const src = url.searchParams.get("src") || "";
+      sendJson(res, 200, { logs: getLogs({ since, limit, src }) });
       return true;
     }
 
@@ -306,16 +309,19 @@ export async function handleAdmin(req, res, url) {
       };
       const onQuota = (d) => send("quota", d);
       const onStats = (d) => send("stats", d);
-      const onLog = (d) => send("log", { ts: Date.now(), level: d.level || "info", msg: d.msg });
+      const onLog = (d) => send("log", { ts: d.ts || Date.now(), level: d.level || "info", msg: d.msg, src: d.src || "manager" });
+      const onQuotaStatus = (d) => send("quota-status", d);
       emitter.on("quota", onQuota);
       emitter.on("stats", onStats);
       emitter.on("log", onLog);
+      emitter.on("quotaStatus", onQuotaStatus);
       const keep = setInterval(() => { try { res.write(": keepalive\n\n"); } catch {} }, 15000);
       req.on("close", () => {
         clearInterval(keep);
         emitter.off("quota", onQuota);
         emitter.off("stats", onStats);
         emitter.off("log", onLog);
+        emitter.off("quotaStatus", onQuotaStatus);
       });
       return true;
     }

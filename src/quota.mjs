@@ -1,7 +1,9 @@
 // ── 官方额度探测（whoami / billing / usage，软失败 + TTL 缓存） ──
 import { readJson, debouncedWriter } from "./state.mjs";
 
-const API_BASE = "https://api.commandcode.ai";
+// 真实端点；e2e 通过 CC_QUOTA_BASE 指向 mock（与 config 的 host/port 覆写同风格）。
+// 默认生产地址，未知环境变量不会产生任何行为差异。
+const API_BASE = process.env.CC_QUOTA_BASE || "https://api.commandcode.ai";
 const PATH_WHOAMI = "/alpha/whoami";
 const PATH_CREDITS = "/alpha/billing/credits";
 const PATH_SUBSCRIPTIONS = "/alpha/billing/subscriptions";
@@ -10,10 +12,25 @@ const PROBE_TIMEOUT = 8000;
 
 let cache = new Map();
 let pool = null;
-let cfg = { quotaRefreshMs: 60000, fiveHourHardStop: 90, weeklyHardStop: 90, softStop: 80 };
+let cfg = { quotaRefreshMs: 60000, quotaRefreshGapMs: 2000, fiveHourHardStop: 90, weeklyHardStop: 90, softStop: 80 };
 let persistCache = null;
 let timer = null;
 let emitter = null;
+
+// 上游风控要求：多 Key 不得并发打官方 API。所有探测经串行队列，
+// 自动全量刷新时 Key 之间再额外间隔 quotaRefreshGapMs。
+let chain = Promise.resolve();
+function enqueue(fn) {
+  const run = chain.then(fn, fn);
+  chain = run.then(() => {}, () => {});
+  return run;
+}
+let sweeping = null; // 当前扫描的完成 promise（测试/调用方可 await，避免竞态）
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function emitStatus(keyId, phase) {
+  if (emitter) emitter.emit("quotaStatus", { keyId, phase, ts: Date.now() });
+}
 
 export function initQuota(poolRef, poolCfg, opts = {}) {
   pool = poolRef;
@@ -96,7 +113,21 @@ function toMs(iso) {
   return Number.isFinite(t) ? t : 0;
 }
 
-export async function probeKey(keyId) {
+export function probeKey(keyId) {
+  return enqueue(async () => {
+    emitStatus(keyId, "updating");
+    try {
+      const out = await doProbe(keyId);
+      emitStatus(keyId, out && out.stale ? "error" : "done");
+      return out;
+    } catch (e) {
+      emitStatus(keyId, "error");
+      throw e;
+    }
+  });
+}
+
+async function doProbe(keyId) {
   const rec = pool.getKeyRecord(keyId);
   if (!rec || !rec.key) return null;
   const prev = cache.get(keyId) || null;
@@ -225,22 +256,39 @@ export async function refreshKey(keyId) {
 }
 
 export async function refreshAll() {
+  if (sweeping) return sweeping; // 上一轮还没跑完（Key 多/网络慢）时跳过本次，避免探测排队叠加
   const recs = pool.listKeys().filter((k) => k.enabled);
-  await Promise.allSettled(recs.map((r) => probeKey(r.id)));
+  if (!recs.length) return;
+  const done = (async () => {
+    // 间隔实时读池配置（admin PUT 即生效，stale 快照仅兜底）
+    const live = typeof pool.getPoolCfg === "function" ? pool.getPoolCfg() : cfg;
+    const gap = Math.max(0, live.quotaRefreshGapMs ?? 2000);
+    for (const r of recs) {
+      try { await probeKey(r.id); } catch {}
+      if (gap > 0) await sleep(gap);
+    }
+  })();
+  sweeping = done.then(() => { sweeping = null; }, () => { sweeping = null; });
+  return sweeping;
 }
 
 export function getReport(keyId) {
   return cache.get(keyId) || null;
 }
 
-export async function testKey(keyId) {
-  const rec = pool.getKeyRecord(keyId);
-  if (!rec) throw new Error("Key 不存在");
-  try {
-    const r = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
-    // fetchJson 已识别 HTTP 4xx 与 200+success:false 两种失败形态
-    return { ok: !r.err, status: r.err ? (r.status || 0) : 200 };
-  } catch {
-    return { ok: false, status: 0 };
-  }
+export function testKey(keyId) {
+  return enqueue(async () => { // 与其他探测串行，避免并发打 whoami 触发风控
+    const rec = pool.getKeyRecord(keyId);
+    if (!rec) throw new Error("Key 不存在");
+    emitStatus(keyId, "testing");
+    try {
+      const r = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
+      // fetchJson 已识别 HTTP 4xx 与 200+success:false 两种失败形态
+      return { ok: !r.err, status: r.err ? (r.status || 0) : 200 };
+    } catch {
+      return { ok: false, status: 0 };
+    } finally {
+      emitStatus(keyId, "idle");
+    }
+  });
 }

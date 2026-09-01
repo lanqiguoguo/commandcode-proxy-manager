@@ -28,6 +28,7 @@ const DEFAULTS = {
     weeklyHardStop: 90,           // 每周窗口硬阈值（%）
     softStop: 80,                 // 软限制阈值（%）：保留但降级
     quotaRefreshMs: 60000,        // 额度探测刷新间隔
+    quotaRefreshGapMs: 2000,      // 全量刷新时相邻 Key 的探测间隔（上游风控：禁止并发打 API）
     zeroOutputCountsAs429: true,  // 零输出是否计入 429
     historyRetentionDays: 7       // 历史记录保留天数（1-31）
   }

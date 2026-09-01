@@ -8,6 +8,7 @@ import { loadConfig, getConfig, DATA_DIR } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as quota from "./quota.mjs";
 import { initStats, usageProviderForPool } from "./stats.mjs";
+import { initLogs, attachConsoleCapture } from "./logs.mjs";
 import { handleGateway } from "./gateway.mjs";
 import { initAdminApi, handleAdmin } from "./adminApi.mjs";
 
@@ -22,6 +23,10 @@ process.on("unhandledRejection", (reason) => {
 
 const cfg = loadConfig();
 
+// 0) 先挂上游日志捕获（早于上游 import：其启动/配置错误日志即刻入环），
+//    再回放磁盘历史并接事件总线
+attachConsoleCapture();
+
 // 1) 启动上游（vendored，同进程动态 import，零改动）
 //    EMBED_UPSTREAM=0 时不嵌入（便于独立部署上游/测试，转发仍走 UPSTREAM_HOST:UPSTREAM_PORT）
 if (process.env.EMBED_UPSTREAM !== "0") {
@@ -33,6 +38,7 @@ if (process.env.EMBED_UPSTREAM !== "0") {
 // 2) 子系统
 const emitter = new EventEmitter();
 initStats(emitter, cfg.pool.historyRetentionDays);
+initLogs(emitter, cfg.pool.historyRetentionDays); // 系统日志持久化（events.jsonl），先于其他子系统以捕获启动期日志
 pool.initKeyPool(cfg.pool, { emitter });
 pool.setUsageProvider(usageProviderForPool());
 quota.initQuota(pool, cfg.pool, { emitter });

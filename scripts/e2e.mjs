@@ -55,7 +55,7 @@ async function waitUp(url, timeout = 20000) {
 let mgr;
 async function startMgr(env = {}) {
   mgr = spawn("node", [resolve(ROOT, "src/server.mjs")], {
-    env: { ...process.env, DATA_DIR: DATA, PORT: "3088", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, ...env },
+    env: { ...process.env, DATA_DIR: DATA, PORT: "3088", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP, ...env },
     stdio: ["ignore", "pipe", "pipe"]
   });
   if (process.env.E2E_VERBOSE) {
@@ -487,6 +487,103 @@ async function main() {
   r = await gw({ model: "m-400", messages: [] });
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   r.status === 400 && calls.length === 1 ? ok("上游 400 透传不重试") : bad("4xx", "status=" + r.status + " calls=" + calls.length);
+
+  // ── T22 串行额度探测 / SSE 状态事件 / 系统日志持久化 ──
+  console.log("\n=== T22 serial probes & status events & log persistence ===");
+  await restartClean();
+  const rC = await admin("/admin/api/keys", "POST", { alias: "keyC", key: "user_keyC" });
+  ok("添加 keyC", String(rC.status));
+  ks = await keysList();
+  const idA22 = ks.find((k) => k.alias === "keyA").id, idC22 = ks.find((k) => k.alias === "keyC").id;
+  await mock("/__reset");
+  // SSE 收集 quota-status
+  const sseEvents = [];
+  const sseConn = await new Promise((resolveP) => {
+    const req = http.request(MG + "/admin/api/events", { headers: { "X-Admin-Token": ADMIN } }, (res) => {
+      let buf = "";
+      res.on("data", (c) => {
+        buf += c;
+        for (const m of buf.matchAll(/event: ([\w-]+)\ndata: (.*)\n/g)) sseEvents.push([m[1], m[2]]);
+        buf = buf.slice(-4000);
+      });
+      resolveP(req);
+    });
+    req.on("error", () => {});
+    req.end();
+  });
+  await sleep(200);
+  // 并发发起两个不同 Key 的刷新 → 后端必须串行（maxActive=1）
+  const [fA, fC] = await Promise.all([
+    admin("/admin/api/keys/" + idA22 + "/refresh-quota", "POST"),
+    admin("/admin/api/keys/" + idC22 + "/refresh-quota", "POST")
+  ]);
+  let qA = null;
+  try { qA = JSON.parse(fA.body).quota; } catch {}
+  qA && qA.stale === false && qA.fiveHour && qA.fiveHour.cap === 14 && typeof qA.fiveHour.resetAt === "string"
+    ? ok("探测成功：epoch-ms resetAt → ISO，fiveHour cap=14") : bad("探测结果", JSON.stringify(qA));
+  qA && qA.totals && qA.totals.runs === 42 ? ok("totals 采集（mock summary）") : bad("totals", JSON.stringify(qA && qA.totals));
+  const ql = JSON.parse((await mockGet("/__quota")).body);
+  ql.maxActive === 1 && ql.quotaLog.length >= 8
+    ? ok("并发刷新被串行化（探测 maxActive=1，共 " + ql.quotaLog.length + " 次）") : bad("串行化", "maxActive=" + ql.maxActive);
+  // 同 Key 连续探测时间线不得重叠（串行队列核心不变式）
+  let overlap = 0;
+  const sorted = [...ql.quotaLog].sort((a, b) => a.start - b.start);
+  for (let i = 1; i < sorted.length; i++) if (sorted[i].start < sorted[i - 1].end) overlap++;
+  overlap === 0 ? ok("探测时间线零重叠（严格串行）") : bad("时间线重叠", overlap + " 处");
+  const qEvents = sseEvents.filter(([n]) => n === "quota-status");
+  const phases = qEvents.map(([, d]) => { try { return JSON.parse(d).phase; } catch { return ""; } });
+  phases.includes("updating") && phases.includes("done")
+    ? ok("SSE quota-status 事件流（updating→done）", phases.slice(0, 6).join(">")) : bad("quota-status", JSON.stringify(phases.slice(0, 8)));
+  try { sseConn.destroy(); } catch {}
+  // 日志持久化：重启后 events.jsonl 回放，历史日志不丢
+  const logsBefore = JSON.parse((await admin("/admin/api/logs?since=0")).body).logs;
+  const addLine = logsBefore.filter((l) => l.msg.includes("新增 Key"));
+  r = await admin("/admin/api/keys/" + idC22, "DELETE");
+  await sleep(1300); // 防抖落盘窗口（logs 为同步 append，此处等 SSE/磁盘一致）
+  const fileHas = existsSync(resolve(DATA, "events.jsonl"));
+  fileHas ? ok("events.jsonl 已落盘") : bad("events.jsonl", "missing");
+  await stopMgr(); await startMgr();
+  const logsAfter = JSON.parse((await admin("/admin/api/logs?since=0")).body).logs;
+  logsAfter.length >= logsBefore.length && JSON.stringify(logsAfter).includes(addLine[0] ? addLine[0].msg.slice(0, 8) : "新增 Key")
+    ? ok("重启后系统日志保留（" + logsBefore.length + " → " + logsAfter.length + " 条）") : bad("日志持久化", logsBefore.length + " → " + logsAfter.length);
+  if (!JSON.stringify(logsAfter).includes("user_keyA")) ok("持久化日志无 Key 明文"); else bad("日志明文", "");
+
+  // ── T23 上游 proxy.mjs 日志捕获（嵌入模式）──
+  console.log("\n=== T23 proxy log capture ===");
+  await stopMgr();
+  // 独立起嵌入模式进程并捕获 stdout：验证 ①docker logs 通道原样透传 ②proxy 行进日志环/落盘
+  const embOut = await new Promise(async (resolveP) => {
+    const proc = spawn("node", [resolve(ROOT, "src/server.mjs")], {
+      env: { ...process.env, DATA_DIR: DATA, PORT: "3087", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3052", EMBED_UPSTREAM: "1", ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP },
+      stdio: ["ignore", "pipe", "pipe"]
+    }); // 嵌入上游监听 3052（避开 mock 的 3051）；quota 探测仍指 mock
+    let txt = "";
+    proc.stdout.on("data", (c) => { txt += c; });
+    proc.stderr.on("data", (c) => { txt += c; });
+    let logTxt = "";
+    for (let i = 0; i < 80; i++) {
+      try {
+        const rr = await http1("http://" + HOST + ":3087/admin/api/logs?since=0&src=proxy", "GET", { "X-Admin-Token": ADMIN });
+        if (rr.status === 200) { logTxt = rr.body; if (JSON.parse(logTxt).logs.length) break; }
+      } catch {}
+      await sleep(250);
+    }
+    const proxyLogs = JSON.parse(logTxt || "{\"logs\":[]}").logs;
+    resolveP({ txt, proxyLogs, proc });
+  });
+  const plogs = embOut.proxyLogs;
+  const pTxt = JSON.stringify(plogs);
+  plogs.length >= 1 && plogs.some((l) => l.msg.includes("CC Proxy started") && l.src === "proxy")
+    ? ok("T23a 上游启动日志入日志页（src=proxy，含捕获前于挂钩的启动行）", plogs.length + " 条") : bad("T23a", pTxt.slice(0, 250));
+  embOut.txt.includes("CC Proxy started") && embOut.txt.includes("[manager] CC Proxy Manager started")
+    ? ok("T23b stdout 原样透传不受捕获影响（docker logs 通道完好）") : bad("T23b", embOut.txt.slice(0, 250));
+  const diskHas = existsSync(resolve(DATA, "events.jsonl")) && readFileSync(resolve(DATA, "events.jsonl"), "utf-8").includes("\"src\":\"proxy\"");
+  diskHas ? ok("T23c proxy 行已落盘 events.jsonl") : bad("T23c", "file missing/no proxy lines");
+  // API 层 src 过滤 + level 字段存在
+  plogs.every((l) => ["info", "warn", "error"].includes(l.level)) ? ok("T23d level 字段规范化") : bad("T23d", pTxt.slice(0, 200));
+  embOut.proc.kill("SIGTERM");
+  await new Promise((r) => { embOut.proc.on("exit", r); setTimeout(r, 2000); });
+  await startMgr();
 
   // ── 汇总 ──
   console.log(`\n=== summary: ${pass} passed, ${fail} failed, ${known} known-issue ===`);

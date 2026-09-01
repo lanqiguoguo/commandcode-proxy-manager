@@ -4,7 +4,10 @@
   --warn: #e8a13c; --bad: #e05252; --quota0: #2fbf71; --quota1: #e8a13c; --quota2: #e05252;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+/* 字体跟随浏览器默认设置（用户可在浏览器外观里自行指定）；
+   数字/日志等 .mono 列保留等宽栈以保证对齐可读 */
+body { margin: 0; background: var(--bg); color: var(--text); font-family: revert; font-size: 14px; line-height: 1.5; }
+button, input, select, textarea { font-family: inherit; }
 header { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
 .brand { font-weight: 700; color: var(--accent); }
 nav { display: flex; gap: 6px; flex: 1; }
@@ -62,6 +65,9 @@ tr:hover td { background: var(--panel2); }
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .log-list { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-height: 60vh; overflow: auto; }
 .log-list div { padding: 3px 6px; border-bottom: 1px solid var(--border); white-space: pre-wrap; word-break: break-all; }
+.log-list .lv-warn { color: var(--warn); }
+.log-list .lv-error { color: var(--bad); }
+.badge.log-src { padding: 0 6px; font-size: 10px; margin-right: 6px; vertical-align: 1px; }
 .empty { color: var(--dim); text-align: center; padding: 40px; }
 /* ── 响应式：移动端适配 ── */
 @media (max-width: 720px) {

@@ -2,7 +2,8 @@
 //   quota 额度感知（硬阈值/软限制/stale/credits 到期兜底/陷阱规则）
 //   keyPool 选 Key（主备/退避/authError/软限制降级/排除已试/冷却）
 //   stats 保留清理（回放/prune/retention clamp/权限）
-// 用法：node scripts/unit.mjs [quota|pool|stats]   （缺省依次全部跑，每场景独立子进程）
+//   logs 持久化 + 上游 proxy 日志捕获（时序/去重/脱敏/src 过滤）
+// 用法：node scripts/unit.mjs [quota|pool|stats|logs]   （缺省依次全部跑，每场景独立子进程）
 import { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -12,7 +13,7 @@ const SC = process.argv[2];
 if (!SC) {
   // runner 模式：逐场景子进程执行（DATA_DIR 在各子进程 import 前注入，互不污染）
   let failed = false;
-  for (const s of ["quota", "pool", "stats"]) {
+  for (const s of ["quota", "pool", "stats", "logs"]) {
     const code = await new Promise((resolveP) => {
       const p = spawn(process.execPath, [fileURLToPath(import.meta.url), s], { stdio: "inherit" });
       p.on("exit", (c) => resolveP(c));
@@ -286,6 +287,70 @@ if (SC === "stats") {
   check(mode === "600", "stats.jsonl 权限 600", mode);
   setRetention(999); // clamp 31
   check(true, "setRetention 越界 clamp 不抛错");
+}
+
+// ════ logs（持久化 + proxy 捕获）════
+if (SC === "logs") {
+  console.log("=== logs 持久化与上游捕获 ===");
+  const { EventEmitter } = await import("events");
+  const L = await import("../src/logs.mjs");
+  const { attachConsoleCapture, initLogs, getLogs, setRetention } = L;
+  const bus = new EventEmitter();
+  const realLog = console.log;
+
+  // 1) 捕获早于回放（两阶段启动）：先挂捕获。
+  //    上游 log() 是单参数预格式化字符串（模板字面量），测试保持一致形态
+  attachConsoleCapture();
+  const oldIso = new Date(Date.now() - 10 * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const tsA = Date.now() - 5000;
+  console.log(`[${oldIso}] [info] CC Proxy started {"url":"http://127.0.0.1:3050"}`);
+  console.log(`[${new Date(tsA).toISOString().replace(/\.\d{3}Z$/, "Z")}] [warn] Stream idle timeout {"model":"m1"}`);
+  console.log(`[${new Date(tsA + 1000).toISOString().replace(/\.\d{3}Z$/, "Z")}] [error] Upstream error {"message":"boom"}`);
+  // keyPrefix 脱敏
+  console.log(`[${oldIso}] [info] Fingerprint generated for key {"keyPrefix":"user_ABCDEF123456"}`);
+  // abort 噪音去重（30s 内第二条吞掉）
+  const abortIso = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  console.log(`[${abortIso}] [info] Aborted request cleaned up`);
+  console.log(`[${abortIso}] [info] Aborted request cleaned up`);
+  // 非 proxy 格式不捕获
+  console.log("random manager output");
+  // 重入防护：再 attach 一次不应重复挂钩
+  attachConsoleCapture();
+  await new Promise((r) => setTimeout(r, 50));
+  check(true, "捕获挂接 + 重入防护不抛错");
+
+  // 2) initLogs 回放：文件里已有上面捕获的行，回放去重（不应翻倍）
+  initLogs(bus, 7);
+  const after = getLogs({});
+  const proxyRows = after.filter((l) => l.src === "proxy");
+  const dup = proxyRows.length - new Set(proxyRows.map((l) => l.ts + "|" + l.msg)).size;
+  check(dup === 0, "捕获期直写 + 回放合并无重复", "proxyRows=" + proxyRows.length + " dup=" + dup);
+  check(after.some((l) => l.msg.includes("CC Proxy started") && l.level === "info" && Date.now() - l.ts > 9 * 864e5), "proxy 行按日志内 ISO 时间戳入库（非当前时间）", JSON.stringify(after.find((l) => l.msg.includes("CC Proxy started"))));
+  check(after.some((l) => l.msg.includes("boom") && l.level === "error"), "error 级捕获 + 附加参数拼接");
+  const fp = after.find((l) => l.msg.includes("Fingerprint"));
+  check(fp && fp.msg.includes("user_***") && !fp.msg.includes("ABCDEF"), "keyPrefix 脱敏", JSON.stringify(fp && fp.msg));
+  const aborts = after.filter((l) => l.msg.startsWith("Aborted request"));
+  check(aborts.length === 1, "abort 噪音 30s 去重（2→1）", "got=" + aborts.length);
+  check(!after.some((l) => l.msg.includes("random manager output")), "非 proxy 格式行不入环");
+
+  // 3) manager emit 通路（bus emit log → listener append，src 默认 manager）
+  bus.emit("log", { level: "info", msg: "新增 Key: user_x***yz" });
+  const mgrRows = getLogs({ src: "manager" });
+  check(mgrRows.some((l) => l.msg.includes("新增 Key") && l.src === "manager"), "manager emit 入环 src=manager");
+  const onlyProxy = getLogs({ src: "proxy" });
+  check(onlyProxy.every((l) => l.src === "proxy"), "src=proxy 过滤纯净");
+  check(getLogs({}).length >= mgrRows.length + onlyProxy.length, "src 过滤不影响全量查询");
+
+  // 4) 落盘权限 + retention 清理
+  const mode = (statSync(DATA + "/events.jsonl").mode & 0o777).toString(8);
+  check(mode === "600", "events.jsonl 权限 600", mode);
+  // 未来时间戳行：setRetention 缩小窗口后仍保留；旧行被清理
+  const beforeN = getLogs({}).length;
+  setRetention(1); // 1 天：ISO 2026-09-01T00:00 的行相对当前(09-01 中午后)可能仍在 1 天内；用远古 ts 行验证
+  bus.emit("log", { ts: 1500000000000, level: "info", msg: "ancient" }); // 2017 年
+  setRetention(1);
+  check(!getLogs({}).some((l) => l.msg === "ancient"), "retention 清理过期行");
+  void beforeN;
 }
 
 console.log(`\n=== unit(${SC}) summary: ${pass} passed, ${fail} failed ===`);

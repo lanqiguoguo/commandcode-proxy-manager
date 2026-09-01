@@ -12,6 +12,11 @@ const HOST = process.env.MOCK_HOST || "127.0.0.1";
 const scripts = new Map(); // authKey → [spec...]
 const calls = [];
 const slowLog = [];
+// 额度探测时间线（串行/间隔断言用）
+const quotaLog = [];
+let quotaActive = 0;
+let quotaMaxActive = 0;
+const quotaLatency = Number(process.env.MOCK_QUOTA_LATENCY || 120);
 
 function json(res, status, data, headers) {
   res.writeHead(status, Object.assign({ "Content-Type": "application/json" }, headers || {}));
@@ -34,11 +39,34 @@ const server = http.createServer((req, res) => {
       json(res, 200, { ok: true }); return;
     }
     if (p === "/__calls") { json(res, 200, { calls }); return; }
+    if (p === "/__quota") { json(res, 200, { quotaLog, maxActive: quotaMaxActive }); return; }
     if (p === "/__slow") { json(res, 200, { slowLog }); return; }
-    if (p === "/__reset") { scripts.clear(); calls.length = 0; slowLog.length = 0; json(res, 200, { ok: true }); return; }
+    if (p === "/__reset") { scripts.clear(); calls.length = 0; slowLog.length = 0; quotaLog.length = 0; quotaMaxActive = quotaActive; json(res, 200, { ok: true }); return; }
 
     let parsed = {};
     try { parsed = JSON.parse(body || "{}"); } catch {}
+    // ── 额度探测端点（quota.mjs 经 CC_QUOTA_BASE 指向本 mock；记录时间线用于
+    //    串行/间隔断言，但不进 /__calls 计数，避免干扰 chat 路径断言）。
+    //    resetAt 故意用 epoch 毫秒——与真实 API 一致，回归 parseWindow 数字形态。
+    if (p === "/alpha/whoami" || p.startsWith("/alpha/billing") || p.startsWith("/alpha/usage")) {
+      const now = Date.now();
+      // 持有自身条目引用：/__reset 清空数组不影响在途探测的回填（防 undefined 崩溃）
+      const e = { p, auth, start: now, active: ++quotaActive };
+      quotaLog.push(e);
+      if (quotaActive > quotaMaxActive) quotaMaxActive = quotaActive;
+      await sleep(quotaLatency); // 轻微延迟，让并发/串行可测
+      e.end = Date.now(); e.active = --quotaActive;
+      if (p === "/alpha/whoami") return json(res, 200, { success: true, data: { org: { id: "o_test" } } });
+      if (p === "/alpha/billing/credits") return json(res, 200, {
+        credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 },
+        windowLimits: {
+          fiveHour: { cap: 14, used: 1, resetAt: Date.now() + 3600e3 },
+          weekly: { cap: 35, used: 5, resetAt: Date.now() + 2 * 864e5 }
+        }
+      });
+      if (p === "/alpha/billing/subscriptions") return json(res, 200, { success: true, data: { currentPeriodStart: "2026-08-25T23:33:28.000Z", currentPeriodEnd: "2026-09-25T23:33:28.000Z", planId: "individual-goat" } });
+      return json(res, 200, { totalCount: 42, completedCount: 42, failedCount: 0, successRate: 100, totalTokensIn: 1000, totalTokensOut: 234, totalTokens: 1234, totalCost: 5.5 });
+    }
     const q = scripts.get(auth);
     const spec = (q && q.length) ? q.shift() : { mode: parsed.testMode || "ok", retryAfter: parsed.retryAfter };
     calls.push({ t: Date.now(), auth, path: p, mode: spec.mode });

@@ -85,6 +85,7 @@ function withFormPreserved(fn) {
 function tick() {
   const el = document.getElementById("tick");
   if (el) el.textContent = new Date().toLocaleTimeString();
+  sweepBusy(); // busy TTL 到期清理（dashboard/keys 视图随后本就会重绘）
   if (state.view === "dashboard") {
     refresh().then(() => render());
   } else if (state.view === "keys") {
@@ -157,6 +158,27 @@ function barHtml(label, p, sub) {
   return '<div class="bar-label"><span>' + esc(label) + '</span><span class="mono">' + esc(sub || "") + "</span></div>" +
     '<div class="bar"><div class="bar-fill ' + barClass(p) + '" style="width:' + p + '%"></div></div>';
 }
+// 每 Key 的即时状态（updating/testing）：本地操作置位 + SSE quota-status 事件
+// 同步（他人触发的自动刷新/测试也能看到"更新中"），done/error/idle 清除；
+// 30s TTL 兜底：SSE 恰好断开错过 done 时不致徽标永久挂死
+const busy = {};
+const BUSY_LABEL = { updating: "额度更新中…", testing: "测试中…" };
+const BUSY_TTL_MS = 30000;
+function setBusy(id, phase) { busy[id] = { phase, at: Date.now() }; }
+function clearBusy(id) { delete busy[id]; }
+function busyPhase(id) {
+  const b = busy[id];
+  if (!b) return "";
+  if (Date.now() - b.at > BUSY_TTL_MS) { delete busy[id]; return ""; }
+  return b.phase;
+}
+function sweepBusy() {
+  let changed = false;
+  for (const id of Object.keys(busy)) {
+    if (Date.now() - busy[id].at > BUSY_TTL_MS) { delete busy[id]; changed = true; }
+  }
+  return changed;
+}
 function healthOf(k) {
   const h = k.health || {};
   const now = Date.now();
@@ -168,18 +190,22 @@ function healthOf(k) {
 }
 
 async function refreshKeyQuota(id) {
+  setBusy(id, "updating"); render();
   try {
     await api("/admin/api/keys/" + id + "/refresh-quota", { method: "POST" });
-    await refresh(); render();
+    await refresh();
   } catch (e) { alert(e.message); }
+  clearBusy(id); render();
 }
 async function testKey(id) {
+  setBusy(id, "testing"); render();
   try {
     const r = await api("/admin/api/keys/" + id + "/test", { method: "POST" });
+    clearBusy(id); render();
     alert(r.ok ? "Key 有效 (HTTP " + r.status + ")" : "Key 无效 (HTTP " + (r.status || "timeout") + ")");
     if (r.ok) await api("/admin/api/keys/" + id + "/clear-auth", { method: "POST" });
     await refresh(); render();
-  } catch (e) { alert(e.message); }
+  } catch (e) { clearBusy(id); render(); alert(e.message); }
 }
 async function toggleKey(k) {
   await api("/admin/api/keys/" + k.id, { method: "PUT", body: JSON.stringify({ enabled: !k.enabled }) });
@@ -279,10 +305,10 @@ function keyCard(k) {
     '<span class="badge pri">' + (k.priority === 0 ? "主" : "备" + k.priority) + "</span>" +
     "<strong>" + esc(k.alias || "未命名") + "</strong>" +
     '<span class="mono muted">' + esc(k.maskedKey) + "</span>" +
-    '<span class="badge ' + h.cls + '">' + h.label + "</span>" +
+    (busyPhase(k.id) ? '<span class="badge accent busy-badge">' + BUSY_LABEL[busyPhase(k.id)] + "</span>" : '<span class="badge ' + h.cls + '">' + h.label + "</span>") +
     "</div>" +
     '<div class="row key-actions">' +
-    '<button class="small ghost" onclick="ccpmRefreshQuota(\'' + k.id + '\')">刷新额度</button>' +
+    '<button class="small ghost" onclick="ccpmRefreshQuota(\'' + k.id + '\')" ' + (busyPhase(k.id) ? "disabled" : "") + '>' + (busyPhase(k.id) === "updating" ? "更新中…" : "刷新额度") + "</button>" +
     '<button class="small ghost" onclick="ccpmToggle(\'' + k.id + '\')">' + (k.enabled ? "停用" : "启用") + "</button>" +
     '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
     "</div>" +
@@ -321,10 +347,10 @@ function renderKeys() {
       '<span class="badge pri">' + (k.priority === 0 ? "主" : "备" + k.priority) + "</span></td>" +
       "<td>" + esc(k.alias || "未命名") + "</td>" +
       '<td class="mono">' + esc(k.maskedKey) + "</td>" +
-      '<td><span class="badge ' + h.cls + '">' + h.label + "</span> " + (k.enabled ? "" : '<span class="badge">已停用</span>') + "</td>" +
+      '<td>' + (busyPhase(k.id) ? '<span class="badge accent busy-badge">' + BUSY_LABEL[busyPhase(k.id)] + "</span>" : '<span class="badge ' + h.cls + '">' + h.label + "</span>") + " " + (k.enabled ? "" : '<span class="badge">已停用</span>') + "</td>" +
       '<td class="muted small">' + esc(k.note || "") + "</td>" +
       "<td>" +
-      '<button class="small ghost" onclick="ccpmTest(\'' + k.id + '\')">测试</button> ' +
+      '<button class="small ghost" onclick="ccpmTest(\'' + k.id + '\')" ' + (busyPhase(k.id) ? "disabled" : "") + ">" + (busyPhase(k.id) === "testing" ? "测试中…" : "测试") + "</button> " +
       '<button class="small ghost" onclick="ccpmToggle(\'' + k.id + '\')">' + (k.enabled ? "停用" : "启用") + "</button> " +
       '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
       "</td></tr>";
@@ -505,30 +531,42 @@ async function exportCsv() {
 function csvCell(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
 
 // ── 设置 ──
+const STRATEGY_INFO = {
+  "active-standby": { label: "主备模式（默认）", desc: "任一时刻只使用优先级最高的可用 Key（列表第 1 位=主 Key），主 Key 限流退避或额度受限才切换到备 Key，恢复后自动回主。对外始终呈现单一账号特征，最不容易触发上游风控。绝大多数场景推荐保持此策略。" },
+  "round-robin": { label: "轮询", desc: "在全部可用 Key 之间依次轮流分配请求，均摊使用量。多账号同时活跃会改变账号行为特征，风控风险相对更高；仅在确需均摊额度时使用。" },
+  "least-usage": { label: "最少用量优先", desc: "每次选择最近 5 小时 token 消耗最少的可用 Key，自动向空闲账号倾斜。同样属于多账号并发模式，风控特征与轮询类似。" },
+};
+const MS_FIELDS = ["sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs", "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "quotaRefreshMs", "quotaRefreshGapMs"];
 function renderSettings() {
   const p = (state.pool && state.pool.poolCfg) || {};
   let html = "<h2>设置</h2>";
   html += '<div class="card mb">' +
     "<h3>池与退避</h3>" +
     '<div class="filters">' +
-    field("strategy", "选 Key 策略", "select", ["active-standby", "round-robin", "least-usage"], p.strategy) +
+    field("strategy", "选 Key 策略", "select", Object.keys(STRATEGY_INFO), p.strategy) +
     field("maxRetries", "最大重试次数", "number", null, p.maxRetries) +
     field("sameKeyRetryCount", "同 Key 重试次数", "number", null, p.sameKeyRetryCount) +
-    field("sameKeyRetryDelayMs", "同 Key 重试间隔 ms", "number", null, p.sameKeyRetryDelayMs) +
-    field("sameKeyRetryMaxWaitMs", "同 Key 重试最大等待 ms", "number", null, p.sameKeyRetryMaxWaitMs) +
-    field("backoffBaseMs", "退避基数 ms", "number", null, p.backoffBaseMs) +
-    field("backoffMaxMs", "退避上限 ms", "number", null, p.backoffMaxMs) +
-    field("connectTimeoutMs", "上游响应头超时 ms", "number", null, p.connectTimeoutMs) +
-    field("failoverCooldownMs", "切换冷却 ms", "number", null, p.failoverCooldownMs) +
+    fieldSec("sameKeyRetryDelayMs", "同 Key 重试间隔（秒）", p.sameKeyRetryDelayMs) +
+    fieldSec("sameKeyRetryMaxWaitMs", "同 Key 重试最大等待（秒）", p.sameKeyRetryMaxWaitMs) +
+    fieldSec("backoffBaseMs", "退避基数（秒）", p.backoffBaseMs) +
+    fieldSec("backoffMaxMs", "退避上限（秒）", p.backoffMaxMs) +
+    fieldSec("connectTimeoutMs", "上游响应头超时（秒）", p.connectTimeoutMs) +
+    fieldSec("failoverCooldownMs", "切换冷却（秒）", p.failoverCooldownMs) +
     field("fiveHourHardStop", "5h 硬阈值 %", "number", null, p.fiveHourHardStop) +
     field("weeklyHardStop", "每周硬阈值 %", "number", null, p.weeklyHardStop) +
     field("softStop", "软限制阈值 %", "number", null, p.softStop) +
-    field("quotaRefreshMs", "额度刷新间隔 ms", "number", null, p.quotaRefreshMs) +
+    fieldSec("quotaRefreshMs", "额度自动刷新间隔（秒）", p.quotaRefreshMs) +
+    fieldSec("quotaRefreshGapMs", "多 Key 刷新间隔（秒）", p.quotaRefreshGapMs) +
     field("historyRetentionDays", "历史保留天数", "number", null, p.historyRetentionDays) +
     "</div>" +
     '<div class="row mt"><label style="margin:0"><input type="checkbox" id="f-zeroOutputCountsAs429" ' + (p.zeroOutputCountsAs429 ? "checked" : "") + '> 零输出计入 429</label></div>' +
     '<div class="mt"><button id="btn-save-pool">保存池配置</button> <span id="pool-msg"></span></div>' +
     "</div>";
+  html += '<div class="card mb"><h3>选 Key 策略说明</h3><table><thead><tr><th>策略</th><th>说明</th></tr></thead><tbody>' +
+    Object.entries(STRATEGY_INFO).map(([k, v]) =>
+      "<tr><td><b>" + esc(v.label) + "</b><div class='muted small mono'>" + esc(k) + "</div></td><td class='small'>" + esc(v.desc) + "</td></tr>"
+    ).join("") +
+    "</tbody></table></div>";
   html += '<div class="card">' +
     "<h3>令牌</h3>" +
     '<div class="muted small mb">clientToken 用于 /v1/* 客户端访问；未配置时自动回退使用 AdminToken。管理界面仍只认 AdminToken。</div>' +
@@ -543,10 +581,18 @@ function renderSettings() {
   document.getElementById("btn-save-sec").addEventListener("click", saveSecurity);
 }
 
+function fieldSec(id, label, msValue) {
+  const sec = msValue != null ? Math.round(Number(msValue) / 100) / 10 : "";
+  return '<div><label>' + esc(label) + '</label><input id="f-' + id + '" type="number" step="any" min="0" value="' + esc(sec) + '"></div>';
+}
+
 function field(id, label, type, options, value) {
   let input;
   if (type === "select") {
-    input = '<select id="f-' + id + '">' + options.map((o) => '<option value="' + o + '"' + (o === value ? " selected" : "") + ">" + o + "</option>").join("") + "</select>";
+    input = '<select id="f-' + id + '">' + options.map((o) => {
+      const text = (id === "strategy" && STRATEGY_INFO[o]) ? STRATEGY_INFO[o].label : o;
+      return '<option value="' + o + '"' + (o === value ? " selected" : "") + ">" + esc(text) + "</option>";
+    }).join("") + "</select>";
   } else {
     input = '<input id="f-' + id + '" type="' + type + '" value="' + esc(value ?? "") + '">';
   }
@@ -554,12 +600,19 @@ function field(id, label, type, options, value) {
 }
 
 async function savePool() {
-  const ids = ["strategy", "maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs", "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop", "softStop", "quotaRefreshMs", "historyRetentionDays"];
+  const ids = ["strategy", "maxRetries", "sameKeyRetryCount", "fiveHourHardStop", "weeklyHardStop", "softStop", "historyRetentionDays"];
   const body = {};
   for (const id of ids) {
     const el = document.getElementById("f-" + id);
     if (!el) continue;
     body[id] = el.type === "number" ? Number(el.value) : el.value;
+  }
+  // 秒显示字段换算回毫秒
+  for (const id of MS_FIELDS) {
+    const el = document.getElementById("f-" + id);
+    if (!el) continue;
+    const sec = Number(el.value);
+    if (Number.isFinite(sec) && sec >= 0) body[id] = Math.round(sec * 1000);
   }
   body.zeroOutputCountsAs429 = document.getElementById("f-zeroOutputCountsAs429").checked;
   try {
@@ -586,25 +639,39 @@ async function saveSecurity() {
   }
 }
 
-// ── 日志 ──（DESIGN §6：按 Key 过滤；SSE log 事件与轮询共用同一渲染）
+// ── 日志 ──（DESIGN §6：按 Key 过滤；SSE log 事件与轮询共用同一渲染；
+// 来源含 manager 自身事件与上游 proxy.mjs 捕获日志）
 function renderLogs() {
   const sel = state.logFilterKeyId || "";
-  const filtered = sel ? state.logs.filter((l) => l.msg.includes(sel)) : state.logs;
+  const src = state.logFilterSrc || "";
+  let filtered = src ? state.logs.filter((l) => (l.src || "manager") === src) : state.logs;
+  filtered = sel ? filtered.filter((l) => l.msg.includes(sel)) : filtered;
   app.innerHTML = "<h2>日志</h2>" +
-    '<div class="card mb"><label>按 Key 过滤：</label>' +
-    '<select id="log-filter"><option value="">全部</option>' +
+    '<div class="card mb"><div class="row">' +
+    '<div><label>来源</label><select id="log-src-filter"><option value="">全部</option>' +
+    '<option value="manager"' + (src === "manager" ? " selected" : "") + ">管理网关</option>" +
+    '<option value="proxy"' + (src === "proxy" ? " selected" : "") + ">上游代理</option></select></div>" +
+    '<div><label>按 Key 过滤</label><select id="log-filter"><option value="">全部</option>' +
     state.keys.map((k) => '<option value="' + esc(k.id) + '"' + (k.id === sel ? " selected" : "") + ">" + esc(k.alias || k.maskedKey) + "</option>").join("") +
-    "</select></div>" +
+    "</select></div></div></div>" +
     '<div class="card"><div class="log-list" id="log-list">' +
-    filtered.map((l) => "<div>[" + fmtTime(l.ts) + "] " + esc(l.msg) + "</div>").join("") +
+    filtered.map((l) => {
+      const lvl = l.level || "info";
+      const lvCls = lvl === "error" ? "lv-error" : lvl === "warn" ? "lv-warn" : "";
+      return '<div class="' + lvCls + '"><span class="badge log-src">' + (l.src === "proxy" ? "上游" : "网关") + "</span>[" + fmtTime(l.ts) + "] " + esc(l.msg) + "</div>";
+    }).join("") +
     "</div></div>";
+  document.getElementById("log-src-filter").addEventListener("change", (e) => {
+    state.logFilterSrc = e.target.value;
+    renderLogs();
+  });
   document.getElementById("log-filter").addEventListener("change", (e) => {
     state.logFilterKeyId = e.target.value;
     renderLogs();
   });
 }
 
-function logKey(l) { return l.ts + "|" + l.msg; }
+function logKey(l) { return l.ts + "|" + (l.src || "manager") + "|" + l.msg; }
 function pushLogs(incoming) {
   // SSE 与轮询双通道写入，按 ts+msg 去重合并（同毫秒竞态下时间游标不可靠）
   const seen = new Set(state.logs.map(logKey));
@@ -705,6 +772,15 @@ function startEventStream() {
     if (state.view !== "history") return;
     clearTimeout(statsDebounce);
     statsDebounce = setTimeout(() => loadHistory().catch(() => {}), 2000);
+  });
+  // 后端探测串行队列的即时状态：updating/testing 显示徽标，done/error/idle 清除
+  eventSource.addEventListener("quota-status", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (!d || !d.keyId) return;
+    if (d.phase === "updating" || d.phase === "testing") setBusy(d.keyId, d.phase);
+    else clearBusy(d.keyId);
+    if (state.view === "dashboard" || state.view === "keys") render();
   });
 }
 function stopEventStream() {

@@ -200,6 +200,18 @@ async function main() {
   ks = await keysList();
   ks.find((k) => k.alias === "keyA").health.backoffUntilMs <= Date.now() ? ok("重试成功不留退避") : bad("零输出退避", "");
 
+  // ── T7b zeroOutputCountsAs429=false → 零输出不计 429、不惩罚 Key ──
+  await restartClean();
+  await admin("/admin/api/pool", "PUT", { zeroOutputCountsAs429: false });
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "zeroout" }] });
+  r = await gw({ model: "m-zero-off", messages: [] });
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  ks = await keysList();
+  r.status === 429 && calls.length === 1 && ks.find((k) => k.alias === "keyA").health.backoffUntilMs <= Date.now()
+    ? ok("开关关闭：零输出透传、不重试不退避（P3-4 已修复）") : bad("零输出开关", "status=" + r.status + " calls=" + calls.length + " health=" + JSON.stringify(ks.find((k) => k.alias === "keyA").health));
+  await admin("/admin/api/pool", "PUT", { zeroOutputCountsAs429: true });
+  await mock("/__reset");
+
   // ── T8 持续 5xx：同 Key 重试一次后切换备 Key（P2-2 修复后）──
   console.log("\n=== T8 upstream 5xx ===");
   await restartClean();

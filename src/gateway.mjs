@@ -351,7 +351,13 @@ export async function handleGateway(req, res, url) {
         return;
       }
 
-      const isRateLimit = upRes.status === 429 || upRes.status === 402 || (poolCfg.zeroOutputCountsAs429 && isZeroOutput(text));
+      const zeroOut = isZeroOutput(text);
+      // 零输出上游返回的就是 429 状态，若先判 status===429 则开关永远短路（原缺陷）。
+      // 语义：zeroOutputCountsAs429=true → 零输出按限流处理（重试/退避）；false → 不惩罚 Key，
+      // 走下方透传分支原样返回上游响应。
+      const isRateLimit = zeroOut
+        ? !!poolCfg.zeroOutputCountsAs429
+        : (upRes.status === 429 || upRes.status === 402);
       if (isRateLimit) {
         lastStatus = 429;
         const mapped = mapError(429, text);
@@ -362,7 +368,6 @@ export async function handleGateway(req, res, url) {
           ? Math.ceil(retryAfterMs / 1000)
           : (mapped.body.retry_after !== undefined ? mapped.body.retry_after : 30);
         lastBody = mapped.body;
-        const zeroOut = isZeroOutput(text);
         // 决策 8：429/402/零输出先同 Key 重试；确属持续限流才退避 + 切换备 Key
         const retryable = sameKeyTries < sameKeyMax && attempts < maxAttempts &&
           (zeroOut || (retryAfterMs !== null && retryAfterMs <= (poolCfg.sameKeyRetryMaxWaitMs ?? 5000)));

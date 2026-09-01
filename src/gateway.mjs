@@ -224,9 +224,12 @@ export async function handleGateway(req, res, url) {
   const startedAt = Date.now();
   const requestBudgetMs = 30000; // 同Key重试/退避等待的总预算（不限制单次等待上游响应头，见 connectTimeoutMs）
   const deadlineAt = startedAt + requestBudgetMs;
+  // 本请求内已尝试过的 Key：5xx/网络错误不记退避（非 per-key 限流信号），若不排除，
+  // 换 Key 时 selectKey 会再次选中同一主 Key，备 Key 永不被尝试（P2-2）
+  const triedKeys = new Set();
 
   while (attempts < maxAttempts) {
-    const chosen = pool.selectKey();
+    const chosen = pool.selectKey(triedKeys);
     if (!chosen) {
       if (attempts === 0) {
         const wait = Math.max(1, Math.ceil(pool.nextRetryAfterMs() / 1000));
@@ -238,6 +241,7 @@ export async function handleGateway(req, res, url) {
       }
       break;
     }
+    triedKeys.add(chosen.id);
     let sameKeyTries = 0;
     let retriedOnce5xx = false;
     while (true) {
@@ -405,6 +409,9 @@ export async function handleGateway(req, res, url) {
 
   if (clientGone || res.writableEnded || res.destroyed) return;
   const wait = Math.max(1, Math.ceil((pool.nextRetryAfterMs() || 5000) / 1000));
+  // 最终状态码如实反映失败类型：上游 5xx/网络错误 → 502（客户端 SDK 不应按限流退避），
+  // 限流/池不可用 → 429（P2-2）
+  const finalStatus = lastStatus >= 500 ? 502 : 429;
   const finalBody = lastBody || { error: { message: "All API keys unavailable", type: "rate_limit_error" }, retry_after: wait };
-  sendJson(res, lastStatus === 502 ? 502 : 429, finalBody, { "Retry-After": String(wait) });
+  sendJson(res, finalStatus, finalBody, { "Retry-After": String(wait) });
 }

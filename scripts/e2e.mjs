@@ -200,7 +200,7 @@ async function main() {
   ks = await keysList();
   ks.find((k) => k.alias === "keyA").health.backoffUntilMs <= Date.now() ? ok("重试成功不留退避") : bad("零输出退避", "");
 
-  // ── T8 持续 5xx（KNOWN: P2-2）──
+  // ── T8 持续 5xx：同 Key 重试一次后切换备 Key（P2-2 修复后）──
   console.log("\n=== T8 upstream 5xx ===");
   await restartClean();
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "server5xx" }, { mode: "server5xx" }, { mode: "server5xx" }, { mode: "server5xx" }] });
@@ -208,15 +208,19 @@ async function main() {
   r = await gw({ model: "m-5xx", messages: [] });
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   const seq8 = calls.map((c) => c.auth.replace("user_", "")).join("→");
-  // KNOWN-ISSUE P2-2：当前实现 5xx 不切换备 Key，且最终返回 429 而非 502
-  knownIssue(
-    r.status === 429 && calls.length === 4 && calls.every((c) => c.auth === "user_keyA"),
-    "P2-2 持续 5xx：全砸主 Key（不切换）且客户端收到 429 — 修复后应切换 keyB 并返回 502",
-    "status=" + r.status + " seq=" + seq8
-  );
+  r.status === 200 && seq8 === "keyA→keyA→keyB"
+    ? ok("5xx 同Key重试1次后切换 keyB 成功（P2-2 已修复）") : bad("P2-2 5xx 切换", "status=" + r.status + " seq=" + seq8);
   ks = await keysList();
   ks.find((k) => k.alias === "keyA").health.backoffUntilMs <= Date.now()
     ? ok("5xx 不进退避（主 Key 保持可用）") : bad("5xx 退避", "");
+  // T8b 全 Key 5xx → 客户端 502（不再误报 429）
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: Array(4).fill({ mode: "server5xx" }) });
+  await mock("/__control", { auth: "user_keyB", responses: Array(4).fill({ mode: "server5xx" }) });
+  r = await gw({ model: "m-5xx-all", messages: [] });
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  r.status === 502 && calls.length === 4
+    ? ok("全 Key 5xx → 502 + 预算内尝试（P2-2 状态码已修复）") : bad("5xx 终态", "status=" + r.status + " calls=" + calls.length);
 
   // ── T9 流式透传 + usage ──
   console.log("\n=== T9 stream ===");

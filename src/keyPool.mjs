@@ -196,11 +196,12 @@ function quotaLimited(id) {
   return h ? nowMs() < h.quotaLimitedUntil : false;
 }
 
-export function selectKey() {
+export function selectKey(excludeIds = null) {
   const cooldownMs = poolCfg.failoverCooldownMs ?? 600000;
   const now = nowMs();
   const avail = keys.filter((k) => {
     if (!k.enabled) return false;
+    if (excludeIds && excludeIds.has(k.id)) return false;
     if (inBackoff(k.id)) return false;
     if (quotaLimited(k.id)) return false;
     const h = health.get(k.id);

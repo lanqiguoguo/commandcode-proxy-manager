@@ -3,6 +3,7 @@
 import { getConfig } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as stats from "./stats.mjs";
+import { safeEqual } from "./tokens.mjs";
 
 function upstreamBase() {
   const c = getConfig();
@@ -186,7 +187,7 @@ export async function handleGateway(req, res, url) {
   // 决策 1：/v1/* 一律要求 token —— clientToken 未配置时回退 AdminToken
   const expect = cfg.clientToken || cfg.adminToken;
   const token = bearerToken(req);
-  if (!token || token !== expect) {
+  if (!token || !safeEqual(token, expect)) {
     sendJson(res, 401, { error: { message: "Invalid or missing client token", type: "authentication_error" } });
     return;
   }
@@ -203,7 +204,8 @@ export async function handleGateway(req, res, url) {
     }
     try {
       const j = JSON.parse(body.toString("utf-8"));
-      model = j.model || "";
+      // P1-4：model 仅接受字符串并截断 128 字符（防 CSV 公式注入放大 + 磁盘放大 P2-8）
+      model = typeof j.model === "string" ? j.model.slice(0, 128) : "";
       stream = j.stream === true;
     } catch {}
   }

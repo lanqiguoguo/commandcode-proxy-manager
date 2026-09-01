@@ -13,7 +13,7 @@ const SC = process.argv[2];
 if (!SC) {
   // runner 模式：逐场景子进程执行（DATA_DIR 在各子进程 import 前注入，互不污染）
   let failed = false;
-  for (const s of ["quota", "pool", "stats", "logs"]) {
+  for (const s of ["quota", "pool", "stats", "logs", "tokens"]) {
     const code = await new Promise((resolveP) => {
       const p = spawn(process.execPath, [fileURLToPath(import.meta.url), s], { stdio: "inherit" });
       p.on("exit", (c) => resolveP(c));
@@ -351,6 +351,22 @@ if (SC === "logs") {
   setRetention(1);
   check(!getLogs({}).some((l) => l.msg === "ancient"), "retention 清理过期行");
   void beforeN;
+}
+
+// ════ tokens（P1-3 常量时间比较）════
+if (SC === "tokens") {
+  console.log("=== tokens 常量时间比较 ===");
+  const { safeEqual } = await import("../src/tokens.mjs");
+  check(safeEqual("abc123", "abc123") === true, "等值 → true");
+  check(safeEqual("", "") === true, "双空串 → true");
+  check(safeEqual("abc123", "abc124") === false, "不等值 → false");
+  check(safeEqual("short", "much-longer-string-value") === false, "长度不等 → false（无长度侧信道）");
+  check(safeEqual(undefined, "tok") === false, "undefined 左 → false（header 缺失场景）");
+  check(safeEqual("tok", undefined) === false, "undefined 右 → false");
+  check(safeEqual(undefined, undefined) === false, "undefined×2 → false（必须显式字符串）");
+  check(safeEqual(null, null) === false, "null×2 → false");
+  check(safeEqual(123, "123") === false, "非字符串数字 → false");
+  check(safeEqual({}, {}) === false, "对象入参 → false");
 }
 
 console.log(`\n=== unit(${SC}) summary: ${pass} passed, ${fail} failed ===`);

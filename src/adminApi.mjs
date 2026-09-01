@@ -5,8 +5,47 @@ import * as pool from "./keyPool.mjs";
 import * as quota from "./quota.mjs";
 import * as stats from "./stats.mjs";
 import { getLogs, setRetention as logsSetRetention } from "./logs.mjs";
+import { safeEqual } from "./tokens.mjs";
 
 let emitter = null;
+
+// P1-5：条件性 Secure cookie。默认部署为明文 HTTP 容器（docker-compose 直发 3080），
+// 默认开 Secure 会让无 TLS 场景下 cookie 完全不回传、SSE 全挂；故仅当
+// SECURE_COOKIES=1/true（置于 TLS 反代之后）时附加 Secure 属性。
+// login 下发与 logout 撤销必须用同一属性组合，否则撤销可能失效。
+function secureCookieAttr() {
+  const v = String(process.env.SECURE_COOKIES || "").toLowerCase();
+  return v === "1" || v === "true" ? "; Secure" : "";
+}
+
+// P1-3：login 按 IP 的内存级失败计数（滑动窗口）。15 分钟内失败 ≥10 次锁定 15 分钟。
+// 仅计 /admin/api/login 的 401（错误 x-admin-token 的 API 请求不计，避免拖死管理 UI 轮询）；
+// 成功登录清零该 IP 计数。进程内状态：重启即复位（可接受，重启本身即成本）。
+// 条目惰性清理：每次 login 顺手删除已过期条目，Map 不随时间无限增长。
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILS = 10;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const loginFails = new Map(); // ip -> { fails, firstAt, lockedUntil }
+function loginLocked(ip, now) {
+  // 惰性清理：窗口已过且未处于锁定期的条目直接删除（锁定条目过期后同样落入此分支）
+  for (const [k, e] of loginFails) {
+    if (k !== ip && e.lockedUntil <= now && now - e.firstAt > LOGIN_WINDOW_MS) loginFails.delete(k);
+  }
+  const e = loginFails.get(ip);
+  if (!e) return false;
+  if (e.lockedUntil > now) return true;
+  if (now - e.firstAt > LOGIN_WINDOW_MS) { loginFails.delete(ip); return false; }
+  return false;
+}
+function loginFailRecord(ip, now) {
+  const e = loginFails.get(ip);
+  if (!e || now - e.firstAt > LOGIN_WINDOW_MS) {
+    loginFails.set(ip, { fails: 1, firstAt: now, lockedUntil: 0 });
+  } else {
+    e.fails++;
+    if (e.fails >= LOGIN_MAX_FAILS) e.lockedUntil = now + LOGIN_LOCK_MS;
+  }
+}
 
 // SSE 专用 cookie：EventSource 无法带自定义 header，token 走 query 会泄漏到
 // URL（DevTools 连接面板/代理访问日志/Referer）。改用 HttpOnly cookie：
@@ -123,22 +162,35 @@ export async function handleAdmin(req, res, url) {
     if (req.method !== "POST") { sendJson(res, 405, { error: { message: "Method not allowed" } }); return true; }
     // 退出登录时撤销 SSE cookie（HttpOnly cookie 前端 JS 删不掉）；
     // 此端点无需鉴权：撤销凭证本身是幂等安全操作
-    res.setHeader("Set-Cookie", SSE_COOKIE + "=; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=0");
+    // 属性组合（含条件 Secure）必须与 login 下发一致，否则撤销失效
+    res.setHeader("Set-Cookie", SSE_COOKIE + "=; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=0" + secureCookieAttr());
     sendJson(res, 200, { ok: true });
     return true;
   }
 
   if (p === "/admin/api/login") {
     if (req.method !== "POST") { sendJson(res, 405, { error: { message: "Method not allowed" } }); return true; }
+    const ip = req.socket.remoteAddress || "unknown";
+    const now = Date.now();
+    const locked = loginLocked(ip, now);
     const body = await readJsonBody(req);
-    if (!body || body.token !== cfg.adminToken) {
+    if (!body || !safeEqual(body.token, cfg.adminToken)) {
+      // 锁定期内的失败尝试直接 429（不再回 401，掐断爆破反馈）；
+      // 持正确令牌者即使在锁定期仍可登录并清零计数——限速防的是猜，不是合法管理员
+      if (locked) {
+        sendJson(res, 429, { error: "too many failed attempts" });
+        return true;
+      }
+      loginFailRecord(ip, Date.now());
       sendJson(res, 401, { error: { message: "Invalid admin token", type: "auth_error" } });
       return true;
     }
+    loginFails.delete(ip); // 成功登录清零该 IP 失败计数（含解除锁定）
     // HttpOnly：JS 读不到；Path 限定 events 端点：其余请求浏览器不回传，
-    // 缩小泄漏面；SameSite=Strict：跨站页面无法携带此 cookie 建 SSE
+    // 缩小泄漏面；SameSite=Strict：跨站页面无法携带此 cookie 建 SSE；
+    // Secure：仅 SECURE_COOKIES=1（TLS 反代部署）时附加，见 secureCookieAttr()
     res.setHeader("Set-Cookie", SSE_COOKIE + "=" + sseCookieValue() +
-      "; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=86400");
+      "; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=86400" + secureCookieAttr());
     sendJson(res, 200, { ok: true });
     return true;
   }
@@ -149,9 +201,10 @@ export async function handleAdmin(req, res, url) {
   // 登录时下发的 HttpOnly 专用 cookie（EventSource 带不了 header，且 token
   // 已不再出现在 URL 中）。query ?token= 通道已移除——URL 会被 DevTools
   // 连接面板、反代 access log、Referer 等记录，明文令牌不应暴露。
-  let authed = req.headers["x-admin-token"] === cfg.adminToken && !!req.headers["x-admin-token"];
+  // !!cfg.adminToken：保留原 "空 header 不得匹配空令牌" 守卫（safeEqual("","") 为 true）
+  let authed = !!cfg.adminToken && safeEqual(req.headers["x-admin-token"], cfg.adminToken);
   if (!authed && p === "/admin/api/events" && req.method === "GET") {
-    authed = parseCookies(req)[SSE_COOKIE] === sseCookieValue();
+    authed = safeEqual(parseCookies(req)[SSE_COOKIE], sseCookieValue());
   }
   if (!authed) {
     sendJson(res, 401, { error: { message: "Unauthorized", type: "auth_error" } });

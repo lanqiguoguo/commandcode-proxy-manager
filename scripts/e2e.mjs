@@ -538,6 +538,77 @@ async function main() {
   r = await http1(MG + "/admin/api/keys", "GET", { "x-admin-token": "" });
   r.status === 401 ? ok("空 header 值被拒") : bad("空 header", "status=" + r.status);
 
+  // ── T18b login 速率限制（P1-3）：15min 窗口内失败 ≥10 → 429，成功登录清零 ──
+  console.log("\n=== T18b login rate limit (P1-3) ===");
+  await restartClean(); // 清空进程内计数（Map 为内存态），本用例独占窗口
+  let lr = null;
+  for (let i = 0; i < 12; i++) {
+    lr = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: "wrong-long-enough" }));
+    if (i < 9 && lr.status !== 401) break;
+  }
+  lr.status === 429 && lr.body.includes("too many failed attempts")
+    ? ok("失败 ≥10 次 → 429 too many failed attempts") : bad("login 限速", "status=" + lr.status + " body=" + lr.body.slice(0, 120));
+  // 锁定期间再次尝试仍 429
+  lr = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: "wrong-long-enough" }));
+  lr.status === 429 ? ok("锁定期内继续 429") : bad("锁定期", "status=" + lr.status);
+  // 合法令牌登录成功 → 计数复位（推荐语义：成功清零）
+  lr = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: ADMIN }));
+  lr.status === 200 ? ok("锁定期后正确 token → 200（计数复位）") : bad("复位", "status=" + lr.status);
+  let again401 = true;
+  for (let i = 0; i < 9; i++) {
+    const q = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: "wrong-long-enough" }));
+    if (q.status !== 401) { again401 = false; break; }
+  }
+  again401 ? ok("复位后再错 9 次仍 401（非 429）") : bad("复位后再计数", "期望 401 提前出现非 401");
+  await restartClean(); // 复位计数，避免污染后续用例
+
+  // ── T18c SECURE_COOKIES（P1-5）：默认不下发 Secure，启用后下发 Secure ──
+  console.log("\n=== T18c SECURE_COOKIES (P1-5) ===");
+  r = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: ADMIN }));
+  let sc = String(r.headers["set-cookie"] || "");
+  r.status === 200 && !/Secure/i.test(sc)
+    ? ok("默认（明文 HTTP 部署）cookie 不含 Secure") : bad("默认 Secure 缺省", sc);
+  sc = String((await http1(MG + "/admin/api/logout", "POST", {})).headers["set-cookie"] || "");
+  /Max-Age=0/.test(sc) && !/Secure/i.test(sc) ? ok("默认 logout 撤销 cookie 属性一致（无 Secure）") : bad("默认撤销", sc);
+  await stopMgr();
+  await startMgr({ SECURE_COOKIES: "1" });
+  r = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: ADMIN }));
+  sc = String(r.headers["set-cookie"] || "");
+  r.status === 200 && /Secure/.test(sc) && /HttpOnly/.test(sc) && /SameSite=Strict/.test(sc)
+    ? ok("SECURE_COOKIES=1 → Set-Cookie 含 Secure") : bad("SECURE_COOKIES=1", "status=" + r.status + " sc=" + sc);
+  const mSec = sc.match(/ccpm_sse=([a-f0-9]{64})/);
+  const sseSec = await new Promise((resolveP) => {
+    const req = http.request(MG + "/admin/api/events", { headers: { Cookie: mSec ? "ccpm_sse=" + mSec[1] : "" } }, (res) => {
+      let text = "";
+      const finish = () => { try { req.destroy(); } catch {} resolveP(res.statusCode); };
+      res.on("data", (c) => { text += c; if (text.includes(": connected")) finish(); });
+      setTimeout(finish, 2000);
+    });
+    req.on("error", () => resolveP(0));
+    req.end();
+  });
+  sseSec === 200 ? ok("Secure 模式下 SSE cookie 鉴权仍通过（curl 手工回传等价）") : bad("Secure SSE", "status=" + sseSec);
+  sc = String((await http1(MG + "/admin/api/logout", "POST", {})).headers["set-cookie"] || "");
+  /Max-Age=0/.test(sc) && /Secure/.test(sc) ? ok("Secure 模式 logout 撤销同样带 Secure") : bad("Secure 撤销", sc);
+  await stopMgr();
+  await startMgr(); // 恢复默认 env，后续用例在明文模式跑
+
+  // ── T18d model 类型/长度校验（P1-4 源头）──
+  console.log("\n=== T18d model validation (P1-4) ===");
+  await restartClean();
+  const longModel = "m-" + "x".repeat(200);
+  r = await gw({ model: longModel, messages: [] });
+  await sleep(200);
+  r = await admin("/admin/api/history?pageSize=1");
+  ev = JSON.parse(r.body).items[0];
+  r.status === 200 && ev && ev.model === longModel.slice(0, 128) && ev.model.length === 128
+    ? ok("超长 model → 历史记录截断为 128 字符", "len=" + (ev && ev.model.length)) : bad("model 截断", JSON.stringify(ev && ev.model.slice(0, 40)));
+  r = await gw({ model: { evil: true }, messages: [] });
+  await sleep(200);
+  r = await admin("/admin/api/history?pageSize=1");
+  ev = JSON.parse(r.body).items[0];
+  r.status === 200 && ev && ev.model === "" ? ok("非字符串 model → 记录空串且请求正常代理") : bad("model 非字符串", "status=" + r.status + " ev=" + JSON.stringify(ev));
+
   // ── T19 /v1/models + /v1/messages 路由 ──
   console.log("\n=== T19 routes ===");
   await restartClean();

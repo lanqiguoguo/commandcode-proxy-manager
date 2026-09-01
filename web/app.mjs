@@ -514,7 +514,13 @@ async function exportCsv() {
     alert("已导出 " + data.items.length + " 条（上限 500/次），共匹配 " + data.total + " 条；请用时间/Key 筛选缩小范围后分批导出");
   }
 }
-function csvCell(s) { return '"' + String(s).replace(/"/g, '""') + '"'; }
+// CSV 公式注入防护（P1-4）：以 = + - @ \t \r 开头的值在 Excel/WPS 中会被当作公式
+// 执行（历史 model 名来自不可信客户端）。在引号转义之前对原始值加 ' 前缀中和。
+function csvCell(s) {
+  let v = String(s);
+  if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
+  return '"' + v.replace(/"/g, '""') + '"';
+}
 
 // ── 设置 ──
 const STRATEGY_INFO = {

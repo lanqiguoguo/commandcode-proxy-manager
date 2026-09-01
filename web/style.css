@@ -56,6 +56,7 @@ tr:hover td { background: var(--panel2); }
 .alert { padding: 10px 14px; border-radius: 8px; margin: 10px 0; font-size: 13px; }
 .alert.err { background: rgba(224,82,82,.12); border: 1px solid var(--bad); color: var(--bad); }
 .alert.ok { background: rgba(47,191,113,.12); border: 1px solid var(--ok); color: var(--ok); }
+.alert.info { background: rgba(88,166,255,.08); border: 1px solid var(--border); color: var(--dim); }
 .filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; align-items: end; }
 .log-list { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-height: 60vh; overflow: auto; }
 .log-list div { padding: 3px 6px; border-bottom: 1px solid var(--border); white-space: pre-wrap; word-break: break-all; }

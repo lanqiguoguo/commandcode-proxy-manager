@@ -74,16 +74,20 @@ function num(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+// 真实 API 中 resetAt 有两种形态：ISO 字符串 或 epoch 毫秒数字（0=无值），均可能出现
 function parseWindow(w) {
   if (!w || typeof w !== "object") return null;
   const cap = num(w.cap);
   const used = num(w.used);
   if (cap === undefined || used === undefined || cap <= 0 || used < 0) return null;
+  let resetAt = null;
+  if (typeof w.resetAt === "number" && w.resetAt > 0) resetAt = new Date(w.resetAt).toISOString();
+  else if (typeof w.resetAt === "string" && w.resetAt) resetAt = w.resetAt;
   return {
     cap,
     used,
     percent: Math.round((used / cap) * 1000) / 10,
-    resetAt: typeof w.resetAt === "string" ? w.resetAt : null
+    resetAt
   };
 }
 
@@ -96,7 +100,7 @@ export async function probeKey(keyId) {
   const rec = pool.getKeyRecord(keyId);
   if (!rec || !rec.key) return null;
   const prev = cache.get(keyId) || null;
-  const report = { fiveHour: null, weekly: null, creditsUsd: null, updatedAt: Date.now(), stale: true };
+  const report = { fiveHour: null, weekly: null, creditsUsd: null, totals: null, updatedAt: Date.now(), stale: true };
   let ok = false;
   let probeErr = "";
   try {
@@ -122,7 +126,9 @@ export async function probeKey(keyId) {
       const sub = subsR.data ? (subsR.data.data || subsR.data) : null;
       const periodStart = sub && typeof sub.currentPeriodStart === "string" ? sub.currentPeriodStart : "";
       if (periodStart && creditsObj) {
-        const usageR = await fetchJson(API_BASE + PATH_USAGE + orgQuery + "&since=" + encodeURIComponent(periodStart), rec.key);
+        // 无 orgId 时 orgQuery 为空串，必须用 ? 起始，否则 "&since=" 拼出非法 URL（真实 API 实测 404）
+        const usageSep = orgQuery ? "&" : "?";
+        const usageR = await fetchJson(API_BASE + PATH_USAGE + orgQuery + usageSep + "since=" + encodeURIComponent(periodStart), rec.key);
         const u = usageR.data ? (usageR.data.data || usageR.data) : null;
         const used = u && u.totalCost !== undefined ? num(u.totalCost) : num(u && u.totalMonthlyCredits);
         const pools = ["monthlyCredits", "purchasedCredits", "freeCredits"]
@@ -137,7 +143,21 @@ export async function probeKey(keyId) {
             remaining,
             limit,
             percent: limit > 0 ? Math.round((used / limit) * 1000) / 10 : 0,
-            expiresAt: sub.currentPeriodEnd || undefined
+            expiresAt: sub.currentPeriodEnd || undefined,
+            periodStart
+          };
+        }
+        // 账期总用量（对应官网 settings/usage 页的 Total 卡片）：调用次数/Token/成功率
+        if (u && (num(u.totalCount) !== undefined || num(u.totalTokens) !== undefined)) {
+          report.totals = {
+            runs: num(u.totalCount) ?? 0,
+            completed: num(u.completedCount) ?? 0,
+            failed: num(u.failedCount) ?? 0,
+            successRate: num(u.successRate),
+            tokensIn: num(u.totalTokensIn) ?? 0,
+            tokensOut: num(u.totalTokensOut) ?? 0,
+            tokens: num(u.totalTokens) ?? 0,
+            cost: num(u.totalCost) ?? num(u.totalCredits) ?? 0
           };
         }
       }
@@ -156,6 +176,7 @@ export async function probeKey(keyId) {
     fiveHour: prev && prev.fiveHour ? prev.fiveHour : null,
     weekly: prev && prev.weekly ? prev.weekly : null,
     creditsUsd: prev && prev.creditsUsd ? prev.creditsUsd : null,
+    totals: prev && prev.totals ? prev.totals : null,
     updatedAt: prev && prev.updatedAt ? prev.updatedAt : null,
     error: probeErr || "probe failed",
     stale: true

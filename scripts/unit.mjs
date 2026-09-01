@@ -160,6 +160,34 @@ if (SC === "quota") {
   const t = await testKey("k1");
   check(t.ok === false && t.status === 401, "testKey → {ok:false,status:401}", JSON.stringify(t));
 
+  // ══ 真实 API 形态回归：totals / epoch-ms resetAt / 无 orgId URL 拼接 ══
+  const urls = [];
+  const msReset = Date.now() + 2 * 864e5;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    urls.push(u);
+    if (u.includes("/alpha/whoami")) return { ok: true, status: 200, json: async () => ({ success: true, data: { user: { id: "u1" } } }) }; // 无 org
+    if (u.includes("/billing/credits")) return { ok: true, status: 200, json: async () => ({
+      credits: { monthlyCredits: 20, purchasedCredits: 0, freeCredits: 0 },
+      windowLimits: {
+        limited: true, exceeded: "weekly",
+        fiveHour: { used: 0, cap: 14, exceeded: false, resetAt: 0 },
+        weekly: { used: 35, cap: 35, exceeded: true, resetAt: msReset }
+      } }) };
+    if (u.includes("/billing/subscriptions")) return { ok: true, status: 200, json: async () => ({ success: true, data: { currentPeriodStart: "2026-08-25T23:33:28.000Z", currentPeriodEnd: "2026-09-25T23:33:28.000Z", planId: "individual-goat" } }) };
+    if (u.includes("/usage/summary")) return { ok: true, status: 200, json: async () => ({ totalCount: 12489, completedCount: 12489, failedCount: 0, successRate: 100, totalTokensIn: 1871710189, totalTokensOut: 7638220, totalTokens: 1879348409, totalCost: 35.0096, periodBasis: "billing-period" }) };
+    return { ok: false, status: 404 };
+  };
+  quotaCalls.length = 0; softCalls.length = 0;
+  const rt = await probeKey("k1");
+  const usageUrl = urls.find((u) => u.includes("/usage/summary")) || "";
+  check(usageUrl.includes("?since=") && !usageUrl.includes("&since="), "无 orgId 时 usage URL 以 ?since 起始（真实 API 回归）", usageUrl.slice(0, 120));
+  check(rt.fiveHour && rt.fiveHour.resetAt === null, "resetAt=0（epoch 数字 0）解析为 null", JSON.stringify(rt.fiveHour));
+  check(rt.weekly && rt.weekly.resetAt === new Date(msReset).toISOString(), "epoch-ms resetAt 转 ISO 保留", JSON.stringify(rt.weekly));
+  check(rt.totals && rt.totals.runs === 12489 && rt.totals.tokens === 1879348409 && rt.totals.tokensIn === 1871710189 && rt.totals.successRate === 100, "totals 采集 Total Runs/Tokens/成功率", JSON.stringify(rt.totals));
+  check(rt.creditsUsd && rt.creditsUsd.periodStart === "2026-08-25T23:33:28.000Z", "creditsUsd 附 periodStart", JSON.stringify(rt.creditsUsd).slice(0, 150));
+  check(quotaCalls[0]?.[1] === "weekly" && quotaCalls[0]?.[2] === msReset, "weekly 100%+epoch-ms resetAt → 硬限制到正确时刻", JSON.stringify(quotaCalls));
+
   // ══ 真实 API 错误封装：HTTP 200 + success:false（实测 whoami 边缘节点抖动）══
   globalThis.fetch = async () => ({
     ok: true, status: 200,
@@ -182,7 +210,7 @@ if (SC === "quota") {
   const r10 = await probeKey("k1");
   check(r10.stale === true && typeof r10.error === "string" && r10.error.includes("RATE_UNAVAILABLE"), "stale 报告附带失败原因 error 字段", JSON.stringify(r10).slice(0, 200));
   check(quotaCalls.length === 0, "stale 不触发额度限制", JSON.stringify(quotaCalls));
-  check(r10.fiveHour !== null && r10.fiveHour.percent === 50, "stale 保留上次成功的 fiveHour", JSON.stringify(r10.fiveHour));
+  check(r10.fiveHour !== null && r10.fiveHour.cap === 14 && r10.fiveHour.percent === 0, "stale 保留上次成功的 fiveHour", JSON.stringify(r10.fiveHour));
 }
 
 // ════ keyPool ════

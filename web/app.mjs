@@ -135,6 +135,21 @@ function esc(s) {
 }
 function fmtTime(ts) { return ts ? new Date(ts).toLocaleString() : "-"; }
 function fmtNum(n) { return (n == null ? 0 : n).toLocaleString(); }
+function fmtCountdown(targetMs) {
+  const s = Math.round((targetMs - Date.now()) / 1000);
+  if (!Number.isFinite(s) || s <= 0) return "";
+  if (s < 60) return s + " 秒后重置";
+  if (s < 3600) return Math.round(s / 60) + " 分钟后重置";
+  if (s < 86400) return (s / 3600).toFixed(1) + " 小时后重置";
+  return Math.round(s / 86400) + " 天后重置";
+}
+function windowBar(label, w, unitless) {
+  if (!w) return '<div class="muted small">' + label + "：无数据</div>";
+  const cd = w.resetAt ? fmtCountdown(Date.parse(w.resetAt)) : "";
+  const sub = (unitless ? w.used + " / " + w.cap : "$" + round2(w.used) + " / $" + round2(w.cap)) + (cd ? " · " + cd : "");
+  return barHtml(label, w.percent, sub);
+}
+function round2(n) { return Math.round((n || 0) * 100) / 100; }
 function barClass(p) { return p >= 90 ? "q2" : p >= 70 ? "q1" : "q0"; }
 function barHtml(label, p, sub) {
   p = Math.max(0, Math.min(100, p || 0));
@@ -147,7 +162,7 @@ function healthOf(k) {
   if (h.authError) return { cls: "bad", label: "认证异常" };
   if (h.quotaLimitedUntil && now < h.quotaLimitedUntil) return { cls: "bad", label: "额度受限" };
   if (h.backoffUntilMs && now < h.backoffUntilMs) return { cls: "warn", label: "退避中" };
-  if (k.quota && k.quota.stale) return { cls: "warn", label: "额度数据过期" };
+  if (k.quota && k.quota.stale) return { cls: "warn", label: k.quota.updatedAt ? "额度数据过期" : "额度获取失败" };
   return { cls: "ok", label: "健康" };
 }
 
@@ -229,12 +244,24 @@ function keyCard(k) {
   } else {
     quotaHtml += '<div class="muted small">额度数据：未获取</div>';
   }
-  if (five) quotaHtml += barHtml("5h 窗口", five.percent, five.used + " / " + five.cap + (five.resetAt ? " · 重置 " + fmtTime(Date.parse(five.resetAt)) : ""));
-  else quotaHtml += '<div class="muted small">5h 窗口：无数据</div>';
-  if (weekly) quotaHtml += barHtml("每周窗口", weekly.percent, weekly.used + " / " + weekly.cap + (weekly.resetAt ? " · 重置 " + fmtTime(Date.parse(weekly.resetAt)) : ""));
-  else quotaHtml += '<div class="muted small">每周窗口：无数据</div>';
-  if (usd) quotaHtml += barHtml("订阅美元", usd.percent, "$" + usd.used + " / $" + usd.limit + " · 余 $" + usd.remaining);
-  else quotaHtml += '<div class="muted small">订阅美元：无数据</div>';
+  // 上游三窗口：5h/每周为积分窗口（cap=点数），月度=订阅账期（美元）
+  quotaHtml += windowBar("5h 窗口（额度点）", five, true);
+  quotaHtml += windowBar("每周窗口（额度点）", weekly, true);
+  if (usd) {
+    const cd = usd.expiresAt ? fmtCountdown(Date.parse(usd.expiresAt)) : "";
+    quotaHtml += barHtml("账期额度（美元）", usd.percent, "$" + round2(usd.used) + " / $" + round2(usd.limit) + " · 余 $" + round2(usd.remaining) + (cd ? " · " + cd : ""));
+  } else {
+    quotaHtml += '<div class="muted small">账期额度（美元）：无数据</div>';
+  }
+  if (q && !q.stale && q.totals) {
+    const t = q.totals;
+    quotaHtml += '<div class="row small muted" style="flex-wrap:wrap;gap:10px">' +
+      "<span>本账期调用 <b>" + fmtNum(t.runs) + "</b> 次</span>" +
+      "<span>总 Token <b>" + fmtNum(t.tokens) + "</b>（入 " + fmtNum(t.tokensIn) + " / 出 " + fmtNum(t.tokensOut) + "）</span>" +
+      "<span>花费 <b>$" + round2(t.cost) + "</b></span>" +
+      (t.successRate != null ? "<span>成功率 <b>" + t.successRate + "%</b></span>" : "") +
+      "</div>";
+  }
   const w5 = u.h5 || {}, w7 = u.d7 || {}, w30 = u.d30 || {};
   const d30Label = u.d30Valid ? "30d" : "保留期";
   const usageHtml =
@@ -365,6 +392,9 @@ async function bulkImport() {
 // ── 历史记录 ──
 function renderHistory() {
   let html = "<h2>历史记录</h2>";
+  html += '<div class="alert info" style="margin-bottom:12px">本页是<b>本网关自身的代理日志</b>（经本 manager 转发的每一次请求：时间/Key/模型/状态/token/延迟/重试），' +
+    "不是 commandcode.ai 官网 settings/usage 的账号级账单明细——上游 API 不向第三方暴露逐条调用记录（仅汇总统计，已在本账期卡片展示）。" +
+    "未走本网关的 CLI 直连调用不会出现在这里。</div>";
   html += '<div class="card mb"><div class="filters">' +
     '<div><label>Key</label><select id="h-key">' + '<option value="">全部</option>' + state.keys.map((k) => '<option value="' + k.id + '">' + esc(k.alias || k.maskedKey) + "</option>").join("") + "</select></div>" +
     '<div><label>状态</label><select id="h-status"><option value="">全部</option><option>200</option><option>401</option><option>429</option><option>502</option></select></div>' +
@@ -573,11 +603,24 @@ function renderLogs() {
   });
 }
 
-async function loadLogs() {
-  const data = await api("/admin/api/logs?since=" + state.lastLogTs);
-  for (const l of data.logs) state.logs.push(l);
+function logKey(l) { return l.ts + "|" + l.msg; }
+function pushLogs(incoming) {
+  // SSE 与轮询双通道写入，按 ts+msg 去重合并（同毫秒竞态下时间游标不可靠）
+  const seen = new Set(state.logs.map(logKey));
+  for (const l of incoming) {
+    const k = logKey(l);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    state.logs.push(l);
+  }
+  state.logs.sort((a, b) => a.ts - b.ts);
   if (state.logs.length > 500) state.logs = state.logs.slice(-500);
   if (state.logs.length) state.lastLogTs = state.logs[state.logs.length - 1].ts;
+}
+
+async function loadLogs() {
+  const data = await api("/admin/api/logs?since=" + (state.lastLogTs ? state.lastLogTs - 2000 : 0));
+  pushLogs(data.logs);
   if (state.view === "logs") {
     renderLogs();
     const el = document.getElementById("log-list");
@@ -633,10 +676,8 @@ function startEventStream() {
   eventSource.addEventListener("log", (e) => {
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
-    if (!d || d.ts <= state.lastLogTs) return; // 与 loadLogs 共用 lastLogTs 去重，防 SSE+轮询双写
-    state.lastLogTs = d.ts;
-    state.logs.push(d);
-    if (state.logs.length > 500) state.logs = state.logs.slice(-500);
+    if (!d) return;
+    pushLogs([d]); // 与轮询共用去重合并（防双通道竞态产生重复两条）
     if (state.view === "logs") {
       renderLogs();
       const el = document.getElementById("log-list");

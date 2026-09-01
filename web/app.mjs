@@ -143,10 +143,11 @@ function fmtCountdown(targetMs) {
   if (s < 86400) return (s / 3600).toFixed(1) + " 小时后重置";
   return Math.round(s / 86400) + " 天后重置";
 }
-function windowBar(label, w, unitless) {
+function fmtUsd(n) { return "$" + (Number(n) || 0).toFixed(2); }
+function windowBar(label, w) {
   if (!w) return '<div class="muted small">' + label + "：无数据</div>";
   const cd = w.resetAt ? fmtCountdown(Date.parse(w.resetAt)) : "";
-  const sub = (unitless ? w.used + " / " + w.cap : "$" + round2(w.used) + " / $" + round2(w.cap)) + (cd ? " · " + cd : "");
+  const sub = fmtUsd(w.used) + " / " + fmtUsd(w.cap) + " · " + round2(w.percent) + "%" + (cd ? " · " + cd : "");
   return barHtml(label, w.percent, sub);
 }
 function round2(n) { return Math.round((n || 0) * 100) / 100; }
@@ -244,22 +245,21 @@ function keyCard(k) {
   } else {
     quotaHtml += '<div class="muted small">额度数据：未获取</div>';
   }
-  // 上游三窗口：5h/每周为积分窗口（cap=点数），月度=订阅账期（美元）
-  quotaHtml += windowBar("5h 窗口（额度点）", five, true);
-  quotaHtml += windowBar("每周窗口（额度点）", weekly, true);
+  // 上游三窗口均为美元限额（官方口径：5h/weekly/monthly limit = $ of usage）
+  quotaHtml += windowBar("5 小时限额", five);
+  quotaHtml += windowBar("每周限额", weekly);
   if (usd) {
     const cd = usd.expiresAt ? fmtCountdown(Date.parse(usd.expiresAt)) : "";
-    quotaHtml += barHtml("账期额度（美元）", usd.percent, "$" + round2(usd.used) + " / $" + round2(usd.limit) + " · 余 $" + round2(usd.remaining) + (cd ? " · " + cd : ""));
+    quotaHtml += barHtml("每月限额（账期）", usd.percent, fmtUsd(usd.used) + " / " + fmtUsd(usd.limit) + " · " + round2(usd.percent) + "%" + (cd ? " · " + cd : ""));
   } else {
-    quotaHtml += '<div class="muted small">账期额度（美元）：无数据</div>';
+    quotaHtml += '<div class="muted small">每月限额（账期）：无数据</div>';
   }
   if (q && !q.stale && q.totals) {
     const t = q.totals;
     quotaHtml += '<div class="row small muted" style="flex-wrap:wrap;gap:10px">' +
       "<span>本账期调用 <b>" + fmtNum(t.runs) + "</b> 次</span>" +
-      "<span>总 Token <b>" + fmtNum(t.tokens) + "</b>（入 " + fmtNum(t.tokensIn) + " / 出 " + fmtNum(t.tokensOut) + "）</span>" +
-      "<span>花费 <b>$" + round2(t.cost) + "</b></span>" +
       (t.successRate != null ? "<span>成功率 <b>" + t.successRate + "%</b></span>" : "") +
+      "<span>总 Token <b>" + fmtNum(t.tokens) + "</b>（入 " + fmtNum(t.tokensIn) + " / 出 " + fmtNum(t.tokensOut) + "）</span>" +
       "</div>";
   }
   const w5 = u.h5 || {}, w7 = u.d7 || {}, w30 = u.d30 || {};
@@ -280,7 +280,7 @@ function keyCard(k) {
     '<span class="mono muted">' + esc(k.maskedKey) + "</span>" +
     '<span class="badge ' + h.cls + '">' + h.label + "</span>" +
     "</div>" +
-    '<div class="row">' +
+    '<div class="row key-actions">' +
     '<button class="small ghost" onclick="ccpmRefreshQuota(\'' + k.id + '\')">刷新额度</button>' +
     '<button class="small ghost" onclick="ccpmToggle(\'' + k.id + '\')">' + (k.enabled ? "停用" : "启用") + "</button>" +
     '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
@@ -310,7 +310,7 @@ function renderKeys() {
     "</div>";
   html += '<div class="card">' +
     "<h3>Key 列表（第 1 位 = 主 Key，其余按序为备 Key）</h3>" +
-    "<table><thead><tr><th>优先级</th><th>别名</th><th>Key</th><th>状态</th><th>备注</th><th>操作</th></tr></thead><tbody>";
+    '<div class="table-scroll"><table><thead><tr><th>优先级</th><th>别名</th><th>Key</th><th>状态</th><th>备注</th><th>操作</th></tr></thead><tbody>';
   for (const k of state.keys) {
     const h = healthOf(k);
     html += "<tr>" +
@@ -328,7 +328,7 @@ function renderKeys() {
       '<button class="small danger" onclick="ccpmDelete(\'' + k.id + '\')">删除</button>' +
       "</td></tr>";
   }
-  html += "</tbody></table></div>";
+  html += "</tbody></table></div></div>";
   app.innerHTML = html;
   document.getElementById("btn-add-key").addEventListener("click", addKey);
   document.getElementById("btn-bulk").addEventListener("click", bulkImport);
@@ -403,7 +403,7 @@ function renderHistory() {
     '<div><label>结束</label><input type="datetime-local" id="h-to"></div>' +
     '<div><label>&nbsp;</label><button id="h-search">查询</button> <button id="h-csv" class="ghost">导出 CSV</button></div>' +
     "</div></div>";
-  html += '<div class="card"><table><thead><tr><th>时间</th><th>Key</th><th>模型</th><th>流式</th><th>状态</th><th>错误</th><th>入/出/缓存 tok</th><th>重试</th><th>延迟</th></tr></thead><tbody>';
+  html += '<div class="card"><div class="table-scroll"><table><thead><tr><th>时间</th><th>Key</th><th>模型</th><th>流式</th><th>状态</th><th>错误</th><th>入/出/缓存 tok</th><th>重试</th><th>延迟</th></tr></thead><tbody>';
   for (const it of state.history.items || []) {
     const keyName = (state.keys.find((k) => k.id === it.keyId) || {}).alias || it.keyId;
     html += "<tr>" +
@@ -418,7 +418,7 @@ function renderHistory() {
       "<td>" + (it.latencyMs != null ? Math.round(it.latencyMs) + "ms" : "-") + "</td>" +
       "</tr>";
   }
-  html += "</tbody></table>";
+  html += "</tbody></table></div>";
   html += '<div class="row spread mt">' +
     '<span class="muted">共 ' + state.history.total + " 条</span>" +
     "<span>" +

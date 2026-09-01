@@ -115,7 +115,10 @@ export async function handleAdmin(req, res, url) {
 
   if (!p.startsWith("/admin/api/")) return false;
 
-  const token = req.headers["x-admin-token"];
+  // EventSource 无法携带自定义 header，/admin/api/events 额外接受 ?token= 查询参数
+  // （仅这一个 GET-only 只读流端点；其余管理 API 仍只认 X-Admin-Token header）
+  const token = req.headers["x-admin-token"] ||
+    (p === "/admin/api/events" && req.method === "GET" ? url.searchParams.get("token") : "");
   if (!token || token !== cfg.adminToken) {
     sendJson(res, 401, { error: { message: "Unauthorized", type: "auth_error" } });
     return true;
@@ -267,7 +270,7 @@ export async function handleAdmin(req, res, url) {
       };
       const onQuota = (d) => send("quota", d);
       const onStats = (d) => send("stats", d);
-      const onLog = (d) => send("log", d);
+      const onLog = (d) => send("log", { ts: Date.now(), level: d.level || "info", msg: d.msg });
       emitter.on("quota", onQuota);
       emitter.on("stats", onStats);
       emitter.on("log", onLog);

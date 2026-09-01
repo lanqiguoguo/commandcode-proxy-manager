@@ -67,11 +67,28 @@ async function refresh() {
   }
 }
 
+// 自动刷新前保存/恢复“添加 Key”表单未提交内容，避免 10s tick 清空正在输入的值（P3-5）
+const KEY_FORM_IDS = ["k-alias", "k-key", "k-note", "k-bulk"];
+function withFormPreserved(fn) {
+  const saved = {};
+  for (const id of KEY_FORM_IDS) {
+    const el = document.getElementById(id);
+    if (el) saved[id] = el.value;
+  }
+  fn();
+  for (const id of Object.keys(saved)) {
+    const el = document.getElementById(id);
+    if (el && !el.value) el.value = saved[id];
+  }
+}
+
 function tick() {
   const el = document.getElementById("tick");
   if (el) el.textContent = new Date().toLocaleTimeString();
-  if (state.view === "dashboard" || state.view === "keys") {
-    refresh().then(render);
+  if (state.view === "dashboard") {
+    refresh().then(() => render());
+  } else if (state.view === "keys") {
+    refresh().then(() => withFormPreserved(render));
   }
 }
 
@@ -105,6 +122,7 @@ async function doLogin() {
     sessionStorage.setItem("ccpm_token", token);
     await refresh();
     startTicker();
+    startEventStream();
     render();
   } catch (e) {
     document.getElementById("login-msg").innerHTML = '<div class="alert err">' + esc(e.message) + "</div>";
@@ -580,6 +598,49 @@ function stopLogPoller() {
   if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
 }
 
+// ── SSE 实时事件（DESIGN §6：quota/health/usage/切换事件推送）──
+// 后端 /admin/api/events 接受 ?token= 查询参数（EventSource 无法带 header）。
+// 10s tick 与日志轮询保留为断线兜底。
+let eventSource = null;
+let statsDebounce = null;
+let quotaRenderTimer = null;
+function startEventStream() {
+  if (eventSource) { try { eventSource.close(); } catch {} }
+  try {
+    eventSource = new EventSource("/admin/api/events?token=" + encodeURIComponent(state.token));
+  } catch { return; }
+  eventSource.addEventListener("log", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (!d || d.ts <= state.lastLogTs) return; // 与 loadLogs 共用 lastLogTs 去重，防 SSE+轮询双写
+    state.lastLogTs = d.ts;
+    state.logs.push(d);
+    if (state.logs.length > 500) state.logs = state.logs.slice(-500);
+    if (state.view === "logs") {
+      renderLogs();
+      const el = document.getElementById("log-list");
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+  });
+  eventSource.addEventListener("quota", (e) => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    const k = state.keys.find((x) => x.id === d.keyId);
+    if (k) k.quota = d.report;
+    if (state.view === "dashboard" || state.view === "keys") {
+      if (!quotaRenderTimer) quotaRenderTimer = setTimeout(() => { quotaRenderTimer = null; render(); }, 500);
+    }
+  });
+  eventSource.addEventListener("stats", () => {
+    if (state.view !== "history") return;
+    clearTimeout(statsDebounce);
+    statsDebounce = setTimeout(() => loadHistory().catch(() => {}), 2000);
+  });
+}
+function stopEventStream() {
+  if (eventSource) { try { eventSource.close(); } catch {} eventSource = null; }
+}
+
 if (!state.token) {
   showLogin();
 } else {
@@ -587,6 +648,7 @@ if (!state.token) {
     const ok = await refresh();
     if (!ok) { showLogin(); return; }
     startTicker();
+    startEventStream();
     startLogPoller();
     if (state.view === "history") loadHistory().catch(() => {});
     render();

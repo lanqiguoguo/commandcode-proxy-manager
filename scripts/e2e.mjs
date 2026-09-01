@@ -423,6 +423,23 @@ async function main() {
   sse.includes(": connected") && sse.includes("event: stats") ? ok("SSE 推送 stats 事件") : bad("SSE", JSON.stringify(sse.slice(0, 200)));
   r = await http1(MG + "/admin/api/events", "GET", {});
   r.status === 401 ? ok("SSE 未鉴权 401") : bad("SSE 401", "status=" + r.status);
+  // EventSource 无法带 header → events 端点支持 ?token= 查询参数（前端 SSE 消费依赖此）
+  const sseQ = await new Promise((resolveP) => {
+    const req = http.request(MG + "/admin/api/events?token=" + encodeURIComponent(ADMIN), {}, (res) => {
+      res.destroy(); resolveP(res.statusCode);
+    });
+    req.on("error", () => resolveP(0));
+    req.end();
+  });
+  sseQ === 200 ? ok("SSE ?token= 鉴权通过") : bad("SSE query token", "status=" + sseQ);
+  const sseBad = await new Promise((resolveP) => {
+    const req = http.request(MG + "/admin/api/events?token=wrong-token-xx", {}, (res) => { res.resume(); resolveP(res.statusCode); });
+    req.on("error", () => resolveP(0));
+    req.end();
+  });
+  sseBad === 401 ? ok("SSE 错误 query token → 401") : bad("SSE query 负例", "status=" + sseBad);
+  const qKeys = await http1(MG + "/admin/api/keys?token=" + encodeURIComponent(ADMIN), "GET", {});
+  qKeys.status === 401 ? ok("query token 仅限 events 端点（keys 仍拒绝）") : bad("query token 隔离", "status=" + qKeys.status);
 
   // ── T19 /v1/models + /v1/messages 路由 ──
   console.log("\n=== T19 routes ===");

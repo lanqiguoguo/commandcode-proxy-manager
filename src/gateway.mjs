@@ -246,7 +246,9 @@ export async function handleGateway(req, res, url) {
   // 换 Key 时 selectKey 会再次选中同一主 Key，备 Key 永不被尝试（P2-2）
   const triedKeys = new Set();
 
-  while (attempts < maxAttempts) {
+  // 预算只约束"重试/退避/换 Key"，单次尝试的 connectTimeoutMs（默认 120s）不受 30s 约束：
+  // 头等待超时按设计从预算中豁免（见下方 perAttemptMs 注释），防止合法慢生成被误杀（T11）。
+  while (attempts < maxAttempts && Date.now() < deadlineAt) {
     const chosen = pool.selectKey(triedKeys);
     if (!chosen) {
       if (attempts === 0) {
@@ -259,6 +261,7 @@ export async function handleGateway(req, res, url) {
       }
       break;
     }
+    if (Date.now() >= deadlineAt) break; // 预算耗尽不再发起新尝试（含选中 Key 后、发起请求前）
     triedKeys.add(chosen.id);
     let sameKeyTries = 0;
     let retriedOnce5xx = false;
@@ -306,8 +309,8 @@ export async function handleGateway(req, res, url) {
           lastStatus = 502;
           lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
           stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 502, errorKind: "timeout", retries: attempts - 1, latencyMs: Date.now() - startedAt });
-          if (Date.now() >= deadlineAt) break;
-          // 预算内才继续换 key 重试
+          // 超时退避后换 Key：外层 while 顶部的截止检查会决定是否继续发起新尝试，
+          // 预算耗尽时此处 break 即进入最终响应路径（502）。
           break;
         }
         lastStatus = 502;

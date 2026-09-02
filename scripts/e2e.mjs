@@ -5,21 +5,148 @@ import http from "http";
 import net from "net";
 import { performance } from "perf_hooks";
 import { spawn } from "child_process";
-import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
-import { resolve, dirname } from "path";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, realpathSync } from "fs";
+import { resolve, dirname, isAbsolute, join, relative, parse, sep } from "path";
+import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DATA = process.env.E2E_DATA || "/tmp/ccpm-e2e";
 const HOST = "127.0.0.1";
-const UP = `http://${HOST}:3051`;
-const MG = `http://${HOST}:3088`;
 const ADMIN = "e2e-admin-token-1234";
 const CLIENT = "e2e-client-token-5678";
+const SCENARIO = process.argv[2] || "";
+
+let DATA;
+let ownedData = false;
+let dataLock = null;
+let TEST_PORTS = null;
+let UP;
+let MG;
+
+const activeRequests = new Set();
+const activeSockets = new Set();
+const activeTimers = new Set();
+const children = new Set();
+
+function trackedTimeout(fn, ms) {
+  const timer = setTimeout(() => {
+    activeTimers.delete(timer);
+    fn();
+  }, ms);
+  activeTimers.add(timer);
+  return timer;
+}
+function clearTrackedTimeout(timer) {
+  if (!timer) return;
+  clearTimeout(timer);
+  activeTimers.delete(timer);
+}
+function trackedRequest(...args) {
+  const req = http.request(...args);
+  activeRequests.add(req);
+  const release = () => activeRequests.delete(req);
+  req.once("close", release);
+  req.once("error", release);
+  return req;
+}
+function trackedSocket(socket) {
+  activeSockets.add(socket);
+  const release = () => activeSockets.delete(socket);
+  socket.once("close", release);
+  socket.once("error", release);
+  return socket;
+}
+function isInside(parent, child) {
+  const rel = relative(parent, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+function canonicalPath(p) {
+  try { return realpathSync(p); } catch { return resolve(p); }
+}
+function safeDataPath(input) {
+  if (typeof input !== "string" || input.trim() === "") throw new Error("E2E_DATA 必须是非空路径");
+  const target = resolve(input);
+  const tmpRoot = canonicalPath(tmpdir());
+  const targetReal = canonicalPath(target);
+  const root = parse(target).root;
+  if (target === root || target === tmpRoot || target === ROOT || isInside(target, ROOT) || isInside(ROOT, target)) {
+    throw new Error(`拒绝危险 E2E_DATA：${input}（不得为根目录、临时根目录或仓库目录及其上下级）`);
+  }
+  // E2E 数据只能位于系统临时目录，避免误删生产挂载、工作区或用户数据。
+  if (!(targetReal === tmpRoot || isInside(tmpRoot, targetReal))) {
+    throw new Error(`拒绝危险 E2E_DATA：${input}（必须位于 ${tmpRoot} 下）`);
+  }
+  if (existsSync(target)) {
+    const st = lstatSync(target);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`拒绝 E2E_DATA：${input}（必须是普通目录，不接受符号链接/文件）`);
+  }
+  return target;
+}
+function validateE2EData() {
+  return process.env.E2E_DATA === undefined ? null : safeDataPath(process.env.E2E_DATA);
+}
+function prepareDataDir() {
+  const requested = validateE2EData();
+  if (requested === null) {
+    DATA = mkdtempSync(join(tmpdir(), "ccpm-e2e-"));
+    chmodSync(DATA, 0o700);
+    ownedData = true;
+    return DATA;
+  }
+  DATA = requested;
+  // 同一路径并发运行时，先拿不可伪造的 mkdir 锁，再允许任何清理动作。
+  dataLock = DATA + ".lock";
+  try {
+    mkdirSync(dirname(dataLock), { recursive: true, mode: 0o700 });
+    mkdirSync(dataLock, { mode: 0o700 });
+  } catch (e) {
+    if (e.code === "EEXIST") throw new Error(`E2E_DATA 正在被另一份 e2e 使用：${DATA}`);
+    throw e;
+  }
+  rmSync(DATA, { recursive: true, force: true });
+  mkdirSync(DATA, { recursive: true, mode: 0o700 });
+  chmodSync(DATA, 0o700);
+  return DATA;
+}
+function privateTempDir(prefix) {
+  const p = mkdtempSync(join(tmpdir(), prefix));
+  chmodSync(p, 0o700);
+  return p;
+}
+function testUrl(port) { return `http://${HOST}:${port}`; }
+function reservePort() {
+  return new Promise((resolveP, rejectP) => {
+    const server = net.createServer();
+    const onError = (e) => { server.removeListener("listening", onListening); rejectP(e); };
+    const onListening = () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : 0;
+      server.close((e) => e ? rejectP(e) : resolveP(port));
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen({ host: HOST, port: 0 });
+  });
+}
+async function allocatePorts() {
+  const names = ["manager", "mock", "corrupt", "tokenKeep", "embedded", "embeddedUpstream"];
+  const used = new Set();
+  const ports = {};
+  for (const name of names) {
+    let port;
+    do { port = await reservePort(); } while (used.has(port));
+    used.add(port);
+    ports[name] = port;
+  }
+  TEST_PORTS = ports;
+  UP = testUrl(ports.mock);
+  MG = testUrl(ports.manager);
+  return ports;
+}
 
 let pass = 0, fail = 0, known = 0;
 const failures = [];
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => trackedTimeout(r, ms));
 function ok(name, extra) { pass++; console.log(`  ✅ ${name}${extra ? " — " + extra : ""}`); }
 function bad(name, detail) { fail++; failures.push({ name, detail }); console.log(`  ❌ ${name}\n     ${detail}`); }
 // 当前缺陷行为如实断言；修复后应改为断言正确行为
@@ -28,45 +155,30 @@ function knownIssue(cond, name, detail) {
   else bad(name + "（缺陷行为未复现，请更新用例）", detail);
 }
 
-// ── 排他预检（M6）：本测试独占 3088(manager)/3051(mock)/3089(T5d)/3090(T5e)/3087(T23)。
-// 并行跑两份 e2e 或与开发实例共存时，后起进程 spawn 会失败但 waitUp 轮询到先起实例
-// → 断言打在别人实例上假绿。此处先探测端口占用，任一冲突立即 fail-fast，
-// DATA 目录清理维持原逻辑（rmSync 兜底崩溃残留）。注意 3089/3090/3087 在单次运行内
-// 是顺序子用例端口（不并行），但同样要防外部实例。
-const E2E_PORTS = [3088, 3051, 3089, 3090, 3087]; // manager/mock/T5d/T5e/T23(嵌入,3052 为内嵌上游)
-const PROBE_TIMEOUT_MS = 300;
-function portBusy(port) {
-  return new Promise((resolveP) => {
-    const sock = net.createConnection({ host: HOST, port }, () => { sock.destroy(); resolveP(true); });
-    sock.on("error", () => resolveP(false));
-    sock.setTimeout(PROBE_TIMEOUT_MS, () => { sock.destroy(); resolveP(false); });
-  });
-}
-async function preflightPorts() {
-  const busy = [];
-  for (const p of E2E_PORTS) if (await portBusy(p)) busy.push(p);
-  if (busy.length) {
-    console.error(`\n[preflight] 端口被占用：${busy.join(", ")}`);
-    console.error("[preflight] 已有 e2e 在跑？还是有开发实例占用这些端口？");
-    console.error(`[preflight] 请先停掉占用进程后重跑（本测试固定使用 ${E2E_PORTS.join("/")}，DATA=${DATA}）`);
-    process.exit(1);
-  }
-}
-
 function http1(url, method, headers, body, timeoutMs = HTTP1_TIMEOUT_MS) {
   return new Promise((resP, rejP) => {
     const u = new URL(url);
-    const r = http.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers }, (res) => {
+    let settled = false;
+    let timer;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTrackedTimeout(timer);
+      fn(value);
+    };
+    const r = trackedRequest({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => { clearTimeout(timer); resP({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf-8") }); });
+      res.on("end", () => finish(resP, { status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf-8") }));
+      res.on("aborted", () => finish(rejP, Object.assign(new Error(`HTTP 响应被中止（${method} ${url}）`), { code: "ECONNRESET" })));
+      res.on("error", (e) => finish(rejP, e));
     });
-    r.on("error", (e) => { clearTimeout(timer); rejP(e); });
+    r.on("error", (e) => finish(rejP, e));
     // 总超时护栏（L-h）：被测 server 回归挂起（如等待上游）时，http1 不得无限期等
     // 响应挂死整个 job。60s 高于任何设计内长用例（T11 真实等 18s），低于 CI 全局超时。
-    const timer = setTimeout(() => {
+    timer = trackedTimeout(() => {
       try { r.destroy(); } catch {}
-      rejP(Object.assign(new Error(`http1 超时：${timeoutMs}ms 内未完成（${method} ${url}），被测服务疑似挂起`), { code: "ETIMEDOUT" }));
+      finish(rejP, Object.assign(new Error(`http1 超时：${timeoutMs}ms 内未完成（${method} ${url}），被测服务疑似挂起`), { code: "ETIMEDOUT" }));
     }, timeoutMs);
     if (body) r.write(body);
     r.end();
@@ -74,54 +186,152 @@ function http1(url, method, headers, body, timeoutMs = HTTP1_TIMEOUT_MS) {
 }
 // L-h：http1 总超时上限（env 可调；恒高于 T11 18s / rawGwOnce 8s race 等设计内长用例）
 const HTTP1_TIMEOUT_MS = Number(process.env.E2E_HTTP_TIMEOUT_MS || 60000);
-const mock = (path, body) => http1(UP + path, "POST", { "Content-Type": "application/json" }, body ? JSON.stringify(body) : "");
+const mock = async (path, body) => {
+  const response = await http1(UP + path, "POST", { "Content-Type": "application/json" }, body ? JSON.stringify(body) : "");
+  if (["/__reset", "/__control"].includes(path)) {
+    if (response.status !== 200) throw new Error(`mock ${path} 状态异常：${response.status}`);
+    const data = parseJsonResponse(response, `mock ${path}`);
+    if (data.ok !== true) throw new Error(`mock ${path} 响应缺少 ok=true：${response.body}`);
+  }
+  return response;
+};
 const mockGet = (path) => http1(UP + path, "GET", {});
 const admin = (path, method = "GET", body) => http1(MG + path, method, { "X-Admin-Token": ADMIN, ...(body ? { "Content-Type": "application/json" } : {}) }, body ? JSON.stringify(body) : undefined);
 const gw = (body, token = CLIENT) => http1(MG + "/v1/chat/completions", "POST", { "Content-Type": "application/json", Authorization: "Bearer " + token }, JSON.stringify(body));
-const keysList = async () => JSON.parse((await admin("/admin/api/keys")).body).keys;
+function parseJsonResponse(response, label) {
+  if (!response || !Number.isInteger(response.status) || response.status < 100 || response.status > 599) {
+    throw new Error(`${label} 缺少有效 HTTP status`);
+  }
+  try {
+    const data = JSON.parse(response.body);
+    if (data === null || typeof data !== "object") throw new Error("JSON 顶层必须是对象");
+    return data;
+  } catch (e) {
+    throw new Error(`${label} 不是合法 JSON：${e.message}`);
+  }
+}
+async function adminJson(path, method = "GET", body, expectedStatus = 200, validate) {
+  const response = await admin(path, method, body);
+  if (!Number.isInteger(response.status) || response.status !== expectedStatus) {
+    throw new Error(`${method} ${path} 状态异常：期望 ${expectedStatus}，实际 ${response.status}，body=${response.body.slice(0, 300)}`);
+  }
+  const data = parseJsonResponse(response, `${method} ${path}`);
+  if (validate) validate(data);
+  return { response, data };
+}
+function validateKeysPayload(data) {
+  if (!Array.isArray(data.keys)) throw new Error("keys API 缺少 keys 数组");
+  for (const key of data.keys) {
+    if (!key || typeof key.id !== "string" || !key.id || typeof key.alias !== "string" || typeof key.enabled !== "boolean" || !key.health || typeof key.health !== "object") {
+      throw new Error(`keys API 条目结构异常：${JSON.stringify(key)}`);
+    }
+  }
+}
+async function addKey(alias, key) {
+  return adminJson("/admin/api/keys", "POST", { alias, key }, 201, (data) => {
+    if (typeof data.id !== "string" || !data.id || data.alias !== alias || typeof data.maskedKey !== "string" || typeof data.priority !== "number") {
+      throw new Error(`添加 Key 响应结构异常：${JSON.stringify(data)}`);
+    }
+  });
+}
+const keysList = async () => (await adminJson("/admin/api/keys", "GET", undefined, 200, validateKeysPayload)).data.keys;
 
-async function waitUp(url, timeout = 20000) {
+async function waitUp(url, timeout = 20000, child) {
   const t0 = performance.now();
   while (performance.now() - t0 < timeout) { try { const r = await http1(url, "GET", {}); if (r.status < 500) return true; } catch {} await sleep(150); }
+  if (child && (child.exitCode !== null || child.signalCode)) throw new Error(`${url} 对应进程提前退出`);
   return false;
 }
 
 let mgr;
 let mgrStderr = ""; // 始终捕获：供 P1-1 用例断言无 unhandledRejection 噪音
+function spawnNode(args, env, stdio = ["ignore", "pipe", "pipe"]) {
+  const child = spawn(process.execPath, args, { env, stdio });
+  children.add(child);
+  return child;
+}
 async function startMgr(env = {}) {
-  mgr = spawn("node", [resolve(ROOT, "src/server.mjs")], {
-    env: { ...process.env, DATA_DIR: DATA, PORT: "3088", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP, ...env },
-    stdio: ["ignore", "pipe", "pipe"]
+  mgr = spawnNode([resolve(ROOT, "src/server.mjs")], {
+    ...process.env, DATA_DIR: DATA, PORT: String(TEST_PORTS.manager), HOST,
+    UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.mock), EMBED_UPSTREAM: "0",
+    ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP, ...env
   });
   mgrStderr = "";
   mgr.stderr.on("data", (d) => { mgrStderr += d; if (process.env.E2E_VERBOSE) process.stderr.write("[mgr!] " + d); });
   if (process.env.E2E_VERBOSE) {
     mgr.stdout.on("data", (d) => process.stdout.write("[mgr] " + d));
   }
-  if (!await waitUp(MG + "/health")) throw new Error("manager not up");
+  if (!await waitUp(MG + "/health", 20000, mgr)) throw new Error("manager not up");
 }
 // 原始 HTTP 请求 + 超时 race：验证连接被有限时间内终止（end/aborted/ECONNRESET），
-// 而非挂死到 race 超时（HANG）。resolve 永不 reject。
+// 而非挂死到 race 超时。超时分支必须销毁底层请求，避免 socket 泄漏。
 function rawGwOnce(bodyObj, timeoutMs = 8000) {
   const t0 = performance.now();
-  return Promise.race([
-    new Promise((resolveP) => {
-      const req = http.request(MG + "/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT }
-      }, (res) => {
-        let txt = "";
-        res.on("data", (c) => (txt += c));
-        res.on("end", () => resolveP({ outcome: "end", ms: Math.round(performance.now() - t0), txt }));
-        res.on("aborted", () => resolveP({ outcome: "aborted", ms: Math.round(performance.now() - t0), txt }));
-      });
-      req.on("error", (e) => resolveP({ outcome: "error:" + (e.code || e.message), ms: Math.round(performance.now() - t0), txt: "" }));
-      req.end(JSON.stringify(bodyObj));
-    }),
-    sleep(timeoutMs).then(() => ({ outcome: "HANG", ms: timeoutMs, txt: "" }))
-  ]);
+  return new Promise((resolveP) => {
+    let req;
+    let res;
+    let timer;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTrackedTimeout(timer);
+      resolveP(result);
+    };
+    req = trackedRequest(MG + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT }
+    }, (response) => {
+      res = response;
+      let txt = "";
+      response.on("data", (c) => (txt += c));
+      response.on("end", () => finish({ outcome: "end", ms: Math.round(performance.now() - t0), txt }));
+      response.on("aborted", () => finish({ outcome: "aborted", ms: Math.round(performance.now() - t0), txt }));
+      response.on("error", (e) => finish({ outcome: "error:" + (e.code || e.message), ms: Math.round(performance.now() - t0), txt }));
+    });
+    req.on("error", (e) => finish({ outcome: "error:" + (e.code || e.message), ms: Math.round(performance.now() - t0), txt: "" }));
+    timer = trackedTimeout(() => {
+      try { res?.destroy(); } catch {}
+      try { req.destroy(); } catch {}
+      finish({ outcome: "timeout", ms: Math.round(performance.now() - t0), txt: "" });
+    }, timeoutMs);
+    req.end(JSON.stringify(bodyObj));
+  });
 }
-function stopMgr() { return new Promise((r) => { if (!mgr) return r(); mgr.on("exit", r); try { mgr.kill("SIGTERM"); } catch { return r(); } setTimeout(r, 3000); }); }
+async function stopChild(child, name = "child") {
+  if (!child) return;
+  const waitExit = (timeoutMs) => new Promise((resolveP) => {
+    if (child.exitCode !== null || child.signalCode) { resolveP(); return; }
+    let done = false;
+    let timer;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTrackedTimeout(timer);
+      child.removeListener("exit", finish);
+      child.removeListener("error", finish);
+      resolveP();
+    };
+    child.once("exit", finish);
+    child.once("error", finish);
+    timer = trackedTimeout(finish, timeoutMs);
+  });
+  try {
+    if (child.exitCode === null && !child.signalCode) child.kill("SIGTERM");
+  } catch {}
+  await waitExit(3000);
+  if (child.exitCode === null && !child.signalCode) {
+    try { child.kill("SIGKILL"); } catch {}
+    await waitExit(1000);
+    console.error(`[cleanup] ${name} 未在 SIGTERM 后退出，已 SIGKILL`);
+  }
+  children.delete(child);
+}
+async function stopMgr() {
+  const child = mgr;
+  mgr = null;
+  await stopChild(child, "manager");
+}
 async function restartClean() {
   await sleep(1300); // 等 state.json 1s 防抖落盘
   await stopMgr();
@@ -135,20 +345,109 @@ async function restartClean() {
   await mock("/__reset");
 }
 
+function runChildForTest(args, env = {}) {
+  return new Promise((resolveP) => {
+    const child = spawn(process.execPath, args, {
+      cwd: ROOT,
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    let timer;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTrackedTimeout(timer);
+      resolveP(result);
+    };
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.once("error", (e) => finish({ code: 2, signal: null, stdout, stderr: stderr + e.message }));
+    // close 在 exit 之后触发，并保证 stdout/stderr 已经关闭，避免提前读取造成假失败。
+    child.once("close", (code, signal) => finish({ code, signal, stdout, stderr }));
+    timer = trackedTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish({ code: 124, signal: "SIGKILL", stdout, stderr: stderr + "子进程测试超时" });
+    }, 10000);
+  });
+}
+
+async function harnessProbe() {
+  let probeData = null;
+  try {
+    validateE2EData();
+    await allocatePorts();
+    probeData = prepareDataDir();
+    console.log(JSON.stringify({ data: probeData, ports: TEST_PORTS }));
+  } finally {
+    for (const req of [...activeRequests]) { try { req.destroy(); } catch {} }
+    for (const socket of [...activeSockets]) { try { socket.destroy(); } catch {} }
+    for (const timer of [...activeTimers]) clearTrackedTimeout(timer);
+    if (ownedData && probeData) { try { rmSync(probeData, { recursive: true, force: true }); } catch {} }
+    if (dataLock) { try { rmSync(dataLock, { recursive: true, force: true }); } catch {} }
+  }
+}
+
+async function harnessRegression() {
+  const packageFile = resolve(ROOT, "package.json");
+  if (!existsSync(packageFile)) throw new Error("回归前置条件失败：仓库文件不存在");
+
+  const dangerTargets = [".", ROOT, parse(ROOT).root, tmpdir()];
+  for (const target of dangerTargets) {
+    const result = await runChildForTest([fileURLToPath(import.meta.url), "--harness-probe"], { E2E_DATA: target });
+    if (result.code === 0) {
+      throw new Error(`危险 E2E_DATA 未拒绝：${target}`);
+    }
+  }
+  if (!existsSync(packageFile)) throw new Error("危险 E2E_DATA 回归疑似删除仓库文件");
+  console.log("  ✅ 危险 E2E_DATA 均非零拒绝，仓库文件仍存在");
+
+  const probeEnv = { ...process.env };
+  delete probeEnv.E2E_DATA;
+  const [one, two] = await Promise.all([
+    runChildForTest([fileURLToPath(import.meta.url), "--harness-probe"], probeEnv),
+    runChildForTest([fileURLToPath(import.meta.url), "--harness-probe"], probeEnv)
+  ]);
+  if (one.code !== 0 || two.code !== 0) throw new Error(`并发 harness probe 失败：${one.stderr}${two.stderr}`);
+  let oneInfo, twoInfo;
+  try {
+    oneInfo = JSON.parse(one.stdout.trim());
+    twoInfo = JSON.parse(two.stdout.trim());
+  } catch (e) {
+    throw new Error(`并发 harness probe 输出不是单一 JSON：${e.message}\n${one.stdout}\n${two.stdout}`);
+  }
+  const onePorts = Object.values(oneInfo.ports || {});
+  const twoPorts = Object.values(twoInfo.ports || {});
+  if (!oneInfo.data || !twoInfo.data || oneInfo.data === twoInfo.data || !onePorts.length || !twoPorts.length || onePorts.some((p) => twoPorts.includes(p))) {
+    throw new Error(`并发隔离失败：${JSON.stringify({ one: oneInfo, two: twoInfo })}`);
+  }
+  console.log("  ✅ 并发 harness probe 使用独立临时目录和不重叠随机端口");
+
+  const typo = await runChildForTest([resolve(ROOT, "scripts/unit.mjs"), "not-a-real-scenario"]);
+  if (typo.code === 0) {
+    throw new Error(`拼错 unit 场景未非零退出：code=${typo.code}`);
+  }
+  console.log("  ✅ 拼错 unit 场景明确非零退出");
+}
+
 async function main() {
-  // M6 排他预检：在任何 spawn / rmSync 之前。端口被占 → 快速失败，
-  // 避免后起进程断言打到先起实例上假绿（DATA 崩溃残留清理维持 rmSync 原逻辑）。
-  await preflightPorts();
-  rmSync(DATA, { recursive: true, force: true });
-  mkdirSync(DATA, { recursive: true });
-  const mockProc = spawn("node", [resolve(ROOT, "scripts/mock-upstream.mjs")], { env: { ...process.env, MOCK_PORT: "3051", MOCK_HOST: HOST }, stdio: ["ignore", "pipe", "pipe"] });
-  if (process.env.E2E_VERBOSE) mockProc.stdout.on("data", (d) => process.stdout.write("[mock] " + d));
-  else mockProc.stdout.resume();
-  mockProc.stderr.on("data", (d) => process.stderr.write("[mock!] " + d));
-  let e2eDone = false;
-  mockProc.on("exit", (code, sig) => { if (!e2eDone) { console.error("mock died code=" + code + " sig=" + sig); process.exitCode = 2; } });
-  if (!await waitUp(UP + "/health")) { console.error("mock not up"); process.exit(2); }
-  await startMgr();
+  let mockProc = null;
+  let cleanupStarted = false;
+  // 先验证 E2E_DATA（无任何删除动作），再分配随机端口，最后才清理/创建数据。
+  // 这样危险路径不会触碰已有数据；端口冲突由实际子进程 bind 失败判定。
+  try {
+    validateE2EData();
+    await allocatePorts();
+    prepareDataDir();
+    mockProc = spawnNode([resolve(ROOT, "scripts/mock-upstream.mjs")], { ...process.env, MOCK_PORT: String(TEST_PORTS.mock), MOCK_HOST: HOST });
+    if (process.env.E2E_VERBOSE) mockProc.stdout.on("data", (d) => process.stdout.write("[mock] " + d));
+    else mockProc.stdout.resume();
+    mockProc.stderr.on("data", (d) => process.stderr.write("[mock!] " + d));
+    mockProc.on("exit", (code, sig) => { if (!cleanupStarted) console.error("mock died code=" + code + " sig=" + sig); });
+    if (!await waitUp(UP + "/health", 20000, mockProc)) throw new Error("mock not up");
+    await startMgr();
 
   // ── T1 鉴权 ──
   console.log("\n=== T1 auth ===");
@@ -164,9 +463,9 @@ async function main() {
   r.status === 429 && r.body.includes("No usable API key") ? ok("空池 → 429 No usable API key") : bad("空池 429", "status=" + r.status + " " + r.body.slice(0, 120));
 
   // ── 播种 keyA(主)/keyB(备) ──
-  let rr = await admin("/admin/api/keys", "POST", { alias: "keyA", key: "user_keyA" });
+  let rr = (await addKey("keyA", "user_keyA")).response;
   ok("添加 keyA", "201=" + rr.status);
-  rr = await admin("/admin/api/keys", "POST", { alias: "keyB", key: "user_keyB" });
+  rr = (await addKey("keyB", "user_keyB")).response;
   ok("添加 keyB", "201=" + rr.status);
   rr = await admin("/admin/api/keys", "POST", { alias: "bad", key: "notuser_x" });
   rr.status === 400 ? ok("非 user_ 前缀 → 400") : bad("非 user_ 前缀", "got " + rr.status);
@@ -247,7 +546,7 @@ async function main() {
   ks = await keysList(); // 一次进程内快速 HTTP（≪100ms），不破坏防抖窗口
   const idA5c = ks.find((k) => k.alias === "keyA").id;
   const t5cKill0 = performance.now();
-  await new Promise((re) => { mgr.on("exit", re); mgr.kill("SIGTERM"); setTimeout(re, 4000); });
+  await stopMgr();
   const killLag = Math.round(performance.now() - t5cKill0);
   killLag < 950 ? ok("T5c 进程在防抖窗口(<1000ms)内退出，timer 不可能已触发", killLag + "ms") : bad("T5c 退出时序", killLag + "ms ≥ 防抖窗口，无法证明 flush 价值");
   const st5c = JSON.parse(readFileSync(resolve(DATA, "state.json"), "utf-8"));
@@ -269,34 +568,35 @@ async function main() {
   // 独立 DATA/端口，手工 spawn，不触碰主流程 DATA 与全局 mgr。
   console.log("\n=== T5d corrupt config backup (P2-1) ===");
   {
-    const D5d = "/tmp/ccpm-e2e-corrupt";
-    rmSync(D5d, { recursive: true, force: true });
-    mkdirSync(D5d, { recursive: true });
+    const D5d = privateTempDir("ccpm-e2e-corrupt-");
     writeFileSync(resolve(D5d, "config.json"), "{ not json");
     const TOK5d = "e2e-fixed-admin-tok-9f8e";
-    const U5d = "http://" + HOST + ":3089";
-    const p5d = spawn("node", [resolve(ROOT, "src/server.mjs")], {
-      env: { ...process.env, DATA_DIR: D5d, PORT: "3089", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: TOK5d, CLIENT_TOKEN: TOK5d, CC_QUOTA_BASE: UP },
-      stdio: ["ignore", "pipe", "pipe"]
+    const U5d = testUrl(TEST_PORTS.corrupt);
+    const p5d = spawnNode([resolve(ROOT, "src/server.mjs")], {
+      ...process.env, DATA_DIR: D5d, PORT: String(TEST_PORTS.corrupt), HOST,
+      UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.mock), EMBED_UPSTREAM: "0",
+      ADMIN_TOKEN: TOK5d, CLIENT_TOKEN: TOK5d, CC_QUOTA_BASE: UP
     });
-    let out5d = "";
-    p5d.stdout.on("data", (d) => { out5d += d; });
-    p5d.stderr.on("data", (d) => { out5d += d; });
-    (await waitUp(U5d + "/health")) ? ok("T5d 损坏 config 下服务正常启动（默认值+env）") : bad("T5d 启动", out5d.slice(0, 300));
-    const corruptFiles = readdirSync(D5d).filter((f) => /^config\.json\.corrupt-\d+$/.test(f));
-    const backupRaw = corruptFiles.length === 1 ? readFileSync(resolve(D5d, corruptFiles[0]), "utf-8") : null;
-    corruptFiles.length === 1 && backupRaw === "{ not json"
-      ? ok("T5d 损坏文件备份为 config.json.corrupt-<ts> 且原内容逐字保留", corruptFiles[0])
-      : bad("T5d 备份", "files=" + corruptFiles.join(",") + " content=" + JSON.stringify(backupRaw));
-    out5d.includes("解析失败，已备份为") ? ok("T5d 启动日志含明确备份警告") : bad("T5d 日志", out5d.slice(0, 300));
-    r = await http1(U5d + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5d }));
-    r.status === 200 ? ok("T5d 磁盘无 token → env 填充（衔接 P2-2），FIXED 令牌登录成功") : bad("T5d login", "status=" + r.status);
-    let cfg5d = null;
-    try { cfg5d = JSON.parse(readFileSync(resolve(D5d, "config.json"), "utf-8")); } catch {}
-    cfg5d && cfg5d.adminToken === TOK5d ? ok("T5d 新 config.json 为合法 JSON 且已持久化 token") : bad("T5d 新 config", JSON.stringify(cfg5d).slice(0, 150));
-    p5d.kill("SIGTERM");
-    await new Promise((re) => { p5d.on("exit", re); setTimeout(re, 3000); });
-    rmSync(D5d, { recursive: true, force: true });
+    try {
+      let out5d = "";
+      p5d.stdout.on("data", (d) => { out5d += d; });
+      p5d.stderr.on("data", (d) => { out5d += d; });
+      (await waitUp(U5d + "/health", 20000, p5d)) ? ok("T5d 损坏 config 下服务正常启动（默认值+env）") : bad("T5d 启动", out5d.slice(0, 300));
+      const corruptFiles = readdirSync(D5d).filter((f) => /^config\.json\.corrupt-\d+$/.test(f));
+      const backupRaw = corruptFiles.length === 1 ? readFileSync(resolve(D5d, corruptFiles[0]), "utf-8") : null;
+      corruptFiles.length === 1 && backupRaw === "{ not json"
+        ? ok("T5d 损坏文件备份为 config.json.corrupt-<ts> 且原内容逐字保留", corruptFiles[0])
+        : bad("T5d 备份", "files=" + corruptFiles.join(",") + " content=" + JSON.stringify(backupRaw));
+      out5d.includes("解析失败，已备份为") ? ok("T5d 启动日志含明确备份警告") : bad("T5d 日志", out5d.slice(0, 300));
+      r = await http1(U5d + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5d }));
+      r.status === 200 ? ok("T5d 磁盘无 token → env 填充（衔接 P2-2），FIXED 令牌登录成功") : bad("T5d login", "status=" + r.status);
+      let cfg5d = null;
+      try { cfg5d = JSON.parse(readFileSync(resolve(D5d, "config.json"), "utf-8")); } catch {}
+      cfg5d && cfg5d.adminToken === TOK5d ? ok("T5d 新 config.json 为合法 JSON 且已持久化 token") : bad("T5d 新 config", JSON.stringify(cfg5d).slice(0, 150));
+    } finally {
+      await stopChild(p5d, "T5d manager");
+      try { rmSync(D5d, { recursive: true, force: true }); } catch {}
+    }
   }
 
   // ── T5e env 令牌不再回滚磁盘凭证（P2-2）──
@@ -304,36 +604,38 @@ async function main() {
   // 修复前：B 启动即把磁盘覆写回 B → A 登录 401（红）。不用 restartClean/主 DATA，避免清理干扰。
   console.log("\n=== T5e env token no-rollback (P2-2) ===");
   {
-    const D5e = "/tmp/ccpm-e2e-tokenkeep";
+    const D5e = privateTempDir("ccpm-e2e-tokenkeep-");
     const TOK5eA = "e2e-disk-token-A-aaaa";
     const TOK5eB = "e2e-env-token-B-bbbb";
-    const U5e = "http://" + HOST + ":3090";
-    const spawn5e = (tok) => spawn("node", [resolve(ROOT, "src/server.mjs")], {
-      env: { ...process.env, DATA_DIR: D5e, PORT: "3090", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3051", EMBED_UPSTREAM: "0", ADMIN_TOKEN: tok, CLIENT_TOKEN: tok, CC_QUOTA_BASE: UP },
-      stdio: ["ignore", "pipe", "pipe"]
+    const U5e = testUrl(TEST_PORTS.tokenKeep);
+    const spawn5e = (tok) => spawnNode([resolve(ROOT, "src/server.mjs")], {
+      ...process.env, DATA_DIR: D5e, PORT: String(TEST_PORTS.tokenKeep), HOST,
+      UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.mock), EMBED_UPSTREAM: "0",
+      ADMIN_TOKEN: tok, CLIENT_TOKEN: tok, CC_QUOTA_BASE: UP
     });
-    const kill5e = (p) => new Promise((re) => { p.on("exit", re); p.kill("SIGTERM"); setTimeout(re, 3000); });
-    rmSync(D5e, { recursive: true, force: true });
-    mkdirSync(D5e, { recursive: true });
-    let p5e = spawn5e(TOK5eA);
-    const upA5e = await waitUp(U5e + "/health");
-    upA5e ? ok("T5e 首次启动（env=A）正常") : bad("T5e 首次启动", D5e);
-    let cfg5e = null;
-    try { cfg5e = JSON.parse(readFileSync(resolve(D5e, "config.json"), "utf-8")); } catch {}
-    cfg5e && cfg5e.adminToken === TOK5eA ? ok("T5e 磁盘 config.json 已建立 token=A") : bad("T5e 首启落盘", JSON.stringify(cfg5e && cfg5e.adminToken));
-    await kill5e(p5e);
-    p5e = spawn5e(TOK5eB);
-    const upB5e = await waitUp(U5e + "/health");
-    if (!upB5e) bad("T5e 二次启动（env=B）", D5e);
-    r = await http1(U5e + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5eA }));
-    const okA = r.status === 200;
-    okA ? ok("T5e env=B 重启后磁盘 token=A 仍有效（未回滚）") : bad("T5e A 登录", "status=" + r.status);
-    r = await http1(U5e + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5eB }));
-    const okB = r.status === 401;
-    okB ? ok("T5e env=B 未获得登录权（env 不覆写非空磁盘值）") : bad("T5e B 登录应 401", "status=" + r.status);
-    upB5e && okA && okB ? ok("T5e 综合：P2-2 语义正确") : bad("T5e 综合", "up=" + upB5e + " A=" + okA + " B=" + okB);
-    await kill5e(p5e);
-    rmSync(D5e, { recursive: true, force: true });
+    let p5e = null;
+    try {
+      p5e = spawn5e(TOK5eA);
+      const upA5e = await waitUp(U5e + "/health", 20000, p5e);
+      upA5e ? ok("T5e 首次启动（env=A）正常") : bad("T5e 首次启动", D5e);
+      let cfg5e = null;
+      try { cfg5e = JSON.parse(readFileSync(resolve(D5e, "config.json"), "utf-8")); } catch {}
+      cfg5e && cfg5e.adminToken === TOK5eA ? ok("T5e 磁盘 config.json 已建立 token=A") : bad("T5e 首启落盘", JSON.stringify(cfg5e && cfg5e.adminToken));
+      await stopChild(p5e, "T5e manager A");
+      p5e = spawn5e(TOK5eB);
+      const upB5e = await waitUp(U5e + "/health", 20000, p5e);
+      if (!upB5e) bad("T5e 二次启动（env=B）", D5e);
+      r = await http1(U5e + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5eA }));
+      const okA = r.status === 200;
+      okA ? ok("T5e env=B 重启后磁盘 token=A 仍有效（未回滚）") : bad("T5e A 登录", "status=" + r.status);
+      r = await http1(U5e + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: TOK5eB }));
+      const okB = r.status === 401;
+      okB ? ok("T5e env=B 未获得登录权（env 不覆写非空磁盘值）") : bad("T5e B 登录应 401", "status=" + r.status);
+      upB5e && okA && okB ? ok("T5e 综合：P2-2 语义正确") : bad("T5e 综合", "up=" + upB5e + " A=" + okA + " B=" + okB);
+    } finally {
+      await stopChild(p5e, "T5e manager");
+      try { rmSync(D5e, { recursive: true, force: true }); } catch {}
+    }
   }
 
   // ── T6 上游 401 → authError、不重试不切换、透传 401 ──
@@ -501,13 +803,28 @@ async function main() {
   await restartClean();
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "slowsse" }] });
   await new Promise((resolveP) => {
-    const req = http.request(MG + "/v1/chat/completions", {
+    let req;
+    let finishTimer;
+    let guardTimer;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTrackedTimeout(finishTimer);
+      clearTrackedTimeout(guardTimer);
+      resolveP();
+    };
+    req = trackedRequest(MG + "/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT }
-    }, (res) => { res.once("data", () => setTimeout(() => { try { req.destroy(); } catch {} }, 30)); });
-    req.on("error", () => {});
+    }, (res) => {
+      res.once("data", () => {
+        finishTimer = trackedTimeout(() => { try { req.destroy(); } catch {} finish(); }, 30);
+      });
+    });
+    req.on("error", finish);
     req.end(JSON.stringify({ model: "m-disc", messages: [], stream: true }));
-    setTimeout(resolveP, 5500); // slowsse 15帧×300ms
+    guardTimer = trackedTimeout(finish, 5500); // slowsse 15帧×300ms
   });
   await sleep(1000);
   const slow = JSON.parse((await mockGet("/__slow")).body).slowLog;
@@ -671,14 +988,27 @@ async function main() {
   console.log("\n=== T18 SSE ===");
   await restartClean();
   const sse = await new Promise((resolveP) => {
-    const req = http.request(MG + "/admin/api/events", { headers: { "X-Admin-Token": ADMIN } }, (res) => {
-      let text = "";
-      res.on("data", (c) => { text += c; if (text.includes("event: stats")) { try { req.destroy(); } catch {} resolveP(text); } });
-      setTimeout(() => { try { req.destroy(); } catch {} resolveP(text); }, 5000);
+    let req;
+    let timeoutTimer;
+    let triggerTimer;
+    let text = "";
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTrackedTimeout(timeoutTimer);
+      clearTrackedTimeout(triggerTimer);
+      try { req.destroy(); } catch {}
+      resolveP(text);
+    };
+    req = trackedRequest(MG + "/admin/api/events", { headers: { "X-Admin-Token": ADMIN } }, (res) => {
+      res.on("data", (c) => { text += c; if (text.includes("event: stats")) finish(); });
+      res.on("error", finish);
     });
-    req.on("error", () => {});
+    req.on("error", finish);
     req.end();
-    setTimeout(() => { gw({ model: "sse-probe", messages: [] }); }, 300);
+    timeoutTimer = trackedTimeout(finish, 5000);
+    triggerTimer = trackedTimeout(() => { void gw({ model: "sse-probe", messages: [] }).catch(() => {}); }, 300);
   });
   sse.includes(": connected") && sse.includes("event: stats") ? ok("SSE 推送 stats 事件") : bad("SSE", JSON.stringify(sse.slice(0, 200)));
   r = await http1(MG + "/admin/api/events", "GET", {});
@@ -694,13 +1024,24 @@ async function main() {
       ? ok("cookie 属性 HttpOnly+Path限定+SameSite=Strict") : bad("cookie 属性", attrs);
     !attrs.includes(ADMIN) ? ok("cookie 值不含明文令牌（SHA-256 摘要）") : bad("cookie 明文泄漏", attrs);
     const sseCookie = await new Promise((resolveP) => {
-      const req = http.request(MG + "/admin/api/events", { headers: { Cookie: "ccpm_sse=" + m[1] } }, (res) => {
+      let req;
+      let timer;
+      let done = false;
+      const finish = (status) => {
+        if (done) return;
+        done = true;
+        clearTrackedTimeout(timer);
+        try { req.destroy(); } catch {}
+        resolveP(status);
+      };
+      req = trackedRequest(MG + "/admin/api/events", { headers: { Cookie: "ccpm_sse=" + m[1] } }, (res) => {
         let text = "";
-        res.on("data", (c) => { text += c; if (text.includes(": connected")) { try { req.destroy(); } catch {} resolveP(res.statusCode); } });
-        setTimeout(() => { try { req.destroy(); } catch {} resolveP(res.statusCode); }, 2000);
+        res.on("data", (c) => { text += c; if (text.includes(": connected")) finish(res.statusCode); });
+        res.on("error", () => finish(res.statusCode || 0));
       });
-      req.on("error", () => resolveP(0));
+      req.on("error", () => finish(0));
       req.end();
+      timer = trackedTimeout(() => finish(0), 2000);
     });
     sseCookie === 200 ? ok("SSE cookie 鉴权通过") : bad("SSE cookie", "status=" + sseCookie);
     const wrong = await http1(MG + "/admin/api/events", "GET", { Cookie: "ccpm_sse=" + "0".repeat(64) });
@@ -757,14 +1098,24 @@ async function main() {
     ? ok("SECURE_COOKIES=1 → Set-Cookie 含 Secure") : bad("SECURE_COOKIES=1", "status=" + r.status + " sc=" + sc);
   const mSec = sc.match(/ccpm_sse=([a-f0-9]{64})/);
   const sseSec = await new Promise((resolveP) => {
-    const req = http.request(MG + "/admin/api/events", { headers: { Cookie: mSec ? "ccpm_sse=" + mSec[1] : "" } }, (res) => {
+    let req;
+    let timer;
+    let done = false;
+    const finish = (status) => {
+      if (done) return;
+      done = true;
+      clearTrackedTimeout(timer);
+      try { req.destroy(); } catch {}
+      resolveP(status);
+    };
+    req = trackedRequest(MG + "/admin/api/events", { headers: { Cookie: mSec ? "ccpm_sse=" + mSec[1] : "" } }, (res) => {
       let text = "";
-      const finish = () => { try { req.destroy(); } catch {} resolveP(res.statusCode); };
-      res.on("data", (c) => { text += c; if (text.includes(": connected")) finish(); });
-      setTimeout(finish, 2000);
+      res.on("data", (c) => { text += c; if (text.includes(": connected")) finish(res.statusCode); });
+      res.on("error", () => finish(res.statusCode || 0));
     });
-    req.on("error", () => resolveP(0));
+    req.on("error", () => finish(0));
     req.end();
+    timer = trackedTimeout(() => finish(0), 2000);
   });
   sseSec === 200 ? ok("Secure 模式下 SSE cookie 鉴权仍通过（curl 手工回传等价）") : bad("Secure SSE", "status=" + sseSec);
   sc = String((await http1(MG + "/admin/api/logout", "POST", {})).headers["set-cookie"] || "");
@@ -833,7 +1184,7 @@ async function main() {
   // ── T22 串行额度探测 / SSE 状态事件 / 系统日志持久化 ──
   console.log("\n=== T22 serial probes & status events & log persistence ===");
   await restartClean();
-  const rC = await admin("/admin/api/keys", "POST", { alias: "keyC", key: "user_keyC" });
+  const rC = (await addKey("keyC", "user_keyC")).response;
   ok("添加 keyC", String(rC.status));
   ks = await keysList();
   const idA22 = ks.find((k) => k.alias === "keyA").id, idC22 = ks.find((k) => k.alias === "keyC").id;
@@ -841,7 +1192,7 @@ async function main() {
   // SSE 收集 quota-status
   const sseEvents = [];
   const sseConn = await new Promise((resolveP) => {
-    const req = http.request(MG + "/admin/api/events", { headers: { "X-Admin-Token": ADMIN } }, (res) => {
+    const req = trackedRequest(MG + "/admin/api/events", { headers: { "X-Admin-Token": ADMIN } }, (res) => {
       let buf = "";
       res.on("data", (c) => {
         buf += c;
@@ -850,7 +1201,7 @@ async function main() {
       });
       resolveP(req);
     });
-    req.on("error", () => {});
+    req.on("error", () => resolveP(null));
     req.end();
   });
   await sleep(200);
@@ -880,7 +1231,7 @@ async function main() {
   const phases = qEvents.map(([, d]) => { try { return JSON.parse(d).phase; } catch { return ""; } });
   phases.includes("updating") && phases.includes("done")
     ? ok("SSE quota-status 事件流（updating→done）", phases.slice(0, 6).join(">")) : bad("quota-status", JSON.stringify(phases.slice(0, 8)));
-  try { sseConn.destroy(); } catch {}
+  try { sseConn?.destroy(); } catch {}
   // 日志持久化：重启后 events.jsonl 回放，历史日志不丢
   const logsBefore = JSON.parse((await admin("/admin/api/logs?since=0")).body).logs;
   const addLine = logsBefore.filter((l) => l.msg.includes("新增 Key"));
@@ -898,47 +1249,69 @@ async function main() {
   console.log("\n=== T23 proxy log capture ===");
   await stopMgr();
   // 独立起嵌入模式进程并捕获 stdout：验证 ①docker logs 通道原样透传 ②proxy 行进日志环/落盘
-  const embOut = await new Promise(async (resolveP) => {
-    const proc = spawn("node", [resolve(ROOT, "src/server.mjs")], {
-      env: { ...process.env, DATA_DIR: DATA, PORT: "3087", HOST, UPSTREAM_HOST: HOST, UPSTREAM_PORT: "3052", EMBED_UPSTREAM: "1", ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP },
-      stdio: ["ignore", "pipe", "pipe"]
-    }); // 嵌入上游监听 3052（避开 mock 的 3051）；quota 探测仍指 mock
-    let txt = "";
-    proc.stdout.on("data", (c) => { txt += c; });
-    proc.stderr.on("data", (c) => { txt += c; });
+  const embProc = spawnNode([resolve(ROOT, "src/server.mjs")], {
+    ...process.env, DATA_DIR: DATA, PORT: String(TEST_PORTS.embedded), HOST,
+    UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.embeddedUpstream), EMBED_UPSTREAM: "1",
+    ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP
+  }); // 嵌入上游使用独立动态端口；quota 探测仍指 mock
+  try {
+    let embTxt = "";
+    embProc.stdout.on("data", (c) => { embTxt += c; });
+    embProc.stderr.on("data", (c) => { embTxt += c; });
     let logTxt = "";
     for (let i = 0; i < 80; i++) {
       try {
-        const rr = await http1("http://" + HOST + ":3087/admin/api/logs?since=0&src=proxy", "GET", { "X-Admin-Token": ADMIN });
-        if (rr.status === 200) { logTxt = rr.body; if (JSON.parse(logTxt).logs.length) break; }
+        const rr = await http1(testUrl(TEST_PORTS.embedded) + "/admin/api/logs?since=0&src=proxy", "GET", { "X-Admin-Token": ADMIN });
+        if (rr.status === 200) { logTxt = rr.body; if (parseJsonResponse(rr, "T23 logs").logs.length) break; }
       } catch {}
       await sleep(250);
     }
-    const proxyLogs = JSON.parse(logTxt || "{\"logs\":[]}").logs;
-    resolveP({ txt, proxyLogs, proc });
-  });
-  const plogs = embOut.proxyLogs;
-  const pTxt = JSON.stringify(plogs);
-  plogs.length >= 1 && plogs.some((l) => l.msg.includes("CC Proxy started") && l.src === "proxy")
-    ? ok("T23a 上游启动日志入日志页（src=proxy，含捕获前于挂钩的启动行）", plogs.length + " 条") : bad("T23a", pTxt.slice(0, 250));
-  embOut.txt.includes("CC Proxy started") && embOut.txt.includes("[manager] CC Proxy Manager started")
-    ? ok("T23b stdout 原样透传不受捕获影响（docker logs 通道完好）") : bad("T23b", embOut.txt.slice(0, 250));
-  const diskHas = existsSync(resolve(DATA, "events.jsonl")) && readFileSync(resolve(DATA, "events.jsonl"), "utf-8").includes("\"src\":\"proxy\"");
-  diskHas ? ok("T23c proxy 行已落盘 events.jsonl") : bad("T23c", "file missing/no proxy lines");
-  // API 层 src 过滤 + level 字段存在
-  plogs.every((l) => ["info", "warn", "error"].includes(l.level)) ? ok("T23d level 字段规范化") : bad("T23d", pTxt.slice(0, 200));
-  embOut.proc.kill("SIGTERM");
-  await new Promise((r) => { embOut.proc.on("exit", r); setTimeout(r, 2000); });
+    const proxyPayload = logTxt ? parseJsonResponse({ status: 200, body: logTxt }, "T23 logs") : { logs: [] };
+    const plogs = Array.isArray(proxyPayload.logs) ? proxyPayload.logs : [];
+    const pTxt = JSON.stringify(plogs);
+    plogs.length >= 1 && plogs.some((l) => l.msg.includes("CC Proxy started") && l.src === "proxy")
+      ? ok("T23a 上游启动日志入日志页（src=proxy，含捕获前于挂钩的启动行）", plogs.length + " 条") : bad("T23a", pTxt.slice(0, 250));
+    embTxt.includes("CC Proxy started") && embTxt.includes("[manager] CC Proxy Manager started")
+      ? ok("T23b stdout 原样透传不受捕获影响（docker logs 通道完好）") : bad("T23b", embTxt.slice(0, 250));
+    const diskHas = existsSync(resolve(DATA, "events.jsonl")) && readFileSync(resolve(DATA, "events.jsonl"), "utf-8").includes("\"src\":\"proxy\"");
+    diskHas ? ok("T23c proxy 行已落盘 events.jsonl") : bad("T23c", "file missing/no proxy lines");
+    // API 层 src 过滤 + level 字段存在
+    plogs.every((l) => ["info", "warn", "error"].includes(l.level)) ? ok("T23d level 字段规范化") : bad("T23d", pTxt.slice(0, 200));
+  } finally {
+    await stopChild(embProc, "embedded manager");
+  }
   await startMgr();
 
   // ── 汇总 ──
   console.log(`\n=== summary: ${pass} passed, ${fail} failed, ${known} known-issue ===`);
   if (failures.length) { console.log("Failures:"); for (const f of failures) console.log(" - " + f.name + ": " + f.detail); }
-  await stopMgr();
-  e2eDone = true;
-  try { mockProc.kill("SIGTERM"); } catch {}
-  await sleep(300);
-  process.exit(fail ? 1 : 0);
+    process.exitCode = fail ? 1 : 0;
+  } finally {
+    cleanupStarted = true;
+    try { await stopMgr(); } catch (e) { console.error("[cleanup] manager：" + e.message); }
+    for (const child of [...children]) {
+      try { await stopChild(child, "child"); } catch (e) { console.error("[cleanup] child：" + e.message); }
+    }
+    for (const req of [...activeRequests]) {
+      try { req.destroy(); } catch {}
+    }
+    for (const socket of [...activeSockets]) {
+      try { socket.destroy(); } catch {}
+    }
+    for (const timer of [...activeTimers]) clearTrackedTimeout(timer);
+    if (ownedData && DATA) {
+      try { rmSync(DATA, { recursive: true, force: true }); } catch (e) { console.error("[cleanup] 临时数据目录：" + e.message); }
+    }
+    if (dataLock) {
+      try { rmSync(dataLock, { recursive: true, force: true }); } catch (e) { console.error("[cleanup] E2E_DATA 锁：" + e.message); }
+    }
+  }
 }
 
-main().catch(async (e) => { console.error("HARNESS ERROR", e); try { await stopMgr(); } catch {} process.exit(2); });
+if (SCENARIO === "--harness-probe") {
+  harnessProbe().catch((e) => { console.error("HARNESS PROBE ERROR", e.message); process.exitCode = 2; });
+} else if (SCENARIO === "--harness-test") {
+  harnessRegression().catch((e) => { console.error("HARNESS REGRESSION ERROR", e.message); process.exitCode = 1; });
+} else {
+  main().catch((e) => { console.error("HARNESS ERROR", e); process.exitCode = 2; });
+}

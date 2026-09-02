@@ -10,6 +10,12 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const SC = process.argv[2];
+const SCENARIOS = ["quota", "pool", "stats", "logs", "tokens", "state"];
+
+if (SC && !SCENARIOS.includes(SC)) {
+  console.error(`未知 unit 场景：${SC}。可选值：${SCENARIOS.join(", ")}`);
+  process.exit(1);
+}
 
 // ── 单场景超时护栏（L-h）：场景子进程挂起（如回归导致的死循环/永不 resolve 的
 // await）不得拖死整个 unit job。30s 远超任何场景实际耗时（毫秒级单测），
@@ -19,7 +25,7 @@ const SCENARIO_TIMEOUT_MS = Number(process.env.UNIT_SCENARIO_TIMEOUT_MS || 30000
 if (!SC) {
   // runner 模式：逐场景子进程执行（DATA_DIR 在各子进程 import 前注入，互不污染）
   let failed = false;
-  for (const s of ["quota", "pool", "stats", "logs", "tokens", "state"]) {
+  for (const s of SCENARIOS) {
     const code = await new Promise((resolveP) => {
       const p = spawn(process.execPath, [fileURLToPath(import.meta.url), s], { stdio: "inherit" });
       let done = false;
@@ -318,7 +324,7 @@ if (SC === "stats") {
   const mode = (statSync(DATA + "/stats.jsonl").mode & 0o777).toString(8);
   check(mode === "600", "stats.jsonl 权限 600", mode);
   setRetention(999); // clamp 31
-  check(true, "setRetention 越界 clamp 不抛错");
+  check(usageByKey("k1").d30Valid === true, "setRetention 越界后仍按 31 天上限启用 d30", JSON.stringify(usageByKey("k1")));
   // ── 终检加固：读侧净化——修复前已落盘的脏 usage 重启回放后不得进聚合（用 ?fresh
   //    查询串绕过模块缓存拿独立实例；DATA_DIR 经 config.mjs 缓存仍指向同一临时目录）──
   const now2 = Date.now();
@@ -364,8 +370,11 @@ if (SC === "logs") {
   console.log("random manager output");
   // 重入防护：再 attach 一次不应重复挂钩
   attachConsoleCapture();
-  await new Promise((r) => setTimeout(r, 50));
-  check(true, "捕获挂接 + 重入防护不抛错");
+  const reentryMarker = "reentry-check-" + Date.now();
+  const beforeReentry = readFileSync(DATA + "/events.jsonl", "utf8").split("\n").filter((line) => line.includes(reentryMarker)).length;
+  console.log(`[${new Date().toISOString().replace(/\.\d{3}Z$/, "Z")}] [info] ${reentryMarker}`);
+  const afterReentry = readFileSync(DATA + "/events.jsonl", "utf8").split("\n").filter((line) => line.includes(reentryMarker)).length;
+  check(afterReentry === beforeReentry + 1, "捕获挂接 + 重入防护只写入一条日志", `before=${beforeReentry} after=${afterReentry}`);
 
   // 2) initLogs 回放：文件里已有上面捕获的行，回放去重（不应翻倍）
   initLogs(bus, 7);

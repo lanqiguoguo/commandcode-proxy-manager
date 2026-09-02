@@ -51,7 +51,11 @@ export function initLogs(emitter, retentionDaysArg = 7) {
     if (dirty) persist();
   }
   emitter.on("log", (entry) => {
-    append({ ts: entry.ts || Date.now(), level: entry.level || "info", msg: String(entry.msg || ""), src: entry.src || "manager" });
+    // ts 单一来源：本订阅先于 adminApi 的 SSE onLog 注册，若 entry 无 ts 在此补一次
+    // 并写回 entry——后续 SSE 消费者拿到同一 ts，避免两处各自 Date.now() 产生不同
+    // 毫秒值导致前端按 ts|src|msg 去重失效（同一条日志双通道显示两条）。
+    if (entry.ts === undefined) entry.ts = Date.now();
+    append({ ts: entry.ts, level: entry.level || "info", msg: String(entry.msg || ""), src: entry.src || "manager" });
   });
   attachConsoleCapture();
   if (pruneTimer) clearInterval(pruneTimer);

@@ -41,8 +41,11 @@ export function initKeyPool(cfgPool, opts = {}) {
   }));
 }
 
+// emit 时统一携带 ts：日志事件有两个消费者（logs.mjs 落盘、adminApi SSE 推送），
+// 若此处不带 ts，两处各自用 Date.now() 补齐会得到不同毫秒值 → 前端按 ts|src|msg
+// 去重失效，同一条日志经 SSE 与轮询双通道显示两条（实测差 1ms 即复现）。
 function emitLog(msg) {
-  if (emitter) emitter.emit("log", { level: "info", msg });
+  if (emitter) emitter.emit("log", { ts: Date.now(), level: "info", msg });
 }
 
 function persistKeys() { writeJson("keys.json", { keys }); }

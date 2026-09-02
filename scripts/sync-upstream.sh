@@ -12,7 +12,8 @@ UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/MAXeaglet/commandcode-proxy.git
 UPSTREAM_API="${UPSTREAM_API:-https://api.github.com/repos/MAXeaglet/commandcode-proxy/releases/latest}"
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# STAGE 在此后定义；trap 执行时若已赋值则一并清理（原子同步的暂存目录）
+trap 'rm -rf "$TMP" ${STAGE:-}' EXIT
 
 # 查询最新 release tag；API 不可达 / 无 release / 响应无 tag_name 均视为「无 release」（返回空）
 if ! API_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 -L "$UPSTREAM_API" 2>/dev/null); then
@@ -46,11 +47,29 @@ else
 fi
 
 mkdir -p upstream
-cp "$TMP/upstream/proxy.mjs" upstream/proxy.mjs
-cp "$TMP/upstream/config.json" upstream/config.json
-cp "$TMP/upstream/package.json" upstream/package.json
+# L-f：原子同步——先在 upstream/.sync-tmp/ 完成全部拷贝与改写（含语法校验），
+# 全部成功后才逐个 mv 原子替换；中途失败（磁盘满/中断/校验不过）由 set -e 退出，
+# EXIT trap 清理 .sync-tmp，upstream/ 保持旧状态，不留"新 proxy + 旧 config"混合态
+# （此前逐文件 cp + sed -i 分步写，CI 会带半成品开 PR）。
+STAGE="upstream/.sync-tmp"
+mkdir -p "$STAGE"
+cp "$TMP/upstream/proxy.mjs" "$STAGE/proxy.mjs"
+cp "$TMP/upstream/config.json" "$STAGE/config.json"
+cp "$TMP/upstream/package.json" "$STAGE/package.json"
 # 上游只监听 127.0.0.1（由管理网关内部转发），避免内部端口暴露
-sed -i 's/"host": "0.0.0.0"/"host": "127.0.0.1"/' upstream/config.json
+sed -i 's/"host": "0.0.0.0"/"host": "127.0.0.1"/' "$STAGE/config.json"
+# 语法冒烟：stdin 校验需 --input-type=module 才会按 ESM（import/export）解析
+if command -v node >/dev/null 2>&1; then
+  if ! node --input-type=module --check < "$STAGE/proxy.mjs" 2>/dev/null; then
+    echo "ERROR: vendored proxy.mjs 语法校验失败，放弃本次同步（upstream/ 未改动）" >&2
+    exit 1
+  fi
+fi
+# 全部就绪后逐个原子替换（同目录 rename）；版本号最后写（同步完成的标记）
+mv "$STAGE/proxy.mjs" upstream/proxy.mjs
+mv "$STAGE/config.json" upstream/config.json
+mv "$STAGE/package.json" upstream/package.json
+rmdir "$STAGE" 2>/dev/null || true
 
 echo "$TAG@$COMMIT" > UPSTREAM_VERSION
 echo "==> Synced upstream $TAG@$COMMIT"

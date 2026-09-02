@@ -11,13 +11,24 @@ import { fileURLToPath } from "url";
 
 const SC = process.argv[2];
 
+// ── 单场景超时护栏（L-h）：场景子进程挂起（如回归导致的死循环/永不 resolve 的
+// await）不得拖死整个 unit job。30s 远超任何场景实际耗时（毫秒级单测），
+// 超时则 SIGKILL + 计 fail + 输出清晰错误。──
+const SCENARIO_TIMEOUT_MS = Number(process.env.UNIT_SCENARIO_TIMEOUT_MS || 30000);
+
 if (!SC) {
   // runner 模式：逐场景子进程执行（DATA_DIR 在各子进程 import 前注入，互不污染）
   let failed = false;
   for (const s of ["quota", "pool", "stats", "logs", "tokens", "state"]) {
     const code = await new Promise((resolveP) => {
       const p = spawn(process.execPath, [fileURLToPath(import.meta.url), s], { stdio: "inherit" });
-      p.on("exit", (c) => resolveP(c));
+      let done = false;
+      const timer = setTimeout(() => {
+        done = true;
+        console.error(`\n  ❌ unit(${s}) 超时：${SCENARIO_TIMEOUT_MS}ms 未结束，已 SIGKILL（疑似回归挂起）`);
+        try { p.kill("SIGKILL"); } catch {}
+      }, SCENARIO_TIMEOUT_MS);
+      p.on("exit", (c) => { clearTimeout(timer); if (done) resolveP(1); else resolveP(c); });
     });
     if (code !== 0) failed = true;
   }

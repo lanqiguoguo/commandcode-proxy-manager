@@ -2,6 +2,7 @@
 // 覆盖鉴权/主备切换/同Key重试/退避持久化/额度感知/统计/管理 API/流式/断连。
 // KNOWN-ISSUE 用例如实断言当前缺陷行为，修复对应项后应翻正（见 docs/CODE_REVIEW_2026-09-01.md）。
 import http from "http";
+import net from "net";
 import { performance } from "perf_hooks";
 import { spawn } from "child_process";
 import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
@@ -27,19 +28,52 @@ function knownIssue(cond, name, detail) {
   else bad(name + "（缺陷行为未复现，请更新用例）", detail);
 }
 
-function http1(url, method, headers, body) {
+// ── 排他预检（M6）：本测试独占 3088(manager)/3051(mock)/3089(T5d)/3090(T5e)/3087(T23)。
+// 并行跑两份 e2e 或与开发实例共存时，后起进程 spawn 会失败但 waitUp 轮询到先起实例
+// → 断言打在别人实例上假绿。此处先探测端口占用，任一冲突立即 fail-fast，
+// DATA 目录清理维持原逻辑（rmSync 兜底崩溃残留）。注意 3089/3090/3087 在单次运行内
+// 是顺序子用例端口（不并行），但同样要防外部实例。
+const E2E_PORTS = [3088, 3051, 3089, 3090, 3087]; // manager/mock/T5d/T5e/T23(嵌入,3052 为内嵌上游)
+const PROBE_TIMEOUT_MS = 300;
+function portBusy(port) {
+  return new Promise((resolveP) => {
+    const sock = net.createConnection({ host: HOST, port }, () => { sock.destroy(); resolveP(true); });
+    sock.on("error", () => resolveP(false));
+    sock.setTimeout(PROBE_TIMEOUT_MS, () => { sock.destroy(); resolveP(false); });
+  });
+}
+async function preflightPorts() {
+  const busy = [];
+  for (const p of E2E_PORTS) if (await portBusy(p)) busy.push(p);
+  if (busy.length) {
+    console.error(`\n[preflight] 端口被占用：${busy.join(", ")}`);
+    console.error("[preflight] 已有 e2e 在跑？还是有开发实例占用这些端口？");
+    console.error(`[preflight] 请先停掉占用进程后重跑（本测试固定使用 ${E2E_PORTS.join("/")}，DATA=${DATA}）`);
+    process.exit(1);
+  }
+}
+
+function http1(url, method, headers, body, timeoutMs = HTTP1_TIMEOUT_MS) {
   return new Promise((resP, rejP) => {
     const u = new URL(url);
     const r = http.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => resP({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf-8") }));
+      res.on("end", () => { clearTimeout(timer); resP({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf-8") }); });
     });
-    r.on("error", rejP);
+    r.on("error", (e) => { clearTimeout(timer); rejP(e); });
+    // 总超时护栏（L-h）：被测 server 回归挂起（如等待上游）时，http1 不得无限期等
+    // 响应挂死整个 job。60s 高于任何设计内长用例（T11 真实等 18s），低于 CI 全局超时。
+    const timer = setTimeout(() => {
+      try { r.destroy(); } catch {}
+      rejP(Object.assign(new Error(`http1 超时：${timeoutMs}ms 内未完成（${method} ${url}），被测服务疑似挂起`), { code: "ETIMEDOUT" }));
+    }, timeoutMs);
     if (body) r.write(body);
     r.end();
   });
 }
+// L-h：http1 总超时上限（env 可调；恒高于 T11 18s / rawGwOnce 8s race 等设计内长用例）
+const HTTP1_TIMEOUT_MS = Number(process.env.E2E_HTTP_TIMEOUT_MS || 60000);
 const mock = (path, body) => http1(UP + path, "POST", { "Content-Type": "application/json" }, body ? JSON.stringify(body) : "");
 const mockGet = (path) => http1(UP + path, "GET", {});
 const admin = (path, method = "GET", body) => http1(MG + path, method, { "X-Admin-Token": ADMIN, ...(body ? { "Content-Type": "application/json" } : {}) }, body ? JSON.stringify(body) : undefined);
@@ -102,6 +136,9 @@ async function restartClean() {
 }
 
 async function main() {
+  // M6 排他预检：在任何 spawn / rmSync 之前。端口被占 → 快速失败，
+  // 避免后起进程断言打到先起实例上假绿（DATA 崩溃残留清理维持 rmSync 原逻辑）。
+  await preflightPorts();
   rmSync(DATA, { recursive: true, force: true });
   mkdirSync(DATA, { recursive: true });
   const mockProc = spawn("node", [resolve(ROOT, "scripts/mock-upstream.mjs")], { env: { ...process.env, MOCK_PORT: "3051", MOCK_HOST: HOST }, stdio: ["ignore", "pipe", "pipe"] });

@@ -770,6 +770,12 @@ function stopLogPoller() {
 let eventSource = null;
 let statsDebounce = null;
 let quotaRenderTimer = null;
+// quota-status 合法 phase（后端 quota.mjs emitStatus 实际发出值）：
+// probeKey 发 updating→done/error，testKey 发 testing→idle。
+// updating/testing 置徽标；done/error/idle 清除；白名单外值一律忽略
+// （伪造 phase 既不 set 也不 clear，防伪造值清掉真实 busy）。
+const BUSY_SET_PHASES = new Set(["updating", "testing"]);
+const BUSY_CLEAR_PHASES = new Set(["done", "error", "idle"]);
 function startEventStream() {
   if (eventSource) { try { eventSource.close(); } catch {} }
   try {
@@ -806,14 +812,20 @@ function startEventStream() {
     clearTimeout(statsDebounce);
     statsDebounce = setTimeout(() => loadHistory().catch(() => {}), 2000);
   });
-  // 后端探测串行队列的即时状态：updating/testing 显示徽标，done/error/idle 清除
+  // 后端探测串行队列的即时状态（M2 加固）：keyId 必须真实存在、phase 必须在
+  // 后端合法枚举内，否则忽略——伪造/错序事件不得置/清任意 Key 的 busy。
+  // setBusy/clearBusy 立即生效（徽标即时），render 与 quota handler 共用一个
+  // 500ms 防抖（quotaRenderTimer），quota/quota-status 交错时合并渲染。
   eventSource.addEventListener("quota-status", (e) => {
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
-    if (!d || !d.keyId) return;
-    if (d.phase === "updating" || d.phase === "testing") setBusy(d.keyId, d.phase);
-    else clearBusy(d.keyId);
-    if (state.view === "dashboard" || state.view === "keys") render();
+    if (!d || typeof d.keyId !== "string" || !state.keys.some((k) => k.id === d.keyId)) return;
+    if (BUSY_SET_PHASES.has(d.phase)) setBusy(d.keyId, d.phase);
+    else if (BUSY_CLEAR_PHASES.has(d.phase)) clearBusy(d.keyId);
+    else return; // 白名单外 phase：不 set 也不 clear
+    if (state.view === "dashboard" || state.view === "keys") {
+      if (!quotaRenderTimer) quotaRenderTimer = setTimeout(() => { quotaRenderTimer = null; render(); }, 500);
+    }
   });
 }
 function stopEventStream() {

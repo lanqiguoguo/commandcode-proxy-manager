@@ -64,7 +64,10 @@ finish() {
       fi
     fi
     if (( OLD_MOVED == 1 )) && has_path "$BACKUP"; then
-      if ! mv -- "$BACKUP" "$UPSTREAM_DIR"; then
+      if has_path "$UPSTREAM_DIR"; then
+        printf 'ERROR: rollback 拒绝把旧的 upstream/ 嵌套恢复到现有目标\n' >&2
+        rollback_failed=1
+      elif ! mv -- "$BACKUP" "$UPSTREAM_DIR"; then
         printf 'ERROR: rollback 无法恢复旧的 upstream/\n' >&2
         rollback_failed=1
       fi
@@ -73,6 +76,8 @@ finish() {
 
   if (( SYNC_COMMITTED == 1 )) && [[ -n "$BACKUP" ]] && has_path "$BACKUP"; then
     rm -rf -- "$BACKUP" || printf 'WARNING: 无法清理旧的 upstream 备份：%s\n' "$BACKUP" >&2
+  elif (( SYNC_COMMITTED == 0 && OLD_MOVED == 0 )) && [[ -n "$BACKUP" ]] && has_path "$BACKUP"; then
+    rm -rf -- "$BACKUP" || printf 'WARNING: 无法清理未使用的 upstream 备份目录：%s\n' "$BACKUP" >&2
   fi
   if [[ -n "$STAGE" ]] && has_path "$STAGE"; then
     rm -rf -- "$STAGE" || printf 'WARNING: 无法清理同步暂存目录：%s\n' "$STAGE" >&2
@@ -87,10 +92,13 @@ finish() {
   fi
   exit "$status"
 }
+restore_signal_traps() {
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
 trap finish EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+restore_signal_traps
 
 # 目标路径本身也不能是会把 rename 导向工作区外的链接或非目录。
 if has_path "$UPSTREAM_DIR" && { [[ -L "$UPSTREAM_DIR" ]] || [[ ! -d "$UPSTREAM_DIR" ]]; }; then
@@ -268,8 +276,13 @@ if has_path "$UPSTREAM_DIR"; then
   if ! rmdir "$BACKUP"; then
     die "无法准备 upstream/ 回滚备份目录"
   fi
+  # 先置位以覆盖 rename 成功后、命令返回前的中断窗口；失败分支再按路径
+  # 校正，避免把仍在原位的旧目录误判为已移动并嵌套恢复。
   OLD_MOVED=1
   if ! mv -- "$UPSTREAM_DIR" "$BACKUP"; then
+    if has_path "$UPSTREAM_DIR" || ! has_path "$BACKUP"; then
+      OLD_MOVED=0
+    fi
     die "无法暂存旧的 upstream/"
   fi
 fi
@@ -278,13 +291,21 @@ fi
 # 已安装目录当作旧目录；若 mv 失败，upstream/ 此时应仍为空或不存在。
 NEW_INSTALLED=1
 if ! mv -- "$STAGE" "$UPSTREAM_DIR"; then
+  if ! has_path "$UPSTREAM_DIR"; then
+    NEW_INSTALLED=0
+  fi
   die "无法安装新的 upstream/"
 fi
 
+# 版本标记与目录交换共同构成一次提交。屏蔽可捕获信号，覆盖版本 rename
+# 成功到 SYNC_COMMITTED 置位的窗口；否则 EXIT trap 可能回滚目录却保留新标记。
+trap '' HUP INT TERM
 if ! mv -- "$VERSION_STAGE" "$VERSION_FILE"; then
+  restore_signal_traps
   die "无法原子安装 UPSTREAM_VERSION；正在恢复旧 upstream/"
 fi
 SYNC_COMMITTED=1
+restore_signal_traps
 
 echo "==> Synced upstream $TAG@$COMMIT"
 if git diff --stat -- upstream UPSTREAM_VERSION | grep -q .; then

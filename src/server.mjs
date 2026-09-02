@@ -59,14 +59,6 @@ function sendJson(res, status, data) {
 }
 
 const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
   const host = req.headers.host || "localhost";
   let url;
   try {
@@ -76,6 +68,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const p = url.pathname;
+  // M4：CORS 仅放开 /v1/* 代理面（OpenAI/Anthropic SDK 跨域调用场景）；
+  // /admin 管理面鉴权走 X-Admin-Token header，无跨域消费方——不再回
+  // Access-Control-Allow-Origin: *，防止任意网站跨域读取管理 API 响应
+  //（令牌泄露场景下的二次放大）。
+  if (p.startsWith("/v1/")) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "authorization, content-type, x-api-key, x-session-id, x-claude-code-session-id");
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+  }
   // P2-7：CSP 仅作用于管理面（/admin 页面、静态资源、/admin/api/*——含 SSE，
   // writeHead 会与 setHeader 初始状态合并故统一在此挂头）。app.mjs 重构为事件委托后
   // 已无内联脚本，script-src 收紧到 'self'；样式有动态内联 style 属性（bar width:NN%）

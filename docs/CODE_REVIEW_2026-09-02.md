@@ -195,3 +195,14 @@
 | 文档 | P2-2 措辞 | `b439208` | README 环境变量表：令牌类"仅磁盘无值时初始化生效" |
 
 未处理项（本次范围外，留待后续）：P2-3（CORS `*` 收窄，涉及部署兼容性需用户决策）、P2-5/6/10/11/12/13 及各 P3 条目。
+
+### 终检与收尾加固（commit `f212dde`）
+
+5 项修复提交后，另派 3 个子代理并行复查 6 个修复 commit 是否引入新 bug（回归中危 1 + 低危若干，核心逻辑三组均判定"未引入可确认功能回归"），主代理据此收尾：
+
+- **stats load() 读侧净化**（补齐 P1-6 承诺）：appendEvent 写侧净化只挡新数据，修复前已落盘的脏 usage 重启回放后仍会进窗口聚合——load() 同样套 sanitizeNumeric，补 unit（`?freshload` 独立实例）3 断言 + dev 实测。
+- **upstream-sync PR 去重**（终检中-1）：cron 每日跑，自动同步 PR 挂 N 天未合并会堆 N 个同内容 PR/孤儿分支——开 PR 前按 title 精确匹配存量 open PR 去重；PR 正文加"master 降级路径"警示注记（终检低-2：sync 步与 check 步 API 限流降级语义不对称的残余风险留给人审）。
+- **e2e T9b/T22 稳定性**（终检低-4 + 负载 flake）：T9b 退避过期从固定 sleep(1300)（对 1000ms 窗口仅 300ms 裕量）改轮询门控 + 恢复 backoffBaseMs 不泄漏；T22 时间线重叠断言容忍 20ms 调度抖动（真并发仍由 maxActive=1 主断言捕获）。
+- **README 反代权衡**（终检中危）：login 限速取 TCP 源地址，反代后共享 IP 会退化为全局开关——文档明示。
+
+验证：`npm test` ×2 全绿（unit 90 + e2e 144 + sync fixture 8 = 242 断言）；e2e 单跑 4 连 T9b/T22 稳定；Node 20.20.2 实跑全链路绿（终检子代理用 fnm 验证 CI 版本兼容性，含 T5c 的 `server.close()` keep-alive 时序断言）。

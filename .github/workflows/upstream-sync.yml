@@ -41,6 +41,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           bash scripts/sync-upstream.sh
+          # L-g：同步产物冒烟——sync-upstream.sh 内已做 proxy.mjs 语法校验，
+          # 这里补仓库级快速验证：unit 不依赖网络/端口（e2e 需固定端口不适合
+          # 在 PR 自动流程跑），可拦截同步后回归；失败则中止不开 PR
+          node scripts/unit.mjs || { echo "ERROR: 上游同步后 unit 冒烟失败，不开 PR"; exit 1; }
           git add upstream UPSTREAM_VERSION
           if git diff --cached --quiet; then
             echo "No actual changes; skip PR."

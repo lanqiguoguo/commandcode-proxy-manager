@@ -10,6 +10,9 @@ import { safeEqual } from "./tokens.mjs";
 // 整包缓冲在内存，多并发大响应可放大为内存耗尽。64MB 为防御性护栏，只作用于
 // pipeBody 非流式路径的 200 响应；非 200 错误体（429/5xx 等）体量小，仍在原路径处理。
 const MAX_NONSTREAM_BODY = 64 * 1024 * 1024;
+// readBody 413 拒绝后仍要消费（丢弃）的请求体上限：防恶意客户端以永不结束的
+// body 占死连接；超过该量强制断开（最后手段，连接已不可救）。
+const MAX_DRAIN = 32 * 1024 * 1024;
 
 function upstreamBase() {
   const c = getConfig();
@@ -32,17 +35,48 @@ function readBody(req, limit) {
   return new Promise((resolveBody, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false; // Promise 只 settle 一次：end / error / drain 超限三条路径先到者生效
+    let overflow = false;
+    let drained = 0;
     req.on("data", (c) => {
+      if (overflow) {
+        // 超限后转 drain：继续读并丢弃剩余请求体直到 end——保住连接，
+        // 让 413 沿完整连接送达（直接 destroy 会让客户端收到 ECONNRESET 而非明确 413）
+        drained += c.length;
+        if (drained > MAX_DRAIN) {
+          // 恶意客户端可发永不结束的 body 占死连接：drain 超上限即强制断开，
+          // 最后手段（连接已不可救，413 已无法送达）。destroy 无错时不再有
+          // end/error 事件，故此处同时 settle——否则 promise 永挂。
+          settled = true;
+          try { req.destroy(); } catch {}
+          reject(Object.assign(new Error("请求体过大"), { statusCode: 413 }));
+        }
+        return;
+      }
       size += c.length;
       if (size > limit) {
+        overflow = true;
+        chunks.length = 0; // 释放已累积的超限数据，防内存放大
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      if (overflow) {
+        // 完整吞掉超限请求体后才在此拒绝：此刻连接干净，413 可送达且连接可复用
         reject(Object.assign(new Error("请求体过大"), { statusCode: 413 }));
-        req.destroy();
       } else {
-        chunks.push(c);
+        resolveBody(Buffer.concat(chunks));
       }
     });
-    req.on("end", () => resolveBody(Buffer.concat(chunks)));
-    req.on("error", reject);
+    req.on("error", (e) => {
+      // 客户端中途断开等：连接已不可用，直接失败
+      if (settled) return;
+      settled = true;
+      reject(e);
+    });
   });
 }
 

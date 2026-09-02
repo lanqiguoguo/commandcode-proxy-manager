@@ -341,10 +341,9 @@ function fakeProjectSlug(sessionId) {
     'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
   const id = String(sessionId || '');
   const head = id.slice(0, 4);
-  // sessionId 既可能是随机 UUID（前 4 位是十六进制），也可能是客户端自定义的
-  // prompt_cache_key（例如 "my-stable-cache-key-001"）。后者按 16 进制解析会得到
-  // NaN，进而让 slug 变成 "…-undefined-my-s"。先按十六进制解析，失败则退化为
-  // 确定性字符哈希，保证同一 session 仍映射到同一个 slug。
+  // sessionId 既可能是随机 UUID（前 4 位十六进制），也可能是客户端自定义的
+  // prompt_cache_key（如 "my-stable-cache-key-001"）。后者按 16 进制解析得 NaN，
+  // 会让 slug 变成 "…-undefined-my-s"。失败时退化为确定性字符哈希。
   let idx = parseInt(head, 16);
   if (!Number.isFinite(idx)) {
     let h = 0;
@@ -386,10 +385,10 @@ function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
-  // 数组型 content 必须展开取 text 后拼成「字符串」，而不是转成 JSON 字符串、
-  // 更不能输出 Anthropic 风格的 content 块数组：CC 原生客户端的 31 个
-  // /alpha/generate 抓包中 params.system 出现 15 次，全部是 str，且真实流量里
-  // 从未出现 cache_control 字段。
+  // 数组型 content 必须展开取 text 后拼成「字符串」，而不是转成 JSON 字符串，
+  // 更不能输出 Anthropic 风格的 content 块数组：CC 上游要求 params.system 恒为
+  // 字符串，传数组会被直接拒绝（真机验证：
+  // Validation error: Invalid input: expected string, received array at "params.system"）。
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
   const systemPrompt = systemMsgs.map(m => {
     if (typeof m.content === 'string') return m.content;
@@ -780,7 +779,8 @@ function readBody(req) {
       if (totalSize > MAX_BODY_SIZE) {
         settled = true;
         chunks.length = 0;
-        const err = new Error(`Request body exceeds ${Math.round(MAX_BODY_SIZE / 1024 / 1024)}MB limit`);
+        const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
+        const err = new Error(`Request body exceeds ${mb}MB limit`);
         err.statusCode = 413;
         reject(err);
         return;
@@ -1112,9 +1112,6 @@ async function handleChatCompletions(req, res) {
                 lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
-                break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-                // Silent - no user-visible content
                 break;
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
@@ -1855,9 +1852,6 @@ async function handleMessages(req, res) {
                 lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
-                break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-                // Silent - no user-visible content
                 break;
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content

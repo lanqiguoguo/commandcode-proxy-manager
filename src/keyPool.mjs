@@ -124,8 +124,12 @@ export function recordRateLimit(id, retryAfterMs) {
   if (!h) return;
   h.failCount = (h.failCount || 0) + 1;
   const base = poolCfg.backoffBaseMs || 5000;
-  const exp = Math.min(poolCfg.backoffMaxMs || 120000, base * Math.pow(2, h.failCount - 1));
-  h.backoffUntilMs = nowMs() + (retryAfterMs && retryAfterMs > 0 ? retryAfterMs : exp);
+  const cap = poolCfg.backoffMaxMs || 120000;
+  const exp = Math.min(cap, base * Math.pow(2, h.failCount - 1));
+  // retryAfterMs 仅对 >0 的真实等待封顶（0/null 表示"立即重试"，走指数分支）；
+  // 上游异常大值（如 Retry-After: 604800）不排除 Key 数天~数年（H2）
+  const wait = retryAfterMs && retryAfterMs > 0 ? Math.min(cap, retryAfterMs) : exp;
+  h.backoffUntilMs = nowMs() + wait;
   persistState();
   emitLog("Key " + id + " 限流退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s（第 " + h.failCount + " 次）");
 }
@@ -164,6 +168,18 @@ export function clearAuthError(id) {
   h.backoffUntilMs = 0;
   persistState();
   emitLog("Key " + id + " 认证异常已清除");
+}
+
+// 管理端手动清除 429/超时退避（H2）：只清 backoffUntilMs 与 failCount，
+// 不动 authError/quotaLimited 等其他状态（401 标记与额度限制是另一类状态，不应被误清）。
+// 与 clearAuthError 不同：id 不存在时抛错（同 updateKey 风格），由 adminApi 统一转 400
+export function clearBackoff(id) {
+  const h = health.get(id);
+  if (!h) throw new Error("Key 不存在");
+  h.backoffUntilMs = 0;
+  h.failCount = 0;
+  persistState();
+  emitLog("Key " + id + " 退避已手动清除");
 }
 
 export function setQuotaLimited(id, untilMs, reason) {

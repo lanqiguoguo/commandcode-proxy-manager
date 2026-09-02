@@ -280,6 +280,12 @@ export async function handleAdmin(req, res, url) {
       return true;
     }
 
+    if (parts.length === 5 && parts[2] === "keys" && parts[4] === "clear-backoff" && req.method === "POST") {
+      pool.clearBackoff(parts[3]);
+      sendJson(res, 200, { ok: true });
+      return true;
+    }
+
     // ── history ──
     if (p === "/admin/api/history" && req.method === "GET") {
       const q = url.searchParams;

@@ -248,6 +248,18 @@ async function delKey(id) {
   await api("/admin/api/keys/" + id, { method: "DELETE" });
   await refresh(); render();
 }
+// 429/超时退避中且非认证异常：可手动清除退避（H2）
+function backoffBtnHtml(k) {
+  const h = (k && k.health) || {};
+  if (h.authError || !h.backoffUntilMs || Date.now() >= h.backoffUntilMs) return "";
+  return '<button class="small ghost" data-act="clear-backoff" data-id="' + esc(k.id) + '">清除退避</button> ';
+}
+async function clearKeyBackoff(id) {
+  try {
+    await api("/admin/api/keys/" + id + "/clear-backoff", { method: "POST" });
+    await refresh(); render();
+  } catch (e) { alert(e.message); }
+}
 async function moveKey(id, dir) {
   const idx = state.keys.findIndex((k) => k.id === id);
   const target = idx + dir;
@@ -347,6 +359,7 @@ function keyCard(k) {
     (busyPhase(k.id) ? '<span class="badge accent busy-badge">' + BUSY_LABEL[busyPhase(k.id)] + "</span>" : '<span class="badge ' + h.cls + '">' + h.label + "</span>") +
     "</div>" +
     '<div class="row key-actions">' +
+    backoffBtnHtml(k) +
     '<button class="small ghost" data-act="refresh-quota" data-id="' + esc(k.id) + '" ' + (busyPhase(k.id) ? "disabled" : "") + '>' + (busyPhase(k.id) === "updating" ? "更新中…" : "刷新额度") + "</button>" +
     '<button class="small ghost" data-act="toggle" data-id="' + esc(k.id) + '">' + (k.enabled ? "停用" : "启用") + "</button>" +
     '<button class="small danger" data-act="delete" data-id="' + esc(k.id) + '">删除</button>' +
@@ -386,6 +399,7 @@ function renderKeys() {
       '<td>' + (busyPhase(k.id) ? '<span class="badge accent busy-badge">' + BUSY_LABEL[busyPhase(k.id)] + "</span>" : '<span class="badge ' + h.cls + '">' + h.label + "</span>") + " " + (k.enabled ? "" : '<span class="badge">已停用</span>') + "</td>" +
       '<td class="muted small">' + esc(k.note || "") + "</td>" +
       "<td>" +
+      backoffBtnHtml(k) +
       '<button class="small ghost" data-act="test" data-id="' + esc(k.id) + '" ' + (busyPhase(k.id) ? "disabled" : "") + ">" + (busyPhase(k.id) === "testing" ? "测试中…" : "测试") + "</button> " +
       '<button class="small ghost" data-act="toggle" data-id="' + esc(k.id) + '">' + (k.enabled ? "停用" : "启用") + "</button> " +
       '<button class="small danger" data-act="delete" data-id="' + esc(k.id) + '">删除</button>' +
@@ -703,6 +717,7 @@ const KEY_ACTIONS = {
   "toggle": (id) => { const k = state.keys.find((x) => x.id === id); if (k) toggleKey(k); },
   "delete": (id) => delKey(id),
   "test": (id) => testKey(id),
+  "clear-backoff": (id) => clearKeyBackoff(id),
   "move-up": (id) => moveKey(id, -1),
   "move-down": (id) => moveKey(id, 1)
 };

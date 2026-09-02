@@ -4,9 +4,9 @@
   --warn: #e8a13c; --bad: #e05252; --quota0: #2fbf71; --quota1: #e8a13c; --quota2: #e05252;
 }
 * { box-sizing: border-box; }
-/* 字体跟随浏览器默认设置（用户可在浏览器外观里自行指定）；
-   数字/日志等 .mono 列保留等宽栈以保证对齐可读 */
-body { margin: 0; background: var(--bg); color: var(--text); font-family: revert; font-size: 14px; line-height: 1.5; }
+/* 字体栈参考 GitHub Primer：系统无衬线优先 + 中文回退；
+   等宽栈（.mono/.log-list）同样对齐 GitHub 的 SFMono/Menlo/Consolas 顺序 */
+body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif, "Apple Color Emoji", "Segoe UI Emoji"; font-size: 14px; line-height: 1.5; }
 button, input, select, textarea { font-family: inherit; }
 header { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
 .brand { font-weight: 700; color: var(--accent); }
@@ -81,7 +81,7 @@ tr:hover td { background: var(--panel2); }
 .strategy-table { table-layout: fixed; }
 .strategy-table th:first-child, .strategy-table td:first-child { width: 160px; white-space: normal; word-break: keep-all; }
 .strategy-table td:last-child { white-space: normal; word-break: break-word; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; }
 .muted { color: var(--dim); }
 .small { font-size: 12px; }
 .login-wrap { max-width: 360px; margin: 12vh auto; }
@@ -98,7 +98,7 @@ tr:hover td { background: var(--panel2); }
 .kadd-row .kadd-key { flex: 2.2 1 0; }
 .kadd-row button { flex: 0 0 auto; }
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.log-list { font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-height: 60vh; overflow: auto; }
+.log-list { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; max-height: 60vh; overflow: auto; }
 /* 日志单行不换行，超长时容器横向滚动；行底色与分隔线随内容宽度延伸 */
 .log-list div { padding: 3px 6px; border-bottom: 1px solid var(--border); white-space: pre; width: max-content; min-width: 100%; }
 .log-list .lv-warn { color: var(--warn); }

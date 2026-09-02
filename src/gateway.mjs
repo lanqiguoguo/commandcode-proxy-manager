@@ -5,6 +5,12 @@ import * as pool from "./keyPool.mjs";
 import * as stats from "./stats.mjs";
 import { safeEqual } from "./tokens.mjs";
 
+// 非流式响应体读取上限：LLM 非流式 JSON 响应远小于此，纯防内存放大（M3）。
+// 请求体侧已有 100MB 上限（readBody），响应体原无上限——upRes.text() 被 undici
+// 整包缓冲在内存，多并发大响应可放大为内存耗尽。64MB 为防御性护栏，只作用于
+// pipeBody 非流式路径的 200 响应；非 200 错误体（429/5xx 等）体量小，仍在原路径处理。
+const MAX_NONSTREAM_BODY = 64 * 1024 * 1024;
+
 function upstreamBase() {
   const c = getConfig();
   return "http://" + c.upstreamHost + ":" + c.upstreamPort;
@@ -131,6 +137,29 @@ function parseUsageFromSseLine(line) {
   return null;
 }
 
+// 等待可写（背压）：res.write() 返回 false 后挂 drain 等待缓冲排空再继续写。
+// 慢客户端断连时 drain 永不触发——close 双事件唤醒（Node 保证连接销毁必发 close），
+// 由调用方随后用 isClientGone() 判定分类。res 的 'error' 已由 handleGateway 挂 noop，
+// 此处仅需 drain+close，两事件都必然在连接生命周期内触达其一，无死锁。
+// 边角：若 close 在我们挂监听之前已发射（res.destroyed 已置位），drain/close 不会再
+// 来——立即返回，由调用方 isClientGone() 判定走 client 收尾，避免永久挂起。
+async function waitDrain(res) {
+  if (res.destroyed) return;
+  await new Promise((resolve) => {
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); resolve(); };
+    res.on("drain", onDrain);
+    res.on("close", onClose);
+  });
+}
+
 // 返回 { usage, err }：err = null（正常完成）| "client"（客户端断开）| "upstream"（上游中途断连）。
 // isClientGone(): 调用方闭包，判定客户端是否已断开（断开检测优先于分类，避免误判上游故障）。
 async function pipeBody(upRes, res, isStream, isClientGone) {
@@ -140,13 +169,32 @@ async function pipeBody(upRes, res, isStream, isClientGone) {
     try { const p = reader.cancel(); if (p && typeof p.catch === "function") p.catch(() => {}); } catch {}
   };
   if (!isStream) {
-    let text;
+    // 非流式响应体上限（M3）：upRes.text() 会被 undici 整包缓冲、无法中途截断，
+    // 改用 reader 逐块累积读取，超 MAX_NONSTREAM_BODY 即 cancel 截断（防内存放大）。
+    const reader = upRes.body.getReader();
+    const chunks = [];
+    let size = 0;
+    let tooLarge = false;
     try {
-      text = await upRes.text();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > MAX_NONSTREAM_BODY) { tooLarge = true; safeCancel(reader); break; }
+        chunks.push(value);
+      }
     } catch {
-      // body 读取中断：客户端断开（abort 致 text 拒绝）或上游 socket 死亡
+      // body 读取中断：客户端断开（abort 致 read 拒绝）或上游 socket 死亡
+      safeCancel(reader);
       return { usage: null, err: isClientGone() ? "client" : "upstream" };
     }
+    if (tooLarge) {
+      // 响应体超限截断（防御性上限）：此时 200 头已发出、无法重试（与 cutbody 同性质），
+      // 复用 err:"upstream" 让调用方走既有的 502 事件 + res.destroy 收尾；
+      // 与断连语义不同：此分支 isClientGone() 必然为 false，只是收尾动作复用。
+      return { usage: null, err: "upstream" };
+    }
+    const text = Buffer.concat(chunks).toString("utf-8");
     res.end(text);
     return { usage: parseUsageFromJson(text), err: null };
   }
@@ -170,12 +218,24 @@ async function pipeBody(upRes, res, isStream, isClientGone) {
       buffer = lines.pop() || "";
       for (const line of lines) {
         merge(parseUsageFromSseLine(line));
-        try { res.write(line + "\n"); } catch { safeCancel(reader); return { usage, err: "client" }; }
+        let ok;
+        try { ok = res.write(line + "\n"); } catch { safeCancel(reader); return { usage, err: "client" }; }
+        if (!ok) {
+          // 写缓冲满（背压）：暂停读上游，等 drain 再继续——慢客户端时防止 Node 写队列无限堆积。
+          // 断连时 drain 永不触发，靠 close 唤醒（Node 保证连接销毁必发 close），由 isClientGone 判定分类。
+          await waitDrain(res);
+          if (isClientGone()) { safeCancel(reader); return { usage, err: "client" }; }
+        }
       }
     }
     if (buffer.trim()) {
       merge(parseUsageFromSseLine(buffer.trim()));
-      try { res.write(buffer); } catch { safeCancel(reader); return { usage, err: "client" }; }
+      let ok;
+      try { ok = res.write(buffer); } catch { safeCancel(reader); return { usage, err: "client" }; }
+      if (!ok) {
+        await waitDrain(res);
+        if (isClientGone()) { safeCancel(reader); return { usage, err: "client" }; }
+      }
     }
   } catch {
     // read() 拒绝：客户端断开（res close → abort）或上游 socket 死亡

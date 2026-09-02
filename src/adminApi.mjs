@@ -70,6 +70,19 @@ export function initAdminApi(emitterRef) {
   // log 事件的落盘/环缓在 logs.mjs initLogs 中统一订阅处理
 }
 
+// 管理面请求鉴权（L-e：/admin/* 未知路径在 404 前也须先鉴权，防匿名路径探测）：
+// 主通道 X-Admin-Token header；仅 SSE 端点（/admin/api/events GET）额外接受登录
+// 下发的 HttpOnly 专用 cookie（EventSource 带不了 header）。
+// !!cfg.adminToken：保留原 "空 header 不得匹配空令牌" 守卫（safeEqual("","") 为 true）
+export function isAdminRequestAuthed(req, p) {
+  const cfg = getConfig();
+  let authed = !!cfg.adminToken && safeEqual(req.headers["x-admin-token"], cfg.adminToken);
+  if (!authed && p === "/admin/api/events" && req.method === "GET") {
+    authed = safeEqual(parseCookies(req)[SSE_COOKIE], sseCookieValue());
+  }
+  return authed;
+}
+
 function sendJson(res, status, data, extraHeaders) {
   const headers = { "Content-Type": "application/json" };
   if (extraHeaders) Object.assign(headers, extraHeaders);
@@ -197,16 +210,7 @@ export async function handleAdmin(req, res, url) {
 
   if (!p.startsWith("/admin/api/")) return false;
 
-  // 鉴权：X-Admin-Token header（管理 API 主通道）；仅 SSE 端点额外接受
-  // 登录时下发的 HttpOnly 专用 cookie（EventSource 带不了 header，且 token
-  // 已不再出现在 URL 中）。query ?token= 通道已移除——URL 会被 DevTools
-  // 连接面板、反代 access log、Referer 等记录，明文令牌不应暴露。
-  // !!cfg.adminToken：保留原 "空 header 不得匹配空令牌" 守卫（safeEqual("","") 为 true）
-  let authed = !!cfg.adminToken && safeEqual(req.headers["x-admin-token"], cfg.adminToken);
-  if (!authed && p === "/admin/api/events" && req.method === "GET") {
-    authed = safeEqual(parseCookies(req)[SSE_COOKIE], sseCookieValue());
-  }
-  if (!authed) {
+  if (!isAdminRequestAuthed(req, p)) {
     sendJson(res, 401, { error: { message: "Unauthorized", type: "auth_error" } });
     return true;
   }

@@ -10,7 +10,7 @@ import * as quota from "./quota.mjs";
 import { initStats, usageProviderForPool } from "./stats.mjs";
 import { initLogs, attachConsoleCapture } from "./logs.mjs";
 import { handleGateway } from "./gateway.mjs";
-import { initAdminApi, handleAdmin } from "./adminApi.mjs";
+import { initAdminApi, handleAdmin, isAdminRequestAuthed } from "./adminApi.mjs";
 import { flushAllPending } from "./state.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -126,6 +126,13 @@ const server = http.createServer(async (req, res) => {
     }
     if (p.startsWith("/admin/")) {
       if (await handleAdmin(req, res, url)) return;
+      // L-e：非 API 的 /admin/* 未知路径（handleAdmin 返回 false）也须先鉴权再 404，
+      // 否则匿名者可探测管理端路由形状。静态文件（app.mjs/style.css）已在上方精确匹配。
+      if (!isAdminRequestAuthed(req, p)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }));
+        return;
+      }
       sendJson(res, 404, { error: { message: "Not found", type: "not_found" } });
       return;
     }

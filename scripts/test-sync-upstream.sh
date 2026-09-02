@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # sync-upstream.sh 的本地 fixture 测试（不触碰真实上游）。
-# 在 /tmp 构造 file:// 上游 git 仓库 + 假目标仓库，验证：
-#   1) 有 release：clone --branch tag，UPSTREAM_VERSION = <tag>@<tag-commit>，vendored 文件来自 tag 内容；
-#   2) 无 release（API 返回无 tag_name）：回退 master，UPSTREAM_VERSION = master@<master-head>；
-#   3) API 不可达：打 warning 后同样回退 master，不中断；
-#   4) sed host 改写在两条路径下均生效（config.json 的 0.0.0.0 → 127.0.0.1）。
+# 在 /tmp 构造 file:// 上游 git 仓库和 HTTP release API，验证：
+#   1) release 的 HTTP 状态、JSON、tag 格式和 tag -> commit 关系独立校验；
+#   2) 只有明确的无 release 响应才回退 master；
+#   3) symlink/目录输入、API 错误、畸形 JSON 和同步中断都保持旧目标不变；
+#   4) 目录级交换和 UPSTREAM_VERSION rename 失败时可 rollback。
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+API_PID=""
+
+cleanup() {
+  if [[ -n "$API_PID" ]] && kill -0 "$API_PID" 2>/dev/null; then
+    kill "$API_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$API_PID" ]]; then
+    wait "$API_PID" 2>/dev/null || true
+  fi
+  rm -rf -- "$T"
+}
+trap cleanup EXIT INT TERM
 
 PASS=0
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -22,72 +33,238 @@ cd "$UP"
 git init -q -b master .
 git config user.email fixture@test.local
 git config user.name fixture
-cat > proxy.mjs <<'EOF'
-export const MARKER = "release-build";
-EOF
+printf '%s\n' 'export const MARKER = "release-build";' > proxy.mjs
 printf '{\n  "host": "0.0.0.0",\n  "port": 3050\n}\n' > config.json
 printf '{\n  "name": "commandcode-proxy",\n  "version": "9.9.9"\n}\n' > package.json
-git add . && git commit -qm "release content"
+git add .
+git commit -qm "release content"
 git tag v9.9.9
-# tag 之后再推一个 master-only commit，用于证明两条路径拉到的内容不同
+
+# tag 之后再推 master-only commit，用于证明 release 路径不是 mutable master。
 printf '%s\n' 'export const MARKER = "master-build";' > proxy.mjs
 git commit -qam "master-only change"
+
+# Git tree 能表达的非普通输入包括 symlink 和目录；其它非普通文件仍由
+# sync-upstream.sh 的 regular-file 检查覆盖。
+SECRET="$T/outside-secret.txt"
+printf '%s\n' 'must-not-be-copied' > "$SECRET"
+rm proxy.mjs
+ln -s "$SECRET" proxy.mjs
+git add -A
+git commit -qm "symlink payload"
+git tag v9.9.10
+rm proxy.mjs
+printf '%s\n' 'export const MARKER = "master-restored";' > proxy.mjs
+git commit -qam "restore regular proxy"
+
+rm config.json
+mkdir config.json
+printf '%s\n' 'directory payload' > config.json/marker
+git add -A
+git commit -qm "directory payload"
+git tag v9.9.11
+rm -rf config.json
+printf '{\n  "host": "0.0.0.0",\n  "port": 3050\n}\n' > config.json
+git add config.json
+git commit -qm "restore regular config"
+
 MASTER_HEAD=$(git rev-parse HEAD)
 TAG_COMMIT=$(git rev-parse v9.9.9^{commit})
 cd "$ROOT_DIR"
+
+# ---------- 构造 HTTP release API fixture ----------
+cat > "$T/api-server.mjs" <<'EOF'
+import http from "node:http";
+
+const responses = new Map([
+  ["/release", [200, '{"tag_name":"v9.9.9","name":"v9.9.9"}']],
+  ["/empty-404", [404, '{"message":"Not Found","documentation_url":"https://docs.github.com"}']],
+  ["/empty-null", [200, '{"tag_name":null}']],
+  ["/missing-tag", [200, '{"message":"unexpected response"}']],
+  ["/malformed", [200, '{"tag_name":']],
+  ["/invalid-tag", [200, '{"tag_name":"master"}']],
+  ["/symlink-release", [200, '{"tag_name":"v9.9.10"}']],
+  ["/directory-release", [200, '{"tag_name":"v9.9.11"}']],
+  ["/forbidden", [403, '{"message":"Forbidden"}']],
+  ["/rate-limit", [429, '{"message":"rate limit exceeded"}']],
+  ["/server-error", [500, '{"message":"server error"}']],
+  ["/bad-not-found", [404, '{"message":"Forbidden"}']],
+]);
+
+const server = http.createServer((request, response) => {
+  const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+  if (path === "/drop") {
+    request.socket.destroy();
+    return;
+  }
+  const [status, body] = responses.get(path) ?? [404, '{"message":"Not Found"}'];
+  response.statusCode = status;
+  response.setHeader("content-type", "application/json");
+  response.end(body);
+});
+
+server.listen(0, "127.0.0.1", () => {
+  const address = server.address();
+  process.stdout.write(`${address.port}\n`);
+});
+EOF
+node "$T/api-server.mjs" > "$T/api-port" 2> "$T/api-server.err" &
+API_PID=$!
+for _ in {1..100}; do
+  if [[ -s "$T/api-port" ]]; then break; fi
+  if ! kill -0 "$API_PID" 2>/dev/null; then
+    sed -n '1,80p' "$T/api-server.err" >&2 || true
+    fail "HTTP API fixture failed to start"
+  fi
+  sleep 0.01
+done
+[[ -s "$T/api-port" ]] || fail "HTTP API fixture did not publish a port"
+API_PORT=$(head -n 1 "$T/api-port")
+API_BASE="http://127.0.0.1:$API_PORT"
 
 # ---------- 构造假目标仓库（跑 sync 脚本的地方） ----------
 FAKE="$T/fake-repo"
 mkdir -p "$FAKE/scripts" "$FAKE/upstream"
 cp "$ROOT_DIR/scripts/sync-upstream.sh" "$FAKE/scripts/"
-printf 'old\n' > "$FAKE/upstream/proxy.mjs"
-printf 'old\n' > "$FAKE/upstream/config.json"
-printf 'old\n' > "$FAKE/upstream/package.json"
-printf 'placeholder\n' > "$FAKE/UPSTREAM_VERSION"
+printf 'old-proxy\n' > "$FAKE/upstream/proxy.mjs"
+printf 'old-config\n' > "$FAKE/upstream/config.json"
+printf 'old-package\n' > "$FAKE/upstream/package.json"
+printf 'old-version\n' > "$FAKE/UPSTREAM_VERSION"
 ( cd "$FAKE" && git init -q -b main . && git config user.email f@f.local && git config user.name f \
   && git add -A && git commit -qm base )
 
-run_sync() { # $1=UPSTREAM_API 值
-  ( cd "$FAKE" && UPSTREAM_URL="file://$UP" UPSTREAM_API="$1" bash scripts/sync-upstream.sh )
+run_sync_url() {
+  local upstream=$1
+  local api=$2
+  ( cd "$FAKE" && UPSTREAM_URL="file://$upstream" UPSTREAM_API="$api" bash scripts/sync-upstream.sh )
+}
+run_sync() { run_sync_url "$UP" "$1"; }
+
+snapshot_target() {
+  local name=$1
+  SNAPSHOT="$T/snapshot-$name"
+  rm -rf -- "$SNAPSHOT"
+  mkdir -p "$SNAPSHOT"
+  cp -a "$FAKE/upstream" "$SNAPSHOT/upstream"
+  cp -p "$FAKE/UPSTREAM_VERSION" "$SNAPSHOT/UPSTREAM_VERSION"
 }
 
-# ---------- 用例 1：有 release ----------
-API1="$T/api-release.json"
-printf '{"tag_name": "v9.9.9", "name": "v9.9.9"}\n' > "$API1"
-OUT1=$(run_sync "file://$API1" 2>&1)
-echo "--- case 1 output ---"; echo "$OUT1"
+assert_target_unchanged() {
+  local label=$1
+  diff -ruN "$SNAPSHOT/upstream" "$FAKE/upstream" >/dev/null || fail "$label 修改了 upstream/"
+  cmp -- "$SNAPSHOT/UPSTREAM_VERSION" "$FAKE/UPSTREAM_VERSION" || fail "$label 修改了 UPSTREAM_VERSION"
+}
+
+expect_failure() {
+  local label=$1
+  local api=$2
+  local upstream=${3:-$UP}
+  local output="$T/$label.out"
+  snapshot_target "$label"
+  if run_sync_url "$upstream" "$api" > "$output" 2>&1; then
+    sed -n '1,120p' "$output"
+    fail "$label 应失败"
+  fi
+  echo "--- $label output ---"
+  sed -n '1,120p' "$output"
+  assert_target_unchanged "$label"
+  ok "$label 失败且旧 upstream/ 与版本标记保持不变"
+}
+
+# ---------- 用例 1：release 的状态、JSON、tag 和 commit ----------
+OUT1=$(run_sync "$API_BASE/release" 2>&1)
+echo "--- case release output ---"; echo "$OUT1"
 V1=$(cat "$FAKE/UPSTREAM_VERSION")
-[ "$V1" = "v9.9.9@$TAG_COMMIT" ] || fail "case1 UPSTREAM_VERSION 应为 v9.9.9@$TAG_COMMIT，实际: $V1"
-ok "case1 UPSTREAM_VERSION = $V1"
-grep -q 'release-build' "$FAKE/upstream/proxy.mjs" || fail "case1 vendored proxy.mjs 应来自 tag 内容"
-ok "case1 vendored 内容来自 release tag（非 master）"
-grep -q '"host": "127.0.0.1"' "$FAKE/upstream/config.json" || fail "case1 sed host 改写未生效"
-if grep -q '"host": "0.0.0.0"' "$FAKE/upstream/config.json"; then fail "case1 config.json 残留 0.0.0.0"; fi
-ok "case1 sed host 改写生效"
-echo "$OUT1" | grep -q 'Fetching upstream release v9.9.9' || fail "case1 应走 release 路径"
-ok "case1 走 release 路径"
+[ "$V1" = "v9.9.9@$TAG_COMMIT" ] || fail "release UPSTREAM_VERSION 应为 v9.9.9@$TAG_COMMIT，实际: $V1"
+ok "release UPSTREAM_VERSION = $V1"
+grep -Fq 'release-build' "$FAKE/upstream/proxy.mjs" || fail "release proxy.mjs 应来自 tag 内容"
+ok "release 内容来自 tag（非 master）"
+grep -Fq '"host": "127.0.0.1"' "$FAKE/upstream/config.json" || fail "release sed host 改写未生效"
+if grep -Fq '"host": "0.0.0.0"' "$FAKE/upstream/config.json"; then fail "release config.json 残留 0.0.0.0"; fi
+ok "release sed host 改写生效"
+echo "$OUT1" | grep -Fq 'Fetching upstream release v9.9.9' || fail "release 应走 release 路径"
+ok "release HTTP/JSON/tag/commit 校验后同步"
 
-# ---------- 用例 2：无 release（API 有响应但无 tag_name） ----------
-API2="$T/api-empty.json"
-printf '{"message": "Not Found"}\n' > "$API2"
-OUT2=$(run_sync "file://$API2" 2>&1)
-echo "--- case 2 output ---"; echo "$OUT2"
+# ---------- 用例 2：只有明确的空 release 才允许 fallback ----------
+OUT2=$(run_sync "$API_BASE/empty-404" 2>&1)
+echo "--- case empty 404 output ---"; echo "$OUT2"
 V2=$(cat "$FAKE/UPSTREAM_VERSION")
-[ "$V2" = "master@$MASTER_HEAD" ] || fail "case2 UPSTREAM_VERSION 应为 master@$MASTER_HEAD，实际: $V2"
-ok "case2 UPSTREAM_VERSION = $V2"
-grep -q 'master-build' "$FAKE/upstream/proxy.mjs" || fail "case2 vendored proxy.mjs 应来自 master"
-grep -q '"host": "127.0.0.1"' "$FAKE/upstream/config.json" || fail "case2 sed host 改写未生效"
-ok "case2 回退 master：内容与 sed 改写均正确"
-echo "$OUT2" | grep -q 'No upstream release found' || fail "case2 应打印回退提示"
-ok "case2 打印无 release 回退提示"
+[ "$V2" = "master@$MASTER_HEAD" ] || fail "empty 404 应为 master@$MASTER_HEAD，实际: $V2"
+grep -Fq 'master-restored' "$FAKE/upstream/proxy.mjs" || fail "empty 404 应同步 master"
+echo "$OUT2" | grep -Fq 'No upstream release found' || fail "empty 404 应打印回退提示"
+ok "明确 404 Not Found 回退 master"
 
-# ---------- 用例 3：API 不可达 ----------
-OUT3=$(run_sync "file://$T/definitely-missing.json" 2>&1)
-echo "--- case 3 output ---"; echo "$OUT3"
-V3=$(cat "$FAKE/UPSTREAM_VERSION")
-[ "$V3" = "master@$MASTER_HEAD" ] || fail "case3 API 不可达应回退 master，实际: $V3"
-echo "$OUT3" | grep -q "WARNING: upstream release API unreachable" || fail "case3 应打印 API 不可达 warning"
-ok "case3 API 不可达：打印 warning、未中断且回退 master@$MASTER_HEAD"
+OUT_EMPTY_NULL=$(run_sync "$API_BASE/empty-null" 2>&1)
+echo "--- case empty null output ---"; echo "$OUT_EMPTY_NULL"
+[ "$(cat "$FAKE/UPSTREAM_VERSION")" = "master@$MASTER_HEAD" ] || fail "empty null 应保持 master@$MASTER_HEAD"
+ok "明确 tag_name:null 空 release 回退 master"
+
+# ---------- 用例 3：API 错误不能伪装成无 release ----------
+for spec in forbidden:403 rate-limit:429 server-error:500; do
+  route=${spec%%:*}
+  status=${spec##*:}
+  expect_failure "api-$status" "$API_BASE/$route"
+done
+expect_failure api-malformed "$API_BASE/malformed"
+expect_failure api-missing-tag "$API_BASE/missing-tag"
+expect_failure api-invalid-tag "$API_BASE/invalid-tag"
+expect_failure api-bad-not-found "$API_BASE/bad-not-found"
+expect_failure api-network-error "$API_BASE/drop"
+
+# ---------- 用例 4：上游预期文件必须是 regular file ----------
+expect_failure upstream-symlink "$API_BASE/symlink-release"
+grep -Fq '拒绝符号链接' "$T/upstream-symlink.out" || fail "symlink 用例未明确报告符号链接"
+ok "symlink 输入被明确拒绝"
+expect_failure upstream-directory "$API_BASE/directory-release"
+grep -Fq 'regular file' "$T/upstream-directory.out" || fail "directory 用例未明确报告 regular file 边界"
+ok "目录输入被明确拒绝"
+
+# ---------- 用例 5：版本 rename 失败时目录 rollback ----------
+MV_REAL=$(command -v mv)
+mkdir -p "$T/fail-mv-bin"
+cat > "$T/fail-mv-bin/mv" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${MV_MODE:-}" == "fail-version" && "${!#}" == */UPSTREAM_VERSION ]]; then
+  echo "fixture: refusing UPSTREAM_VERSION rename" >&2
+  exit 91
+fi
+if [[ "${MV_MODE:-}" == "interrupt-after-swap" && "${!#}" == */upstream && ! -e "${INTERRUPT_MARKER:?}" ]]; then
+  "$REAL_MV" "$@"
+  : > "$INTERRUPT_MARKER"
+  kill -TERM "$PPID"
+  exit 0
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$T/fail-mv-bin/mv"
+
+snapshot_target version-rename-failure
+VERSION_FAILURE_OUT="$T/version-rename-failure.out"
+if ( cd "$FAKE" && REAL_MV="$MV_REAL" MV_MODE=fail-version PATH="$T/fail-mv-bin:$PATH" \
+  UPSTREAM_URL="file://$UP" UPSTREAM_API="$API_BASE/release" bash scripts/sync-upstream.sh ) \
+  > "$VERSION_FAILURE_OUT" 2>&1; then
+  sed -n '1,120p' "$VERSION_FAILURE_OUT"
+  fail "版本 rename 失败用例应失败"
+fi
+echo "--- version rename failure output ---"
+sed -n '1,120p' "$VERSION_FAILURE_OUT"
+assert_target_unchanged version-rename-failure
+ok "版本 rename 失败后 rollback 保持旧目录和旧版本"
+
+# ---------- 用例 6：目录交换后收到可捕获中断时 rollback ----------
+INTERRUPT_MARKER="$T/interrupt-sent"
+snapshot_target interrupt-after-swap
+INTERRUPT_OUT="$T/interrupt-after-swap.out"
+if ( cd "$FAKE" && REAL_MV="$MV_REAL" MV_MODE=interrupt-after-swap INTERRUPT_MARKER="$INTERRUPT_MARKER" \
+  PATH="$T/fail-mv-bin:$PATH" UPSTREAM_URL="file://$UP" UPSTREAM_API="$API_BASE/release" \
+  bash scripts/sync-upstream.sh ) > "$INTERRUPT_OUT" 2>&1; then
+  sed -n '1,120p' "$INTERRUPT_OUT"
+  fail "目录交换中断用例应失败"
+fi
+echo "--- interrupt after swap output ---"
+sed -n '1,120p' "$INTERRUPT_OUT"
+assert_target_unchanged interrupt-after-swap
+ok "目录交换中断后 rollback 保持旧目录和旧版本"
 
 echo
 echo "sync-upstream fixture tests passed ($PASS checks)."

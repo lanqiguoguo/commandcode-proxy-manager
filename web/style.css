@@ -25,6 +25,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 input, select, textarea { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 label { display: block; font-size: 12px; color: var(--dim); margin: 8px 0 4px; }
+label.inline { display: inline-block; margin: 0; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
 .grid { display: grid; gap: 14px; }
 .grid.cards { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); }
@@ -40,6 +41,13 @@ h3 { margin: 0 0 10px; font-size: 14px; }
 .bar { background: var(--panel2); border-radius: 6px; height: 10px; overflow: hidden; margin: 4px 0 2px; }
 .bar-fill { height: 100%; border-radius: 6px; }
 .bar-fill.q0 { background: var(--quota0); } .bar-fill.q1 { background: var(--quota1); } .bar-fill.q2 { background: var(--quota2); }
+/* L-j：CSP style-src 收紧 'self' 后 style 属性被禁，条宽按 5% 档位 class 渲染
+   （app.mjs barHtml 映射 w0/w5/.../w100，label 文字仍精确，宽度档误差 ≤2.5%） */
+.bar-fill.w0 { width: 0%; } .bar-fill.w5 { width: 5%; } .bar-fill.w10 { width: 10%; } .bar-fill.w15 { width: 15%; } .bar-fill.w20 { width: 20%; }
+.bar-fill.w25 { width: 25%; } .bar-fill.w30 { width: 30%; } .bar-fill.w35 { width: 35%; } .bar-fill.w40 { width: 40%; } .bar-fill.w45 { width: 45%; }
+.bar-fill.w50 { width: 50%; } .bar-fill.w55 { width: 55%; } .bar-fill.w60 { width: 60%; } .bar-fill.w65 { width: 65%; } .bar-fill.w70 { width: 70%; }
+.bar-fill.w75 { width: 75%; } .bar-fill.w80 { width: 80%; } .bar-fill.w85 { width: 85%; } .bar-fill.w90 { width: 90%; } .bar-fill.w95 { width: 95%; }
+.bar-fill.w100 { width: 100%; }
 .bar-label { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 12px; color: var(--dim); }
 /* ── 总览 Key 卡片：分组 + 层级（额度 / 本账期 / 实测用量折叠）── */
 .key-card .kc-head { margin-bottom: 4px; }

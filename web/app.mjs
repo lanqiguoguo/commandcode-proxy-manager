@@ -180,11 +180,14 @@ function barSubHtml(p, sub) {
   if (cd) out += '<span class="kc-cd">' + esc(cd) + "</span>";
   return out;
 }
+// L-j：CSP style-src 收紧为 'self' 后，style 属性会被浏览器禁止（CSP3），
+// 进度条动态宽度不能再走内联 style，改按 5% 档位 class（w0/w5/.../w100）渲染；
+// label 文字（barSubHtml）仍显示精确百分比，仅条宽取档，视觉误差 ≤2.5%
 function barHtml(label, p, sub) {
   const noData = p == null;
   const v = noData ? 0 : Math.max(0, Math.min(100, p || 0));
   return '<div class="kc-bar"><div class="bar-label"><span>' + esc(label) + "</span><span>" + barSubHtml(v, sub) + "</span></div>" +
-    '<div class="bar"><div class="bar-fill ' + barClass(v) + '" style="width:' + v + '%"></div></div></div>';
+    '<div class="bar"><div class="bar-fill ' + barClass(v) + ' w' + Math.round(v / 5) * 5 + '"></div></div></div>';
 }
 // 每 Key 的即时状态（updating/testing）：本地操作置位 + SSE quota-status 事件
 // 同步（他人触发的自动刷新/测试也能看到"更新中"），done/error/idle 清除；
@@ -426,7 +429,7 @@ async function addKey() {
 // ── 历史记录 ──
 function renderHistory() {
   let html = "<h2>历史记录</h2>";
-  html += '<div class="alert info" style="margin-bottom:12px">本页是<b>本网关自身的代理日志</b>（经本 manager 转发的每一次请求：时间/Key/模型/状态/token/延迟/重试），' +
+  html += '<div class="alert info mb">本页是<b>本网关自身的代理日志</b>（经本 manager 转发的每一次请求：时间/Key/模型/状态/token/延迟/重试），' +
     "不是 commandcode.ai 官网 settings/usage 的账号级账单明细——上游 API 不向第三方暴露逐条调用记录（仅汇总统计，已在本账期卡片展示）。" +
     "未走本网关的 CLI 直连调用不会出现在这里。</div>";
   html += '<div class="card mb"><div class="filters">' +
@@ -572,7 +575,7 @@ function renderSettings() {
     fieldSec("quotaRefreshGapMs", "多 Key 刷新间隔（秒）", p.quotaRefreshGapMs) +
     field("historyRetentionDays", "历史保留天数", "number", null, p.historyRetentionDays) +
     "</div>" +
-    '<div class="row mt"><label style="margin:0"><input type="checkbox" id="f-zeroOutputCountsAs429" ' + (p.zeroOutputCountsAs429 ? "checked" : "") + '> 零输出计入 429</label></div>' +
+    '<div class="row mt"><label class="inline"><input type="checkbox" id="f-zeroOutputCountsAs429" ' + (p.zeroOutputCountsAs429 ? "checked" : "") + '> 零输出计入 429</label></div>' +
     '<div class="mt"><button id="btn-save-pool">保存池配置</button> <span id="pool-msg"></span></div>' +
     "</div>";
   html += '<div class="card mb"><h3>选 Key 策略说明</h3><table class="strategy-table"><thead><tr><th>策略</th><th>说明</th></tr></thead><tbody>' +

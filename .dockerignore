@@ -1,5 +1,14 @@
-.git
-.github
-data
-node_modules
-scripts
+# Deny-by-default build context. Only files copied by Dockerfile are sent to
+# the builder; this also excludes .env files, credentials, keys, certificates,
+# backups and future local files without relying on their names.
+*
+!Dockerfile
+!package.json
+!package-lock.json
+!src/
+!src/**
+!web/
+!web/**
+!upstream/
+!upstream/**
+!UPSTREAM_VERSION

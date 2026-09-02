@@ -23,7 +23,7 @@
 
 ## 架构
 
-单容器、单 Node 进程：管理网关（3080，对外）→ 同进程嵌入的上游代理（127.0.0.1:3050，不对外）→ Command Code API。
+单容器、单 Node 进程：管理网关（默认 3080，对外）→ 同进程嵌入的上游代理（127.0.0.1:3050，不对外）→ Command Code API。
 
     OpenAI / Anthropic SDK ──► :3080/v1/*（clientToken 鉴权）
     Browser ─────────────────► :3080/admin（管理 UI）· /admin/api/*（REST+SSE）
@@ -36,7 +36,7 @@
 
 ## 快速开始
 
-镜像采用精简基础镜像（alpine + 无 npm 的 nodejs），拉取体积约 29MB（node:22-alpine 基底约 58MB）。
+镜像采用固定 digest 的 Node 20.19.4 / Alpine 3.21 多架构基础镜像；CI 与镜像使用同一 Node 20 主版本。
 
 Docker：
 
@@ -48,7 +48,19 @@ docker compose：
 
     docker compose up -d
 
-本地开发（Node >= 18）：
+容器内监听端口由 `PORT` 统一决定，默认值为 3080。Compose 会把同一个值同时用于容器环境和宿主机映射；例如使用非默认端口：
+
+    PORT=8080 docker compose up -d
+
+直接使用 `docker run` 时也要同时设置环境变量和映射的容器端口：
+
+    docker run -d --name cc-proxy-manager -e PORT=8080 -p 8080:8080 \
+      -v ccpm-data:/data \
+      ghcr.io/lanqiguoguo/commandcode-proxy-manager:latest
+
+镜像的 `EXPOSE 3080` 表示默认端口；非默认 `PORT` 必须映射为相同的宿主机端口和容器端口。Dockerfile 与 Compose healthcheck 都读取运行时 `PORT`。基础镜像升级时，先用 `docker buildx imagetools inspect` 审阅目标 Node/Alpine manifest，再同步更新 Dockerfile 中的完整 tag 和 digest。
+
+本地开发（Node 20）：
 
     npm start          # 数据落在 ./data/
 
@@ -60,7 +72,7 @@ docker compose：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| PORT | 3080 | 管理网关端口 |
+| PORT | 3080 | 管理网关监听端口；容器/Compose 的宿主机映射使用同一值 |
 | HOST | 0.0.0.0 | 监听地址 |
 | DATA_DIR | ./data（容器内 /data） | 持久化目录（keys.json / state.json / quota-cache.json / stats.jsonl / config.json） |
 | ADMIN_TOKEN | 自动生成 | 管理端令牌（仅磁盘无值时初始化生效） |

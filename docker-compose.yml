@@ -4,16 +4,17 @@ services:
     image: ghcr.io/lanqiguoguo/commandcode-proxy-manager:latest
     container_name: cc-proxy-manager
     ports:
-      - "3080:3080"
+      - "${PORT:-3080}:${PORT:-3080}"
     environment:
-      - DATA_DIR=/data
-      # - ADMIN_TOKEN=change-me     # 可选：不设置则首次启动自动生成并打印到日志
-      # - CLIENT_TOKEN=change-me    # 可选：不设置则 /v1/* 回退使用 AdminToken
+      PORT: "${PORT:-3080}"
+      DATA_DIR: /data
+      # ADMIN_TOKEN: change-me     # 可选：不设置则首次启动自动生成并打印到日志
+      # CLIENT_TOKEN: change-me    # 可选：不设置则 /v1/* 回退使用 AdminToken
     volumes:
       - ccpm-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3080/health"]
+      test: ["CMD-SHELL", "wget -qO- \"http://127.0.0.1:$${PORT}/health\" >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 15s

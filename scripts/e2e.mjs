@@ -388,8 +388,20 @@ async function main() {
   const hSeed = ks.find((k) => k.alias === "keyA").health;
   const idA9b = ks.find((k) => k.alias === "keyA").id;
   hSeed.failCount === 1 ? ok("基线：keyA failCount=1（timeout 退避）") : bad("基线 failCount", JSON.stringify(hSeed));
-  await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 120000 });
-  await sleep(1300); // 退避（base=1s）过期，keyA 可再次被选中但不清零 failCount
+  await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 120000, backoffBaseMs: 5000 });
+  // 轮询门控：等 keyA 的 1s 退避真正到期再放行（固定 sleep(1300) 与 1000ms 窗口仅
+  // 300ms 裕量，负载下 API 延迟叠加会让 keyA 仍在 inBackoff → cutstream 被路由到
+  // keyB（default ok）→ 本用例断言偶发翻红，集成终检实锤）。门控超时则原样继续，
+  // 由后续断言暴露。同时校验 failCount=1 保留——保证“误清”检测有意义（非真空通过）。
+  {
+    const tGate = performance.now();
+    while (performance.now() - tGate < 5000) {
+      const hs = (await keysList()).find((k) => k.alias === "keyA");
+      if (hs && hs.health.failCount === 1 && Date.now() >= hs.health.backoffUntilMs) break;
+      await sleep(100);
+    }
+    await sleep(80); // Date.now 粒度余量
+  }
   await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "cutstream" }] });
   const stderrMark = mgrStderr.length;
@@ -818,10 +830,14 @@ async function main() {
   const ql = JSON.parse((await mockGet("/__quota")).body);
   ql.maxActive === 1 && ql.quotaLog.length >= 8
     ? ok("并发刷新被串行化（探测 maxActive=1，共 " + ql.quotaLog.length + " 次）") : bad("串行化", "maxActive=" + ql.maxActive);
-  // 同 Key 连续探测时间线不得重叠（串行队列核心不变式）
+  // 同 Key 连续探测时间线不得重叠（串行队列核心不变式）。
+  // 容忍 20ms：mock 的 start/end 时间戳记在 handler 两端，事件循环在高负载下
+  // 的调度抖动会让相邻探测的记录区间产生 <20ms 的表观重叠（真实并发在
+  // maxActive=1 主断言即被捕获；即便主断言因时序缝隙漏过，真并发的重叠时长
+  // ≈ MOCK_QUOTA_LATENCY(120ms) 也远超容差）。
   let overlap = 0;
   const sorted = [...ql.quotaLog].sort((a, b) => a.start - b.start);
-  for (let i = 1; i < sorted.length; i++) if (sorted[i].start < sorted[i - 1].end) overlap++;
+  for (let i = 1; i < sorted.length; i++) if (sorted[i].start < sorted[i - 1].end - 20) overlap++;
   overlap === 0 ? ok("探测时间线零重叠（严格串行）") : bad("时间线重叠", overlap + " 处");
   const qEvents = sseEvents.filter(([n]) => n === "quota-status");
   const phases = qEvents.map(([, d]) => { try { return JSON.parse(d).phase; } catch { return ""; } });

@@ -47,11 +47,21 @@ jobs:
             exit 0
           fi
           BRANCH="chore/upstream-sync-$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+          TITLE="chore: sync upstream $(cat UPSTREAM_VERSION)"
+          # 存量去重：同版本 open PR 已存在则不再重复开（cron 每日跑，PR 挂几天就会堆几个）
+          # 不用 --search（TITLE 含冒号会被解析成 search qualifier）；TITLE 形如
+          # "chore: sync upstream <tag>@<sha>"，无单引号，可安全内插进 jq 表达式
+          EXISTING=$(gh pr list --state open --limit 100 --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          if [ -n "$EXISTING" ]; then
+            echo "Open PR #$EXISTING already covers [$TITLE]; skip creating duplicate."
+            exit 0
+          fi
           git checkout -b "$BRANCH"
-          git commit -m "chore: sync upstream $(cat UPSTREAM_VERSION)"
+          git commit -m "$TITLE"
           git push origin "$BRANCH"
           gh pr create \
             --base "$GITHUB_REF_NAME" \
             --head "$BRANCH" \
-            --title "chore: sync upstream $(cat UPSTREAM_VERSION)" \
-            --body "自动上游同步 PR：本 PR 由 upstream-sync workflow 生成，替换 vendored 的上游代码（upstream/ 目录）并更新 UPSTREAM_VERSION。属于第三方代码变更，请人工审阅后再合并。"
+            --title "$TITLE" \
+            --body "自动上游同步 PR：本 PR 由 upstream-sync workflow 生成，替换 vendored 的上游代码（upstream/ 目录）并更新 UPSTREAM_VERSION。属于第三方代码变更，请人工审阅后再合并。注意：若本 PR 的 UPSTREAM_VERSION 为 master@… 而上游当时存在更新的 release tag，说明同步时 release API 不可达走了降级路径——请关闭本 PR 等次日按 release tag 重开。"

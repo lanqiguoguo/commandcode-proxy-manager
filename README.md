@@ -123,7 +123,7 @@ Anthropic SDK：base_url 指向 http://127.0.0.1:3080 ，x-api-key 填 clientTok
 - keys.json 权限 600，仅本地明文；管理 API 只回显掩码（user_ab***cd），日志不含 Key 明文
 - 客户端令牌不会透传上游，上游只看到池内 Key
 - 管理 API 与 /v1/* 分离鉴权；额度端点为非文档化接口，探测失败自动降级（stale），不影响推理主链路
-- 令牌比较使用常量时间比较（SHA-256 摘要 + timingSafeEqual）；login 按来源 IP 限速：15 分钟内失败 10 次锁定 15 分钟（返回 429），成功登录即清零计数（计数为进程内存态，重启复位）
+- 令牌比较使用常量时间比较（SHA-256 摘要 + timingSafeEqual）；login 按来源 IP 限速：15 分钟内失败 10 次锁定 15 分钟（返回 429），成功登录即清零计数（计数为进程内存态，重启复位）。注意限速取 TCP 源地址：置于反向代理之后时所有请求共享代理 IP，限速退化为全局开关（误输 10 次会连带锁住所有管理员），需自行在反代层限流或接受该权衡
 - **TLS 反代部署请设 `SECURE_COOKIES=1`**：登录下发的 SSE 专用 cookie（ccpm_sse）默认不带 `Secure`
   属性——官方部署形态为明文 HTTP 容器（3080 直接对外），默认开启会导致浏览器在 HTTP 下完全不回传
   cookie、SSE 实时推送失效。当你把服务置于 HTTPS 反代（Caddy/Nginx/Traefik）之后时，设置

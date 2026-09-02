@@ -42,7 +42,11 @@ function load() {
       if (!line.trim()) continue;
       try {
         const ev = JSON.parse(line);
-        if (ev.ts >= cutoff) events.push(ev);
+        if (ev.ts >= cutoff) {
+          // 读侧净化：修复前已落盘的脏 usage（字符串/对象）重启后不得进内存聚合
+          sanitizeNumeric(ev, ["inputTokens", "outputTokens", "cachedTokens", "latencyMs", "retries", "status"]);
+          events.push(ev);
+        }
       } catch {}
     }
   } catch (e) {

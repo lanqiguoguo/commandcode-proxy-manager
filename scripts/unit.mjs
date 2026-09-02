@@ -308,6 +308,22 @@ if (SC === "stats") {
   check(mode === "600", "stats.jsonl 权限 600", mode);
   setRetention(999); // clamp 31
   check(true, "setRetention 越界 clamp 不抛错");
+  // ── 终检加固：读侧净化——修复前已落盘的脏 usage 重启回放后不得进聚合（用 ?fresh
+  //    查询串绕过模块缓存拿独立实例；DATA_DIR 经 config.mjs 缓存仍指向同一临时目录）──
+  const now2 = Date.now();
+  writeFileSync(DATA + "/stats.jsonl", [
+    { ts: now2 - 10e3, keyId: "kx", ok: true, status: 200, model: "clean", inputTokens: 10, outputTokens: 5 },
+    { ts: now2 - 5e3, keyId: "kx", ok: true, status: 200, model: "dirtyload", inputTokens: "12/><img>", outputTokens: { evil: 1 }, cachedTokens: null, retries: "x" }
+  ].map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
+  const S2 = await import("../src/stats.mjs?freshload");
+  S2.initStats({ emit: () => {} }, 7);
+  const u3 = S2.usageByKey("kx");
+  check(u3.d7.input === 10 && u3.d7.output === 5, "load() 读侧净化：历史脏 usage 不进窗口聚合", JSON.stringify(u3.d7));
+  const dl = S2.queryEvents({}).items.find((e) => e.model === "dirtyload");
+  check(dl && dl.inputTokens === undefined && dl.outputTokens === undefined && dl.cachedTokens === undefined && dl.retries === undefined,
+    "load() 读侧净化：脏字段从回放事件删除（保持缺省语义）", JSON.stringify(dl));
+  const cl = S2.queryEvents({}).items.find((e) => e.model === "clean");
+  check(cl && cl.inputTokens === 10 && cl.status === 200, "load() 读侧净化不误伤合法数值字段");
 }
 
 // ════ logs（持久化 + proxy 捕获）════

@@ -356,6 +356,12 @@ export async function handleGateway(req, res, url) {
       break;
     }
     if (Date.now() >= deadlineAt) break; // 预算耗尽不再发起新尝试（含选中 Key 后、发起请求前）
+    // L-b：上一尝试错误体排空/收尾（activeAc 已置 null，见各 break 分支）之后、本尝试
+    // fetch 发出之前，客户端可能断开——res 'close' 触发时 abort 落空，仅置位 clientGone，
+    // 而外层 while 条件不含 clientGone，若无此复查，新 fetch 将无中断源地完整执行
+    // （浪费一次完整生成与上游计费）。所有"换 Key 后发起新尝试"的路径都汇聚于此
+    // （selectKey 同步执行，本行与 fetch 发出之间无 await，close 不可能漏检），一处覆盖。
+    if (clientGone || res.writableEnded || res.destroyed) return;
     triedKeys.add(chosen.id);
     let sameKeyTries = 0;
     let retriedOnce5xx = false;
@@ -466,6 +472,8 @@ export async function handleGateway(req, res, url) {
         pool.markAuthError(chosen.id);
         activeAc = null;
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "auth", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+        // 错误体排空后客户端可能断开：sendJson 自带判空守卫，此处提前返回保持一致
+        if (clientGone || res.writableEnded || res.destroyed) return;
         const mapped = mapError(upRes.status, text);
         sendJson(res, mapped.status, mapped.body);
         return;
@@ -499,11 +507,21 @@ export async function handleGateway(req, res, url) {
           if (Date.now() >= deadlineAt) break;
           // 等待期间客户端可能断开：中断重试
           if (clientGone || res.writableEnded || res.destroyed) return;
+          // L-a：睡眠期间本 Key 可能已被并发请求标退避 / 额度探测标 quotaLimited /
+          // 401 标 authError——醒来复检不可用即放弃它，不再多发一次请求（break 后
+          // 外层 selectKey 会排除它：triedKeys 已含 chosen，且退避/限额已使其不可选）。
+          // 该 Key 的状态是并发方标的，此处只做"取消"，不重复 recordRateLimit /
+          // recordFailover / 统计事件（避免重复计数）；池中无其他 Key 时最终收尾 429。
+          if (!pool.isKeyUsable(chosen.id)) break;
           continue;
         }
         pool.recordRateLimit(chosen.id, retryAfterMs);
         pool.recordFailover(chosen.id);
         activeAc = null;
+        // L-b：错误体已排空、不再重试（将走外层 while 换 Key 或最终 429）。此时客户端若
+        // 断开，'close' 只置位 clientGone（activeAc 已 null，abort 落空）——外层 while 条件
+        // 不含 clientGone，唯一的闸门是 while 顶部的 L-b 复检，故需在此提前返回。
+        if (clientGone || res.writableEnded || res.destroyed) return;
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 429, errorKind: "rate_limit", retries: attempts - 1, latencyMs: Date.now() - startedAt });
         break;
       }
@@ -519,6 +537,9 @@ export async function handleGateway(req, res, url) {
           continue;
         }
         activeAc = null;
+        // L-b：错误体已排空、不再重试（将走外层 while 换 Key 或最终 502）——同 429
+        // 持续限流分支，客户端若在排空后断开，需在此提前返回（外层唯一闸门在 while 顶部）。
+        if (clientGone || res.writableEnded || res.destroyed) return;
         stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
         break;
       }
@@ -526,6 +547,8 @@ export async function handleGateway(req, res, url) {
       // 其余状态（400/404/422...）：透传，不重试
       activeAc = null;
       stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "client", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+      // L-b：错误体已排空、即将透传响应——sendJson 自带判空守卫，此处提前返回保持一致
+      if (clientGone || res.writableEnded || res.destroyed) return;
       const mapped = mapError(upRes.status, text);
       sendJson(res, mapped.status, mapped.body);
       return;

@@ -230,19 +230,29 @@ function quotaLimited(id) {
   return h ? nowMs() < h.quotaLimitedUntil : false;
 }
 
+// 只读可用性复检（L-a：同 Key 重试睡眠醒来后、网关发起下一次尝试前使用）：
+// 仅判"不可用排除集"——enabled、非退避、非额度受限、非认证错误，与 selectKey 的
+// 排除逻辑同源（selectKey 据此过滤候选）；不含 cooldown/softLimited 优先级排序。
+// 在睡眠期间 Key 可能已被并发请求标退避 / 额度探测标 quotaLimited / 401 标 authError，
+// 醒来复检发现不可用即不再对它重试，避免向本应排除的 Key 多发一次请求（L-a）。
+export function isKeyUsable(id) {
+  const rec = keys.find((k) => k.id === id);
+  if (!rec) return false;
+  if (!rec.enabled) return false;
+  if (inBackoff(id)) return false;
+  if (quotaLimited(id)) return false;
+  const h = health.get(id);
+  if (h && h.authError) return false;
+  return true;
+}
+
 export function selectKey(excludeIds = null) {
   const cooldownMs = poolCfg.failoverCooldownMs ?? 600000;
   const now = nowMs();
   const avail = keys.filter((k) => {
-    if (!k.enabled) return false;
-    if (excludeIds && excludeIds.has(k.id)) return false;
-    if (inBackoff(k.id)) return false;
-    if (quotaLimited(k.id)) return false;
-    const h = health.get(k.id);
-    if (h && h.authError) return false;
     // failoverCooldown：刚发生过切换的 key 在冷却期内降低优先级（仅 active-standby 场景有效）
     // 实现为：冷却期内该 key 仍可用，但当存在非冷却可用 key 时会被排后
-    return true;
+    return isKeyUsable(k.id) && !(excludeIds && excludeIds.has(k.id));
   });
   if (!avail.length) return null;
   let chosen = null;

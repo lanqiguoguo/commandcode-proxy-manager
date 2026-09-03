@@ -3,6 +3,7 @@
 //   1) 请求 body 的 testMode 字段（经网关原样转发的 body 传递）
 //   2) POST /__control {auth, responses:[{mode,...}]} 设置该 Key 的响应队列（优先）
 // 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | server5xx | hang | bodyhang | delay(delayMs)
+//          | empty | malformed | truncated | missingstructure | empty_sse | malformed_sse | missingdone | unterminateddone | split_sse
 //          | cutstream（200 SSE 写数帧后 destroy，模拟上游流中途断连）| cutbody（200 JSON 写半身后 destroy）
 //          | badusage（200 JSON，usage 字段为字符串/对象/null 恶意值，P1-6 净化验证）
 // 初始化控制：POST /__control {auth, init:{fingerprint:[spec], lifecycle:[spec]}}
@@ -258,6 +259,99 @@ const server = http.createServer((req, res) => {
         choices: [{ index: 0, message: { role: "assistant", content: "bad-usage" }, finish_reason: "stop" }],
         usage: { prompt_tokens: "1\"/><img src=x onerror=alert(1)>", completion_tokens: { evil: 1 }, total_tokens: null }
       });
+      return;
+    }
+    if (spec.mode === "empty") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end();
+      return;
+    }
+    if (spec.mode === "malformed") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("not-json");
+      return;
+    }
+    if (spec.mode === "truncated") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"id":"chatcmpl-truncated","object":"chat.completion","choices":[{"message":');
+      return;
+    }
+    if (spec.mode === "missingstructure") {
+      json(res, 200, { id: "chatcmpl-missingstructure", object: "chat.completion", choices: [] });
+      return;
+    }
+    if (p === "/v1/models") {
+      json(res, 200, {
+        object: "list",
+        data: [{ id: "mock-model", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "mock" }]
+      });
+      return;
+    }
+    if (p === "/v1/messages") {
+      if (spec.mode === "empty_sse") {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        res.end();
+        return;
+      }
+      if (spec.mode === "malformed_sse") {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        res.end("event: message_start\ndata: {bad-json}\n\n");
+        return;
+      }
+      if (spec.mode === "missingdone") {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+        res.end("event: message_start\ndata: " + JSON.stringify({ type: "message_start", message: { type: "message", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 0 } } }) + "\n\n");
+        return;
+      }
+      if (spec.mode === "sse") {
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+        res.write("event: message_start\ndata: " + JSON.stringify({ type: "message_start", message: { id: "msg-mock", type: "message", role: "assistant", content: [], model: parsed.model || "mock", usage: { input_tokens: 3, output_tokens: 0 } } }) + "\n\n");
+        await sleep(10);
+        res.write("event: content_block_start\ndata: " + JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) + "\n\n");
+        res.write("event: content_block_delta\ndata: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello from messages mock" } }) + "\n\n");
+        res.write("event: content_block_stop\ndata: " + JSON.stringify({ type: "content_block_stop", index: 0 }) + "\n\n");
+        res.write("event: message_delta\ndata: " + JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 3, output_tokens: 4 } }) + "\n\n");
+        res.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        res.end();
+        return;
+      }
+      json(res, 200, {
+        id: "msg-mock", type: "message", role: "assistant", model: parsed.model || "mock",
+        content: [{ type: "text", text: "hello from messages mock" }],
+        stop_reason: "end_turn", stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 7, cache_read_input_tokens: 1 }
+      });
+      return;
+    }
+    if (spec.mode === "empty_sse") {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      res.end();
+      return;
+    }
+    if (spec.mode === "missingdone") {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      res.end('data: {"id":"c-missingdone","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"stop"}]}\n\n');
+      return;
+    }
+    if (spec.mode === "unterminateddone") {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      res.end('data: {"id":"c-unterminated","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"stop"}]}\n\ndata: [DONE]');
+      return;
+    }
+    if (spec.mode === "malformed_sse") {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      res.end('data: {"id":"c-malformed","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"partial"}}]}\n\ndata: {bad-json}\n\n');
+      return;
+    }
+    if (spec.mode === "split_sse") {
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      const first = 'data: {"id":"c-split","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"split"},"finish_reason":"stop"}]}\n\n';
+      const done = "data: [DONE]\n\n";
+      for (const part of [first.slice(0, 19), first.slice(19), done.slice(0, 8), done.slice(8)]) {
+        res.write(part);
+        await sleep(5);
+      }
+      res.end();
       return;
     }
     if (spec.mode === "sse") {

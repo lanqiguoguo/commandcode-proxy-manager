@@ -132,42 +132,163 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function parseUsageFromJson(text) {
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function usageFromPayload(payload) {
+  if (!isRecord(payload)) return null;
+  const usage = isRecord(payload.usage)
+    ? payload.usage
+    : (payload.type === "message_start" && isRecord(payload.message?.usage) ? payload.message.usage : null);
+  if (!usage) return null;
+  return {
+    inputTokens: num(usage.prompt_tokens ?? usage.input_tokens ?? 0),
+    outputTokens: num(usage.completion_tokens ?? usage.output_tokens ?? 0),
+    cachedTokens: num(usage.prompt_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens ?? 0)
+  };
+}
+
+function responseProtocol(pathname) {
+  if (pathname === "/v1/messages") return "anthropic";
+  if (pathname === "/v1/models") return "models";
+  return "openai";
+}
+
+function validateJsonResponse(text, protocol) {
+  let payload;
   try {
-    const j = JSON.parse(text);
-    const u = j.usage;
-    if (!u || typeof u !== "object") return null;
-    return {
-      inputTokens: num(u.prompt_tokens ?? u.input_tokens ?? 0),
-      outputTokens: num(u.completion_tokens ?? u.output_tokens ?? 0),
-      cachedTokens: num(u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens ?? 0)
-    };
+    payload = JSON.parse(text);
   } catch {
+    return { ok: false, reason: "upstream 200 response is not valid JSON" };
+  }
+  if (!isRecord(payload)) return { ok: false, reason: "upstream JSON response must be an object" };
+
+  if (protocol === "models") {
+    if (payload.object !== "list" || !Array.isArray(payload.data) ||
+        payload.data.some((model) => !isRecord(model) || typeof model.id !== "string" || !model.id)) {
+      return { ok: false, reason: "upstream model list is incomplete" };
+    }
+    return { ok: true, payload, usage: null };
+  }
+
+  if (protocol === "anthropic") {
+    if (payload.type !== "message" || payload.role !== "assistant" || !Array.isArray(payload.content)) {
+      return { ok: false, reason: "upstream Anthropic message is incomplete" };
+    }
+    return { ok: true, payload, usage: usageFromPayload(payload) };
+  }
+
+  if (payload.object !== "chat.completion" || !Array.isArray(payload.choices) || payload.choices.length === 0) {
+    return { ok: false, reason: "upstream OpenAI chat completion is incomplete" };
+  }
+  if (payload.choices.some((choice) => !isRecord(choice) || !isRecord(choice.message))) {
+    return { ok: false, reason: "upstream OpenAI chat completion choices are incomplete" };
+  }
+  return { ok: true, payload, usage: usageFromPayload(payload) };
+}
+
+function newSseState(protocol) {
+  return {
+    protocol,
+    frameLines: [],
+    sawDone: false,
+    sawChunk: false,
+    messageStarted: false,
+    messageStopped: false,
+    sawContent: false,
+    usage: null,
+  };
+}
+
+function mergeUsage(current, next) {
+  if (!next) return current;
+  if (!current) return { ...next };
+  current.inputTokens += next.inputTokens;
+  current.outputTokens += next.outputTokens;
+  current.cachedTokens += next.cachedTokens;
+  return current;
+}
+
+function validateSsePayload(payload, state) {
+  if (payload.trim() === "[DONE]") {
+    if (state.protocol !== "openai" || state.sawDone || !state.sawChunk) {
+      return "invalid or premature SSE [DONE] termination";
+    }
+    state.sawDone = true;
     return null;
+  }
+  if (state.sawDone) return "SSE data appeared after [DONE]";
+  if (!payload.trim()) return "empty SSE data event";
+
+  let event;
+  try { event = JSON.parse(payload); } catch { return "SSE data event is not valid JSON"; }
+  if (!isRecord(event)) return "SSE data event must be an object";
+
+  if (state.protocol === "openai") {
+    if (event.object !== "chat.completion.chunk" || !Array.isArray(event.choices)) {
+      return "upstream OpenAI SSE chunk is incomplete";
+    }
+    if (event.choices.length === 0 && !isRecord(event.usage)) {
+      return "upstream OpenAI SSE chunk has no choices or usage";
+    }
+    if (event.choices.some((choice) => !isRecord(choice) || !isRecord(choice.delta))) {
+      return "upstream OpenAI SSE choices are incomplete";
+    }
+    if (event.choices.length > 0) state.sawChunk = true;
+    state.usage = mergeUsage(state.usage, usageFromPayload(event));
+    return null;
+  }
+
+  switch (event.type) {
+    case "ping":
+      return null;
+    case "message_start":
+      if (state.messageStarted || !isRecord(event.message) || event.message.type !== "message" ||
+          event.message.role !== "assistant" || !Array.isArray(event.message.content)) {
+        return "upstream Anthropic message_start is incomplete";
+      }
+      state.messageStarted = true;
+      state.usage = mergeUsage(state.usage, usageFromPayload(event));
+      return null;
+    case "content_block_start":
+      if (!state.messageStarted || !Number.isInteger(event.index) || !isRecord(event.content_block)) {
+        return "upstream Anthropic content_block_start is incomplete";
+      }
+      state.sawContent = true;
+      return null;
+    case "content_block_delta":
+      if (!state.messageStarted || !Number.isInteger(event.index) || !isRecord(event.delta)) {
+        return "upstream Anthropic content_block_delta is incomplete";
+      }
+      state.sawContent = true;
+      return null;
+    case "content_block_stop":
+      if (!state.messageStarted || !Number.isInteger(event.index)) return "upstream Anthropic content_block_stop is incomplete";
+      return null;
+    case "message_delta":
+      if (!state.messageStarted || !isRecord(event.delta)) return "upstream Anthropic message_delta is incomplete";
+      state.sawContent = true;
+      state.usage = mergeUsage(state.usage, usageFromPayload(event));
+      return null;
+    case "message_stop":
+      if (!state.messageStarted || state.messageStopped) return "upstream Anthropic message_stop is invalid";
+      state.messageStopped = true;
+      return null;
+    case "error":
+      return "upstream Anthropic SSE reported an error";
+    default:
+      return "unknown or unsupported Anthropic SSE event";
   }
 }
 
-function parseUsageFromSseLine(line) {
-  if (!line.startsWith("data:")) return null;
-  const payload = line.slice(5).trim();
-  if (!payload || payload === "[DONE]") return null;
-  try {
-    const j = JSON.parse(payload);
-    if (j && j.usage && typeof j.usage === "object" && (j.object === "chat.completion.chunk" || j.usage.prompt_tokens !== undefined)) {
-      const u = j.usage;
-      return {
-        inputTokens: num(u.prompt_tokens ?? 0),
-        outputTokens: num(u.completion_tokens ?? 0),
-        cachedTokens: num((u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) ?? 0)
-      };
-    }
-    if (j && j.type === "message_start" && j.message && j.message.usage) {
-      return { inputTokens: num(j.message.usage.input_tokens ?? 0), outputTokens: 0, cachedTokens: num(j.message.usage.cache_read_input_tokens ?? 0) };
-    }
-    if (j && j.type === "message_delta" && j.usage && typeof j.usage === "object") {
-      return { inputTokens: 0, outputTokens: num(j.usage.output_tokens ?? 0), cachedTokens: num(j.usage.cache_read_input_tokens ?? 0) };
-    }
-  } catch {}
+function finishSseValidation(state) {
+  if (state.frameLines.length > 0) return "upstream SSE ended with an incomplete event frame";
+  if (state.protocol === "openai") {
+    if (!state.sawChunk || !state.sawDone) return "upstream OpenAI SSE is missing a valid [DONE] termination";
+  } else if (!state.messageStarted || !state.sawContent || !state.messageStopped) {
+    return "upstream Anthropic SSE is missing a complete message termination";
+  }
   return null;
 }
 
@@ -194,17 +315,19 @@ async function waitDrain(res) {
   });
 }
 
-// 返回 { usage, err }：err = null（正常完成）| "client"（客户端断开）| "upstream"（上游中途断连）。
+// 返回 { body, usage, err }：err = null（正常完成）| "client"（客户端断开）|
+// "upstream"（上游中途断连）| "invalid"（200 响应协议不完整）。非流式在完整校验
+// 前不写客户端，流式则保留已写出的前缀并由调用方销毁连接，避免切 Key 重放。
 // isClientGone(): 调用方闭包，判定客户端是否已断开（断开检测优先于分类，避免误判上游故障）。
-async function pipeBody(upRes, res, isStream, isClientGone) {
+async function pipeBody(upRes, res, isStream, isClientGone, protocol) {
   // 已 broken 的流上 cancel() 返回 rejected promise（undici "terminated"），同步 try/catch 接不住，
   // 会成为 unhandledRejection —— 统一挂 noop catch 消除次生拒绝噪音。
   const safeCancel = (reader) => {
     try { const p = reader.cancel(); if (p && typeof p.catch === "function") p.catch(() => {}); } catch {}
   };
   if (!isStream) {
-    // 非流式响应体上限（M3）：upRes.text() 会被 undici 整包缓冲、无法中途截断，
-    // 改用 reader 逐块累积读取，超 MAX_NONSTREAM_BODY 即 cancel 截断（防内存放大）。
+    // 非流式响应体上限（M3）：逐块读取，先完整校验，避免把截断/畸形 200 透传为成功。
+    if (!upRes.body) return { body: Buffer.alloc(0), usage: null, err: "invalid", reason: "upstream 200 response has an empty body" };
     const reader = upRes.body.getReader();
     const chunks = [];
     let size = 0;
@@ -220,29 +343,65 @@ async function pipeBody(upRes, res, isStream, isClientGone) {
     } catch {
       // body 读取中断：客户端断开（abort 致 read 拒绝）或上游 socket 死亡
       safeCancel(reader);
-      return { usage: null, err: isClientGone() ? "client" : "upstream" };
+      return { body: Buffer.concat(chunks), usage: null, err: isClientGone() ? "client" : "upstream" };
     }
     if (tooLarge) {
-      // 响应体超限截断（防御性上限）：此时 200 头已发出、无法重试（与 cutbody 同性质），
-      // 复用 err:"upstream" 让调用方走既有的 502 事件 + res.destroy 收尾；
-      // 与断连语义不同：此分支 isClientGone() 必然为 false，只是收尾动作复用。
-      return { usage: null, err: "upstream" };
+      return { body: Buffer.concat(chunks), usage: null, err: "invalid", reason: "upstream 200 response exceeds the size limit" };
     }
-    const text = Buffer.concat(chunks).toString("utf-8");
-    res.end(text);
-    return { usage: parseUsageFromJson(text), err: null };
+    const body = Buffer.concat(chunks);
+    const validation = validateJsonResponse(body.toString("utf-8"), protocol);
+    if (!validation.ok) return { body, usage: null, err: "invalid", reason: validation.reason };
+    return { body, usage: validation.usage, err: null };
   }
+  if (!upRes.body) return { usage: null, err: "invalid", reason: "upstream 200 SSE response has an empty body" };
   const reader = upRes.body.getReader();
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
-  let usage = null;
-  const merge = (u) => {
-    if (!u) return;
-    if (!usage) usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
-    usage.inputTokens += u.inputTokens || 0;
-    usage.outputTokens += u.outputTokens || 0;
-    usage.cachedTokens += u.cachedTokens || 0;
+  const state = newSseState(protocol);
+
+  const writeChunk = async (chunk) => {
+    let ok;
+    try { ok = res.write(chunk); } catch { return "client"; }
+    if (!ok) {
+      // 写缓冲满（背压）：暂停读上游，等 drain 再继续——慢客户端时防止 Node 写队列无限堆积。
+      // 断连时 drain 永不触发，靠 close 唤醒（Node 保证连接销毁必发 close），由 isClientGone 判定分类。
+      await waitDrain(res);
+      if (isClientGone()) return "client";
+    }
+    return null;
   };
+
+  const processFrame = () => {
+    if (!state.frameLines.length) return null;
+    const dataLines = [];
+    for (const line of state.frameLines) {
+      if (line.startsWith(":")) continue;
+      if (line.startsWith("data:")) {
+        let value = line.slice(5);
+        if (value.startsWith(" ")) value = value.slice(1);
+        dataLines.push(value);
+        continue;
+      }
+      if (/^(?:event|id|retry)(?::.*)?$/.test(line)) continue;
+      return "SSE frame contains an invalid field";
+    }
+    state.frameLines = [];
+    if (!dataLines.length) return null;
+    return validateSsePayload(dataLines.join("\n"), state);
+  };
+
+  const processLine = (rawLine) => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line === "") return processFrame();
+    state.frameLines.push(line);
+    return null;
+  };
+
+  const invalid = (reason) => {
+    safeCancel(reader);
+    return { usage: state.usage, err: "invalid", reason };
+  };
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -251,33 +410,28 @@ async function pipeBody(upRes, res, isStream, isClientGone) {
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
-        merge(parseUsageFromSseLine(line));
-        let ok;
-        try { ok = res.write(line + "\n"); } catch { safeCancel(reader); return { usage, err: "client" }; }
-        if (!ok) {
-          // 写缓冲满（背压）：暂停读上游，等 drain 再继续——慢客户端时防止 Node 写队列无限堆积。
-          // 断连时 drain 永不触发，靠 close 唤醒（Node 保证连接销毁必发 close），由 isClientGone 判定分类。
-          await waitDrain(res);
-          if (isClientGone()) { safeCancel(reader); return { usage, err: "client" }; }
-        }
+        const reason = processLine(line);
+        const writeErr = await writeChunk(line + "\n");
+        if (writeErr) { safeCancel(reader); return { usage: state.usage, err: writeErr }; }
+        if (reason) return invalid(reason);
       }
     }
-    if (buffer.trim()) {
-      merge(parseUsageFromSseLine(buffer.trim()));
-      let ok;
-      try { ok = res.write(buffer); } catch { safeCancel(reader); return { usage, err: "client" }; }
-      if (!ok) {
-        await waitDrain(res);
-        if (isClientGone()) { safeCancel(reader); return { usage, err: "client" }; }
-      }
+    buffer += decoder.decode();
+    if (buffer) {
+      const reason = processLine(buffer);
+      const writeErr = await writeChunk(buffer);
+      if (writeErr) { safeCancel(reader); return { usage: state.usage, err: writeErr }; }
+      if (reason) return invalid(reason);
     }
   } catch {
-    // read() 拒绝：客户端断开（res close → abort）或上游 socket 死亡
+    // read() 拒绝：客户端断开（abort 致 read 拒绝）或上游 socket 死亡
     safeCancel(reader);
-    return { usage, err: isClientGone() ? "client" : "upstream" };
+    return { usage: state.usage, err: isClientGone() ? "client" : "upstream" };
   }
+  const reason = finishSseValidation(state);
+  if (reason) return invalid(reason);
   try { res.end(); } catch {}
-  return { usage, err: null };
+  return { usage: state.usage, err: null };
 }
 
 function sleep(ms) {
@@ -427,7 +581,8 @@ export async function handleGateway(req, res, url) {
 
       if (upRes.status === 200) {
         const ct = upRes.headers.get("content-type") || "";
-        const isStream = stream && ct.includes("text/event-stream");
+        const protocol = responseProtocol(upstreamPath);
+        const isStream = stream && protocol !== "models" && ct.toLowerCase().includes("text/event-stream");
         const headers = { "content-type": ct || (isStream ? "text/event-stream" : "application/json") };
         if (isStream) {
           headers["cache-control"] = "no-cache";
@@ -436,11 +591,27 @@ export async function handleGateway(req, res, url) {
         // 客户端断开检测复用 res 'close'（activeAc 已指向本尝试的 controller）：
         // 断开即 abort 上游拉取，pipeBody 走中断路径；不记成功事件。
         const isClientGone = () => clientGone || ac.signal.aborted;
-        res.writeHead(200, headers);
+        if (stream && protocol !== "models" && !isStream) {
+          // stream 请求收到非 SSE 200 时不能把完整 JSON 当作成功，更不能切 Key
+          // 重放（上游已经接受了本次请求）；先取消未消费的 body，再返回明确 502。
+          try { await upRes.body?.cancel(); } catch {}
+          activeAc = null;
+          stats.appendEvent({ keyId: chosen.id, model, stream: true, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+          if (clientGone || res.writableEnded || res.destroyed) return;
+          sendJson(res, 502, { error: { message: "Upstream returned a non-SSE response for a stream request", type: "proxy_error" } });
+          return;
+        }
+        if (isStream) res.writeHead(200, headers);
         let usage = null;
         let pipeErr = null;
+        let pipeReason = "";
+        let responseBody = null;
         try {
-          ({ usage, err: pipeErr } = await pipeBody(upRes, res, isStream, isClientGone));
+          const result = await pipeBody(upRes, res, isStream, isClientGone, protocol);
+          usage = result.usage;
+          pipeErr = result.err;
+          pipeReason = result.reason || "";
+          responseBody = result.body || null;
         } catch {
           // pipeBody 已不抛出；此处纯兜底（如 writeHead/end 意外抛错）
           pipeErr = isClientGone() ? "client" : "upstream";
@@ -451,13 +622,21 @@ export async function handleGateway(req, res, url) {
           return;
         }
         if (pipeErr === "client") return;
-        if (pipeErr === "upstream") {
-          // 上游中途断连：200 头 + 部分内容已写出，不能重试（会重复输出）；
-          // 必须收尾 res——否则客户端在 keep-alive 下收不到流终止信号，挂起到自身超时。
-          // destroy 前 activeAc 已置 null，'close' 置位的 clientGone 不再影响本请求（已 return）。
+        if (pipeErr) {
+          // 流式路径可能已经写出 200 头或部分内容，协议错误与上游断流一样只能
+          // 终止当前连接，绝不能换 Key 重放；非流式尚未写头，返回可解析的 502。
           stats.appendEvent({ keyId: chosen.id, model, stream: isStream, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
-          try { res.destroy(); } catch {}
+          if (isStream) {
+            try { res.destroy(); } catch {}
+          } else if (!clientGone && !res.writableEnded && !res.destroyed) {
+            sendJson(res, 502, { error: { message: pipeReason || "Invalid response from upstream", type: "proxy_error" } });
+          }
           return;
+        }
+        if (!isStream) {
+          if (!responseBody || clientGone || res.writableEnded || res.destroyed) return;
+          res.writeHead(200, headers);
+          res.end(responseBody);
         }
         pool.recordSuccess(chosen.id, attempt);
         stats.appendEvent({

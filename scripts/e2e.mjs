@@ -285,15 +285,15 @@ function rawGwOnce(bodyObj, timeoutMs = 8000) {
       res = response;
       let txt = "";
       response.on("data", (c) => (txt += c));
-      response.on("end", () => finish({ outcome: "end", ms: Math.round(performance.now() - t0), txt }));
-      response.on("aborted", () => finish({ outcome: "aborted", ms: Math.round(performance.now() - t0), txt }));
-      response.on("error", (e) => finish({ outcome: "error:" + (e.code || e.message), ms: Math.round(performance.now() - t0), txt }));
+      response.on("end", () => finish({ outcome: "end", status: response.statusCode, ms: Math.round(performance.now() - t0), txt }));
+      response.on("aborted", () => finish({ outcome: "aborted", status: response.statusCode, ms: Math.round(performance.now() - t0), txt }));
+      response.on("error", (e) => finish({ outcome: "error:" + (e.code || e.message), status: response.statusCode, ms: Math.round(performance.now() - t0), txt }));
     });
-    req.on("error", (e) => finish({ outcome: "error:" + (e.code || e.message), ms: Math.round(performance.now() - t0), txt: "" }));
+    req.on("error", (e) => finish({ outcome: "error:" + (e.code || e.message), status: res?.statusCode, ms: Math.round(performance.now() - t0), txt: "" }));
     timer = trackedTimeout(() => {
       try { res?.destroy(); } catch {}
       try { req.destroy(); } catch {}
-      finish({ outcome: "timeout", ms: Math.round(performance.now() - t0), txt: "" });
+      finish({ outcome: "timeout", status: res?.statusCode, ms: Math.round(performance.now() - t0), txt: "" });
     }, timeoutMs);
     req.end(JSON.stringify(bodyObj));
   });
@@ -891,6 +891,76 @@ async function main() {
     ? bad("cutbody 拒绝噪音", mgrStderr.slice(stderrMark2).trim().split("\n").slice(0, 3).join(" | "))
     : ok("非流式断连无 unhandledRejection 噪音");
 
+  // ── T9e HTTP 200 响应完整性与成功统计门禁（F08）──
+  console.log("\n=== T9e HTTP 200 response completeness (F08) ===");
+  await restartClean();
+  const protocolEvent = async (model) => {
+    await sleep(120);
+    const history = JSON.parse((await admin("/admin/api/history?keyId=" + idA9b + "&pageSize=500")).body).items;
+    return history.find((event) => event.model === model) || null;
+  };
+  const assertInvalidJson200 = async (mode, label) => {
+    const model = "m-f08-" + mode;
+    await mock("/__reset");
+    await mock("/__control", { auth: "user_keyA", responses: [{ mode }] });
+    const result = await gw({ model, messages: [] });
+    const callsF08 = JSON.parse((await mockGet("/__calls")).body).calls;
+    const event = await protocolEvent(model);
+    const keyHealth = (await keysList()).find((key) => key.alias === "keyA").health;
+    result.status === 502 && callsF08.length === 1 && event && event.ok === false && event.status === 502 &&
+      event.errorKind === "upstream" && keyHealth.failCount === 0 && keyHealth.backoffUntilMs <= Date.now()
+      ? ok(label + " → 502、单次调用、失败事件且不退避")
+      : bad(label + " 门禁", JSON.stringify({ result, calls: callsF08, event, health: keyHealth }));
+    const successEvents = JSON.parse((await admin("/admin/api/history?keyId=" + idA9b + "&status=200&pageSize=500")).body).items;
+    successEvents.some((event200) => event200.model === model)
+      ? bad(label + " 被误记为成功", JSON.stringify(successEvents.find((event200) => event200.model === model)))
+      : ok(label + " 无 ok:true/status:200 成功事件");
+  };
+  await assertInvalidJson200("empty", "clean EOF 空 JSON body");
+  await assertInvalidJson200("truncated", "clean EOF 截断 JSON");
+  await assertInvalidJson200("malformed", "clean EOF 畸形 JSON");
+  await assertInvalidJson200("missingstructure", "JSON 缺少必要 choices 结构");
+
+  const assertInvalidSse200 = async (mode, label) => {
+    const model = "m-f08-" + mode;
+    await mock("/__reset");
+    await mock("/__control", { auth: "user_keyA", responses: [{ mode }] });
+    const result = await rawGwOnce({ model, messages: [], stream: true });
+    const callsF08 = JSON.parse((await mockGet("/__calls")).body).calls;
+    const event = await protocolEvent(model);
+    const keyHealth = (await keysList()).find((key) => key.alias === "keyA").health;
+    result.outcome !== "timeout" && result.outcome !== "end" && (result.status === 200 || result.status === undefined) && callsF08.length === 1 &&
+      event && event.ok === false && event.status === 502 && event.errorKind === "upstream" &&
+      keyHealth.failCount === 0 && keyHealth.backoffUntilMs <= Date.now()
+      ? ok(label + " → 200 头后有限终止、单次调用、失败事件且不退避")
+      : bad(label + " 门禁", JSON.stringify({ result, calls: callsF08, event, health: keyHealth }));
+    const successEvents = JSON.parse((await admin("/admin/api/history?keyId=" + idA9b + "&status=200&pageSize=500")).body).items;
+    successEvents.some((event200) => event200.model === model)
+      ? bad(label + " 被误记为成功", JSON.stringify(successEvents.find((event200) => event200.model === model)))
+      : ok(label + " 无 ok:true/status:200 成功事件");
+  };
+  await assertInvalidSse200("empty_sse", "SSE clean EOF 空 body");
+  await assertInvalidSse200("missingdone", "SSE clean EOF 缺少 [DONE]");
+  await assertInvalidSse200("unterminateddone", "SSE 最终 [DONE] 缓冲区未闭合");
+  await assertInvalidSse200("malformed_sse", "SSE 畸形事件");
+
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "ok" }] });
+  r = await gw({ model: "m-f08-non-sse", messages: [], stream: true });
+  const nonSseCalls = JSON.parse((await mockGet("/__calls")).body).calls;
+  const nonSseEvent = await protocolEvent("m-f08-non-sse");
+  r.status === 502 && nonSseCalls.length === 1 && nonSseEvent && nonSseEvent.ok === false && nonSseEvent.status === 502
+    ? ok("stream 请求收到 JSON 200 → 明确 502 且不重放")
+    : bad("stream 非 SSE 200 门禁", JSON.stringify({ result: r, calls: nonSseCalls, event: nonSseEvent }));
+
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "split_sse" }] });
+  r = await gw({ model: "m-f08-split", messages: [], stream: true });
+  const splitEvent = await protocolEvent("m-f08-split");
+  r.status === 200 && r.body.includes("[DONE]") && splitEvent && splitEvent.ok === true && splitEvent.status === 200
+    ? ok("SSE 跨 chunk 拆分后仍按完整帧解析并成功")
+    : bad("SSE 跨 chunk 正常路径", JSON.stringify({ result: r, event: splitEvent }));
+
   // ── T9d 上游脏 usage 净化（P1-6：字符串/对象/null usage 不得入 stats/历史）──
   console.log("\n=== T9d bad usage sanitization (P1-6) ===");
   await restartClean();
@@ -1313,12 +1383,20 @@ async function main() {
   await restartClean();
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "ok" }] });
   r = await http1(MG + "/v1/models", "GET", { Authorization: "Bearer " + CLIENT });
-  r.status === 200 ? ok("/v1/models 透传") : bad("/v1/models", "status=" + r.status + " " + r.body.slice(0, 120));
+  let modelsBody = null;
+  try { modelsBody = JSON.parse(r.body); } catch {}
+  r.status === 200 && modelsBody?.object === "list" && Array.isArray(modelsBody?.data)
+    ? ok("/v1/models 透传且通过模型列表完整性门禁")
+    : bad("/v1/models", "status=" + r.status + " " + r.body.slice(0, 120));
   r.headers["content-security-policy"] === undefined ? ok("/v1/models 无 CSP（网关面不加）") : bad("/v1 CSP 越界", JSON.stringify(r.headers["content-security-policy"]));
   r = await http1(MG + "/v1/models", "GET", {});
   r.status === 401 ? ok("/v1/models 鉴权") : bad("/v1/models auth", "status=" + r.status);
   r = await http1(MG + "/v1/messages", "POST", { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT }, JSON.stringify({ model: "claude-sonnet-4-6", messages: [{ role: "user", content: "x" }] }));
-  r.status === 200 ? ok("/v1/messages 路由到上游") : bad("/v1/messages", "status=" + r.status + " " + r.body.slice(0, 120));
+  let messagesBody = null;
+  try { messagesBody = JSON.parse(r.body); } catch {}
+  r.status === 200 && messagesBody?.type === "message" && messagesBody?.role === "assistant" && Array.isArray(messagesBody?.content)
+    ? ok("/v1/messages 路由到上游且通过 Anthropic JSON 完整性门禁")
+    : bad("/v1/messages", "status=" + r.status + " " + r.body.slice(0, 120));
 
   // ── T20 删除 Key ──
   console.log("\n=== T20 delete ===");

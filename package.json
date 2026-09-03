@@ -11,9 +11,10 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
-    "test": "node scripts/unit.mjs && node scripts/e2e.mjs && bash scripts/test-sync-upstream.sh",
+    "test": "node scripts/unit.mjs && node scripts/e2e.mjs && node scripts/test-server-lifecycle.mjs && bash scripts/test-sync-upstream.sh",
     "test:unit": "node scripts/unit.mjs",
     "test:e2e": "node scripts/e2e.mjs",
+    "test:lifecycle": "node scripts/test-server-lifecycle.mjs",
     "sync:upstream": "bash scripts/sync-upstream.sh",
     "docker:build": "docker build -t commandcode-proxy-manager:latest .",
     "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy-manager:latest ."

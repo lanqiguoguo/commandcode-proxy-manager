@@ -13,6 +13,7 @@ import { handleGateway } from "./gateway.mjs";
 import { initAdminApi, handleAdmin, isAdminRequestAuthed } from "./adminApi.mjs";
 import { flushAllPending } from "./state.mjs";
 import { getPersistenceStatus } from "./persistence.mjs";
+import { createServerLifecycle } from "./serverLifecycle.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -31,10 +32,19 @@ attachConsoleCapture();
 
 // 1) 启动上游（vendored，同进程动态 import，零改动）
 //    EMBED_UPSTREAM=0 时不嵌入（便于独立部署上游/测试，转发仍走 UPSTREAM_HOST:UPSTREAM_PORT）
+let embeddedUpstream = null;
 if (process.env.EMBED_UPSTREAM !== "0") {
   process.env.PORT = String(cfg.upstreamPort);
   process.env.HOST = cfg.upstreamHost;
-  await import(resolve(__dirname, "..", "upstream", "proxy.mjs"));
+  process.env.CC_EMBEDDED_UPSTREAM = "1";
+  try {
+    embeddedUpstream = await import(resolve(__dirname, "..", "upstream", "proxy.mjs"));
+    if (embeddedUpstream.ready) await embeddedUpstream.ready;
+  } catch (e) {
+    console.error(`[manager] embedded upstream startup failed: ${e.code || "ERROR"} ${e.message}`);
+    process.exitCode = 1;
+    process.exit(1);
+  }
 }
 
 // 2) 子系统
@@ -60,6 +70,11 @@ function sendJson(res, status, data) {
 }
 
 const server = http.createServer(async (req, res) => {
+  if (managerLifecycle.isClosing()) {
+    res.setHeader("Connection", "close");
+    sendJson(res, 503, { error: { message: "Server is shutting down", type: "server_shutdown" } });
+    return;
+  }
   const host = req.headers.host || "localhost";
   let url;
   try {
@@ -162,7 +177,35 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(cfg.port, cfg.host, () => {
+const managerLifecycle = createServerLifecycle(server, { label: "manager" });
+
+let shutdownPromise = null;
+function shutdown(exitCode = 0, reason = "signal") {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    let finalExitCode = exitCode;
+    console.log(`[manager] shutdown started (${reason})`);
+    // Flush before closing listeners so writes triggered by the signal are
+    // durable before the process can be forced out.
+    flushAllPending();
+    try {
+      // Close the public gateway first. Active gateway requests may still be
+      // using the embedded upstream, so upstream is closed only after the
+      // manager has drained or force-terminated those requests.
+      await managerLifecycle.close();
+      if (embeddedUpstream?.shutdownUpstream) await embeddedUpstream.shutdownUpstream();
+    } catch (e) {
+      finalExitCode = 1;
+      console.error(`[manager] shutdown cleanup failed: ${e.message}`);
+    }
+    flushAllPending();
+    process.exitCode = finalExitCode;
+    process.exit(finalExitCode);
+  })();
+  return shutdownPromise;
+}
+
+function onManagerListening() {
   console.log("[manager] CC Proxy Manager started: http://" + cfg.host + ":" + cfg.port);
   console.log("[manager] admin UI: http://" + cfg.host + ":" + cfg.port + "/admin");
   console.log("[manager] data dir: " + DATA_DIR);
@@ -176,16 +219,25 @@ server.listen(cfg.port, cfg.host, () => {
   if (pool.listKeys().length) {
     quota.refreshAll().catch(() => {});
   }
-});
+}
 
-// P2-4：进入即先同步 flush 防抖待写数据（state.json/quota-cache.json），再走优雅
-// 关闭。SSE 常连接会让 server.close 回调永不触发——2s 兜底硬退出前数据已落盘。
-// 重复信号（连按 Ctrl-C）安全：flushAllPending 对已 flush 的 writer 幂等 no-op。
+// Stop accepting requests first, then let active work finish within the
+// lifecycle controller's finite grace period. A second signal is harmless.
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
+    if (shutdownPromise) {
+      console.log(`[manager] received ${sig}; shutdown already in progress`);
+      return;
+    }
     console.log("[manager] received " + sig + ", shutting down");
-    flushAllPending();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
+    shutdown(0, sig).catch((e) => {
+      console.error(`[manager] shutdown failed: ${e.message}`);
+      process.exit(1);
+    });
   });
 }
+
+managerLifecycle.listen(cfg.port, cfg.host, onManagerListening).catch((e) => {
+  console.error(`[manager] startup failed: ${e.code || "ERROR"} ${e.message}`);
+  shutdown(1, "listen failure").catch(() => process.exit(1));
+});

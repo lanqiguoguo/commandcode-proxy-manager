@@ -255,6 +255,9 @@ done
 if ! sed -i 's/"host": "0.0.0.0"/"host": "127.0.0.1"/' "$STAGE/config.json"; then
   die "无法改写暂存 config.json"
 fi
+if ! node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$STAGE/proxy.mjs"; then
+  die "无法对暂存 proxy.mjs 应用稳定的生命周期补丁（upstream/ 未改动）"
+fi
 if ! node --input-type=module --check < "$STAGE/proxy.mjs"; then
   die "vendored proxy.mjs 语法校验失败，放弃本次同步（upstream/ 未改动）"
 fi

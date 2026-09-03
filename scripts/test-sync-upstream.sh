@@ -33,7 +33,52 @@ cd "$UP"
 git init -q -b master .
 git config user.email fixture@test.local
 git config user.name fixture
-printf '%s\n' 'export const MARKER = "release-build";' > proxy.mjs
+write_fixture_proxy() {
+  local marker=$1
+  cat > proxy.mjs <<EOF
+import http from 'http';
+
+const CFG = { port: Number(process.env.PORT || 0), host: process.env.HOST || '127.0.0.1' };
+export const MARKER = "$marker";
+async function refreshCCVersion() {}
+const CC_VERSION_REFRESH_MS = 86400000;
+refreshCCVersion();
+setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+
+const sessionStore = new Map();
+const keyStateStore = new Map();
+// 定期清理过期 session
+setInterval(() => {
+  for (const [key, entry] of sessionStore) {
+    if (Date.now() >= entry.expiresAt) {
+      sessionStore.delete(key);
+      keyStateStore.delete(key);
+    }
+  }
+}, 60 * 60 * 1000);
+function getSessionId() { return 'fixture'; }
+
+function sendJSON(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+    return;
+  }
+  sendJSON(res, 200, { marker: MARKER });
+});
+
+server.listen(CFG.port, CFG.host, () => {
+  const address = server.address();
+  console.log('FIXTURE_READY ' + (typeof address === 'object' && address ? address.port : CFG.port));
+});
+EOF
+}
+write_fixture_proxy release-build
 printf '{\n  "host": "0.0.0.0",\n  "port": 3050\n}\n' > config.json
 printf '{\n  "name": "commandcode-proxy",\n  "version": "9.9.9"\n}\n' > package.json
 git add .
@@ -41,7 +86,7 @@ git commit -qm "release content"
 git tag v9.9.9
 
 # tag 之后再推 master-only commit，用于证明 release 路径不是 mutable master。
-printf '%s\n' 'export const MARKER = "master-build";' > proxy.mjs
+write_fixture_proxy master-build
 git commit -qam "master-only change"
 
 # Git tree 能表达的非普通输入包括 symlink 和目录；其它非普通文件仍由
@@ -54,7 +99,7 @@ git add -A
 git commit -qm "symlink payload"
 git tag v9.9.10
 rm proxy.mjs
-printf '%s\n' 'export const MARKER = "master-restored";' > proxy.mjs
+write_fixture_proxy master-restored
 git commit -qam "restore regular proxy"
 
 rm config.json
@@ -124,8 +169,10 @@ API_BASE="http://127.0.0.1:$API_PORT"
 
 # ---------- 构造假目标仓库（跑 sync 脚本的地方） ----------
 FAKE="$T/fake-repo"
-mkdir -p "$FAKE/scripts" "$FAKE/upstream"
+mkdir -p "$FAKE/scripts" "$FAKE/src" "$FAKE/upstream"
 cp "$ROOT_DIR/scripts/sync-upstream.sh" "$FAKE/scripts/"
+cp "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$FAKE/scripts/"
+cp "$ROOT_DIR/src/serverLifecycle.mjs" "$FAKE/src/"
 printf 'old-proxy\n' > "$FAKE/upstream/proxy.mjs"
 printf 'old-config\n' > "$FAKE/upstream/config.json"
 printf 'old-package\n' > "$FAKE/upstream/package.json"
@@ -184,6 +231,71 @@ if grep -Fq '"host": "0.0.0.0"' "$FAKE/upstream/config.json"; then fail "release
 ok "release sed host 改写生效"
 echo "$OUT1" | grep -Fq 'Fetching upstream release v9.9.9' || fail "release 应走 release 路径"
 ok "release HTTP/JSON/tag/commit 校验后同步"
+
+# ---------- 用例 1b：生命周期补丁只应用一次且重复输入字节不变 ----------
+assert_patch_applies_once() {
+  local label=$1
+  local target=$2
+  local first second before after
+  first=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
+  echo "--- $label first patch ---"; echo "$first"
+  echo "$first" | grep -Fq "upstream lifecycle patch applied" || fail "$label 首次应应用补丁"
+  cp -p "$target" "$target.before-second"
+  second=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
+  echo "--- $label second patch ---"; echo "$second"
+  echo "$second" | grep -Fq "upstream lifecycle patch already present" || fail "$label 重复执行应报告 already present"
+  cmp -- "$target.before-second" "$target" || fail "$label 重复执行改变了字节"
+  ok "$label clean input 应用一次，重复输入字节不变"
+}
+
+assert_patch_rejection() {
+  local label=$1
+  local target=$2
+  local message=$3
+  local output
+  cp -p "$target" "$target.before-rejection"
+  if output=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1); then
+    echo "$output"
+    fail "$label 应拒绝"
+  fi
+  echo "--- $label rejection ---"; echo "$output"
+  echo "$output" | grep -Fq "$message" || fail "$label 缺少明确诊断"
+  cmp -- "$target.before-rejection" "$target" || fail "$label 拒绝时修改了字节"
+  ok "$label 拒绝且输入字节保持不变"
+}
+
+CURRENT_CLEAN="$T/current-upstream-clean.mjs"
+git show HEAD:upstream/proxy.mjs > "$CURRENT_CLEAN"
+assert_patch_applies_once "当前上游 fixture" "$CURRENT_CLEAN"
+
+RELEASE_CLEAN="$T/release-upstream-clean.mjs"
+git -C "$UP" show "$TAG_COMMIT:proxy.mjs" > "$RELEASE_CLEAN"
+assert_patch_applies_once "release test fixture" "$RELEASE_CLEAN"
+
+PATCHED_RELEASE="$T/release-upstream-patched.mjs"
+cp -p "$FAKE/upstream/proxy.mjs" "$PATCHED_RELEASE"
+PATCHED_RELEASE_BEFORE="$T/release-upstream-patched.before"
+cp -p "$PATCHED_RELEASE" "$PATCHED_RELEASE_BEFORE"
+PATCHED_RELEASE_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$PATCHED_RELEASE" 2>&1)
+echo "--- already patched byte check ---"; echo "$PATCHED_RELEASE_OUT"
+echo "$PATCHED_RELEASE_OUT" | grep -Fq "upstream lifecycle patch already present" || fail "已补丁输入应报告 already present"
+cmp -- "$PATCHED_RELEASE_BEFORE" "$PATCHED_RELEASE" || fail "已补丁输入重复执行改变了字节"
+ok "已补丁 upstream/proxy.mjs 重复执行字节完全不变"
+
+DUP_MARKER="$T/duplicate-marker.mjs"
+cp -p "$PATCHED_RELEASE" "$DUP_MARKER"
+printf '\n// CCPM_LIFECYCLE_PATCH_V1\n' >> "$DUP_MARKER"
+assert_patch_rejection "重复 lifecycle marker" "$DUP_MARKER" "生命周期标记重复"
+
+DUP_UNREF="$T/duplicate-unref.mjs"
+cp -p "$PATCHED_RELEASE" "$DUP_UNREF"
+sed -i '/^ccVersionRefreshTimer\.unref?\.();$/a ccVersionRefreshTimer.unref?.();' "$DUP_UNREF"
+assert_patch_rejection "重复 timer unref" "$DUP_UNREF" "CC refresh timer unref 不是唯一一处"
+
+OLD_INLINE="$T/old-inline-patch.mjs"
+cp -p "$RELEASE_CLEAN" "$OLD_INLINE"
+printf '\nfunction createProxyLifecycle() {}\n' >> "$OLD_INLINE"
+assert_patch_rejection "旧 inline lifecycle patch" "$OLD_INLINE" "仍残留旧 inline lifecycle 实现"
 
 # ---------- 用例 2：只有明确的空 release 才允许 fallback ----------
 OUT2=$(run_sync "$API_BASE/empty-404" 2>&1)

@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createServerLifecycle } from "../src/serverLifecycle.mjs";
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -138,7 +139,8 @@ async function refreshCCVersion() {
   }
 }
 refreshCCVersion(); // 启动时立即拉取
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+const ccVersionRefreshTimer = setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+ccVersionRefreshTimer.unref?.();
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
 const MAX_BODY_SIZE = (() => {
@@ -186,7 +188,7 @@ function ensureSession(apiKey) {
 }
 
 // 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
+const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
@@ -197,7 +199,8 @@ setInterval(() => {
     }
   }
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
+}, 60 * 60 * 1000);
+sessionCleanupTimer.unref?.();
 
 function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
@@ -2002,6 +2005,17 @@ function handleHealth(req, res) {
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
+  // CCPM_LIFECYCLE_GUARD_V1
+  if (upstreamLifecycle.isClosing()) {
+    res.setHeader('Connection', 'close');
+    sendJSON(res, 503, { error: { message: 'Server is shutting down', type: 'server_shutdown' } });
+    return;
+  }
+
+
+
+
+
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -2042,7 +2056,19 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-server.listen(CFG.port, CFG.host, () => {
+// CCPM_LIFECYCLE_PATCH_V1
+const upstreamLifecycle = createServerLifecycle(server, { label: "embedded upstream" });
+
+function clearBackgroundTimers() {
+  clearInterval(ccVersionRefreshTimer);
+  clearInterval(sessionCleanupTimer);
+}
+
+export async function shutdownUpstream() {
+  clearBackgroundTimers();
+  return upstreamLifecycle.close();
+}
+export const ready = upstreamLifecycle.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
@@ -2054,3 +2080,20 @@ server.listen(CFG.port, CFG.host, () => {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });
+ready.catch(() => clearBackgroundTimers());
+await ready;
+
+if (process.env.CC_EMBEDDED_UPSTREAM !== '1') {
+  let standaloneShutdown = null;
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => {
+      if (standaloneShutdown) return;
+      standaloneShutdown = shutdownUpstream()
+        .then(() => process.exit(0))
+        .catch((error) => {
+          console.error('[embedded upstream] shutdown failed: ' + error.message);
+          process.exit(1);
+        });
+    });
+  }
+}

@@ -11,13 +11,14 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
-    "test": "node scripts/unit.mjs && node scripts/e2e.mjs && node scripts/test-server-lifecycle.mjs && node scripts/test-admin-body.mjs && node scripts/test-admin-boundaries.mjs && node scripts/test-upstream-initialization.mjs && bash scripts/test-sync-upstream.sh",
+    "test": "node scripts/unit.mjs && node scripts/e2e.mjs && node scripts/test-server-lifecycle.mjs && node scripts/test-admin-body.mjs && node scripts/test-admin-boundaries.mjs && node scripts/test-upstream-initialization.mjs && node scripts/test-upstream-version.mjs && bash scripts/test-sync-upstream.sh",
     "test:unit": "node scripts/unit.mjs",
     "test:e2e": "node scripts/e2e.mjs",
     "test:lifecycle": "node scripts/test-server-lifecycle.mjs",
     "test:admin-body": "node scripts/test-admin-body.mjs",
     "test:admin-boundaries": "node scripts/test-admin-boundaries.mjs",
     "test:upstream-init": "node scripts/test-upstream-initialization.mjs",
+    "test:upstream-version": "node scripts/test-upstream-version.mjs",
     "sync:upstream": "bash scripts/sync-upstream.sh",
     "docker:build": "docker build -t commandcode-proxy-manager:latest .",
     "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy-manager:latest ."

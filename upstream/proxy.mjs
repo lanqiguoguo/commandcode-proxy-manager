@@ -119,28 +119,147 @@ function generateFingerprint() {
   };
 }
 
-let CC_VERSION = '0.32.3';
-const CC_VERSION_FALLBACK = '0.32.3';
-const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
+// CCPM_VERSION_PATCH_V1
+// Keep the protocol version fixed at sync/build time by default.
+const CC_VERSION_FALLBACK = "0.32.3";
+const CC_VERSION_BUILD = CC_VERSION_FALLBACK;
+let CC_VERSION = CC_VERSION_BUILD;
+const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // Fixed 24h refresh boundary
+const CC_VERSION_REGISTRY_URL = 'https://registry.npmjs.org/command-code/latest';
+const CC_VERSION_REFRESH_TIMEOUT_DEFAULT_MS = 5000;
+const CC_VERSION_RESPONSE_MAX_BYTES = 16 * 1024;
+const CC_VERSION_MAX_PATCH_AHEAD = 100;
+const CC_VERSION_REFRESH_ENABLED = process.env.CC_ENABLE_VERSION_REFRESH === '1';
 
-// ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
-async function refreshCCVersion() {
-  try {
-    const url = 'https://registry.npmjs.org/command-code/latest';
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) throw new Error(`npm responded with ${res.status}`);
-    const pkg = await res.json();
-    if (pkg.version && typeof pkg.version === 'string') {
-      CC_VERSION = pkg.version;
-      log('info', 'CC Version refreshed from npm', { version: CC_VERSION });
+function configuredCCVersionRefreshIntervalMs() {
+  const value = Number(process.env.CC_VERSION_REFRESH_INTERVAL_MS);
+  return Number.isSafeInteger(value) && value >= 50 && value <= CC_VERSION_REFRESH_MS
+    ? value
+    : CC_VERSION_REFRESH_MS;
+}
+
+const CC_VERSION_REFRESH_INTERVAL_MS = configuredCCVersionRefreshIntervalMs();
+
+function configuredCCVersionRefreshTimeoutMs() {
+  const value = Number(process.env.CC_VERSION_REFRESH_TIMEOUT_MS);
+  return Number.isSafeInteger(value) && value >= 50 && value <= 10000
+    ? value
+    : CC_VERSION_REFRESH_TIMEOUT_DEFAULT_MS;
+}
+
+const CC_VERSION_REFRESH_TIMEOUT_MS = configuredCCVersionRefreshTimeoutMs();
+
+function parseStableSemver(value) {
+  if (typeof value !== 'string') return null;
+  const match = value.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+  if (!match) return null;
+  const parts = match.slice(1).map(Number);
+  if (!parts.every(Number.isSafeInteger)) return null;
+  return { value, major: parts[0], minor: parts[1], patch: parts[2] };
+}
+
+const CC_VERSION_FALLBACK_SEMVER = parseStableSemver(CC_VERSION_FALLBACK);
+if (!CC_VERSION_FALLBACK_SEMVER) throw new Error('Invalid fixed CC_VERSION_FALLBACK');
+
+function isAllowedCCVersion(candidate) {
+  const version = parseStableSemver(candidate);
+  const current = parseStableSemver(CC_VERSION) || CC_VERSION_FALLBACK_SEMVER;
+  return version &&
+    version.major === CC_VERSION_FALLBACK_SEMVER.major &&
+    version.minor === CC_VERSION_FALLBACK_SEMVER.minor &&
+    version.patch >= CC_VERSION_FALLBACK_SEMVER.patch &&
+    version.patch >= current.patch &&
+    version.patch <= CC_VERSION_FALLBACK_SEMVER.patch + CC_VERSION_MAX_PATCH_AHEAD
+    ? version
+    : null;
+}
+
+async function readCCVersionResponseBody(response) {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength !== null) {
+    if (!/^(0|[1-9]\d*)$/.test(contentLength.trim())) {
+      throw new Error('registry response content-length is invalid');
     }
-  } catch (e) {
-    log('warn', 'CC Version fetch failed, using current', { version: CC_VERSION, error: e.message });
+    const declaredLength = Number(contentLength);
+    if (!Number.isSafeInteger(declaredLength) || declaredLength > CC_VERSION_RESPONSE_MAX_BYTES) {
+      throw new Error('registry response is too large');
+    }
+  }
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > CC_VERSION_RESPONSE_MAX_BYTES) {
+        try { await reader.cancel(); } catch {}
+        throw new Error('registry response is too large');
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function refreshCCVersion() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CC_VERSION_REFRESH_TIMEOUT_MS);
+  timeout.unref?.();
+  try {
+    const response = await fetch(CC_VERSION_REGISTRY_URL, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('registry responded with HTTP ' + response.status);
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType && !/json/i.test(contentType)) throw new Error('registry response is not JSON');
+    let payload;
+    try { payload = JSON.parse(await readCCVersionResponseBody(response)); }
+    catch (error) { throw new Error('registry response JSON is invalid: ' + (error?.message || String(error))); }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.version !== 'string') {
+      throw new Error('registry response must contain a string version');
+    }
+    const accepted = isAllowedCCVersion(payload.version);
+    if (!accepted) throw new Error('registry version is outside the allowed stable range');
+    CC_VERSION = accepted.value;
+    log('info', 'CC Version refreshed from allowlisted registry', { version: CC_VERSION });
+    return true;
+  } catch (error) {
+    try { controller.abort(); } catch {}
+    const message = error instanceof Error ? error.message : String(error);
+    log('warn', 'CC Version registry refresh ignored; fixed version retained', { version: CC_VERSION, error: message });
+    return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
-refreshCCVersion(); // 启动时立即拉取
-const ccVersionRefreshTimer = setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+
+let ccVersionRefreshFlight = null;
+function scheduleCCVersionRefresh() {
+  if (ccVersionRefreshFlight) return ccVersionRefreshFlight;
+  ccVersionRefreshFlight = refreshCCVersion()
+    .catch((error) => {
+      log('warn', 'CC Version refresh task failed; fixed version retained', { version: CC_VERSION, error: error?.message || String(error) });
+      return false;
+    })
+    .finally(() => { ccVersionRefreshFlight = null; });
+  ccVersionRefreshFlight.catch(() => {});
+  return ccVersionRefreshFlight;
+}
+
+// Registry access is opt-in. A failed attempt leaves the fixed version untouched;
+// the next 24h boundary retries when refresh is enabled.
+const ccVersionRefreshTimer = setInterval(() => {
+  if (CC_VERSION_REFRESH_ENABLED) void scheduleCCVersionRefresh();
+}, CC_VERSION_REFRESH_INTERVAL_MS);
 ccVersionRefreshTimer.unref?.();
+if (CC_VERSION_REFRESH_ENABLED) void scheduleCCVersionRefresh();
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
 const MAX_BODY_SIZE = (() => {

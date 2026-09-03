@@ -40,15 +40,21 @@ import http from 'http';
 
 const CFG = { port: Number(process.env.PORT || 0), host: process.env.HOST || '127.0.0.1' };
 export const MARKER = "$marker";
+let CC_VERSION = '0.32.3';
+const CC_VERSION_FALLBACK = '0.32.3';
+const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000;
+const versionRegistryUrl = 'https://registry.npmjs.org/command-code/latest';
+void versionRegistryUrl;
 async function refreshCCVersion() {}
-const CC_VERSION_REFRESH_MS = 86400000;
 refreshCCVersion();
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
 function generateFingerprint() {
   return { components: { platform: 'fixture', arch: 'x64' } };
 }
-const CC_VERSION = 'fixture';
+
+// 请求体大小上限
+const MAX_BODY_SIZE = 100 * 1024 * 1024;
 
 const sessionStore = new Map();
 // 定期清理过期 session
@@ -225,6 +231,7 @@ mkdir -p "$FAKE/scripts" "$FAKE/src" "$FAKE/upstream"
 cp "$ROOT_DIR/scripts/sync-upstream.sh" "$FAKE/scripts/"
 cp "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$FAKE/scripts/"
 cp "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$FAKE/scripts/"
+cp "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$FAKE/scripts/"
 cp "$ROOT_DIR/src/serverLifecycle.mjs" "$FAKE/src/"
 printf 'old-proxy\n' > "$FAKE/upstream/proxy.mjs"
 printf 'old-config\n' > "$FAKE/upstream/config.json"
@@ -292,13 +299,17 @@ assert_patch_applies_once() {
   local first second before after
   first=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
   first+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$target" 2>&1)
+  first+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$target" 2>&1)
   echo "--- $label first patch ---"; echo "$first"
   echo "$first" | grep -Fq "upstream lifecycle patch applied" || fail "$label 首次应应用补丁"
+  echo "$first" | grep -Fq "upstream version patch applied" || fail "$label 首次应应用版本补丁"
   cp -p "$target" "$target.before-second"
   second=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
   second+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$target" 2>&1)
+  second+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$target" 2>&1)
   echo "--- $label second patch ---"; echo "$second"
   echo "$second" | grep -Fq "upstream lifecycle patch already present" || fail "$label 重复执行应报告 already present"
+  echo "$second" | grep -Fq "upstream version patch already present" || fail "$label 重复执行版本补丁应报告 already present"
   cmp -- "$target.before-second" "$target" || fail "$label 重复执行改变了字节"
   ok "$label clean input 应用一次，重复输入字节不变"
 }
@@ -319,6 +330,22 @@ assert_patch_rejection() {
   ok "$label 拒绝且输入字节保持不变"
 }
 
+assert_version_patch_rejection() {
+  local label=$1
+  local target=$2
+  local message=$3
+  local output
+  cp -p "$target" "$target.before-version-rejection"
+  if output=$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$target" 2>&1); then
+    echo "$output"
+    fail "$label 应拒绝"
+  fi
+  echo "--- $label version rejection ---"; echo "$output"
+  echo "$output" | grep -Fq "$message" || fail "$label 缺少明确诊断"
+  cmp -- "$target.before-version-rejection" "$target" || fail "$label 拒绝时修改了字节"
+  ok "$label 版本补丁拒绝且输入字节保持不变"
+}
+
 CURRENT_CLEAN="$T/current-upstream-clean.mjs"
 git -C "$UP" show "$TAG_COMMIT:proxy.mjs" > "$CURRENT_CLEAN"
 assert_patch_applies_once "当前上游 fixture" "$CURRENT_CLEAN"
@@ -335,10 +362,34 @@ PATCHED_RELEASE_BEFORE="$T/release-upstream-patched.before"
 cp -p "$PATCHED_RELEASE" "$PATCHED_RELEASE_BEFORE"
 PATCHED_RELEASE_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$PATCHED_RELEASE" 2>&1)
 PATCHED_RELEASE_OUT+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PATCHED_RELEASE" 2>&1)
+PATCHED_RELEASE_OUT+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$PATCHED_RELEASE" 2>&1)
 echo "--- already patched byte check ---"; echo "$PATCHED_RELEASE_OUT"
 echo "$PATCHED_RELEASE_OUT" | grep -Fq "upstream lifecycle patch already present" || fail "已补丁输入应报告 already present"
+echo "$PATCHED_RELEASE_OUT" | grep -Fq "upstream version patch already present" || fail "已补丁输入应报告 version already present"
 cmp -- "$PATCHED_RELEASE_BEFORE" "$PATCHED_RELEASE" || fail "已补丁输入重复执行改变了字节"
-ok "已补丁 upstream/proxy.mjs 重复执行字节完全不变"
+grep -Fq "CCPM_VERSION_PATCH_V1" "$PATCHED_RELEASE" || fail "已补丁 upstream/proxy.mjs 缺少版本补丁"
+grep -Fq "CCPM_LIFECYCLE_PATCH_V1" "$PATCHED_RELEASE" || fail "版本补丁覆盖了生命周期补丁"
+grep -Fq "CCPM_INITIALIZATION_PATCH_V1" "$PATCHED_RELEASE" || fail "版本补丁覆盖了初始化补丁"
+ok "已补丁 upstream/proxy.mjs 三段补丁重复执行字节完全不变"
+
+DUP_VERSION_MARKER="$T/duplicate-version-marker.mjs"
+cp -p "$PATCHED_RELEASE" "$DUP_VERSION_MARKER"
+printf '\n// CCPM_VERSION_PATCH_V1\n' >> "$DUP_VERSION_MARKER"
+assert_version_patch_rejection "重复 version marker" "$DUP_VERSION_MARKER" "version patch marker is duplicated"
+
+BAD_VERSION_FALLBACK="$T/bad-version-fallback.mjs"
+cp -p "$RELEASE_PRISTINE" "$BAD_VERSION_FALLBACK"
+node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$BAD_VERSION_FALLBACK" >/dev/null
+node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$BAD_VERSION_FALLBACK" >/dev/null
+sed -i "s/const CC_VERSION_FALLBACK = '0.32.3';/const CC_VERSION_FALLBACK = 'fixture';/" "$BAD_VERSION_FALLBACK"
+assert_version_patch_rejection "无效固定 fallback" "$BAD_VERSION_FALLBACK" "CC_VERSION_FALLBACK 必须是稳定 semver"
+
+PARTIAL_VERSION="$T/partial-version-patch.mjs"
+cp -p "$RELEASE_PRISTINE" "$PARTIAL_VERSION"
+node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$PARTIAL_VERSION" >/dev/null
+node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PARTIAL_VERSION" >/dev/null
+printf '\nconst CC_VERSION_BUILD = CC_VERSION_FALLBACK;\n' >> "$PARTIAL_VERSION"
+assert_version_patch_rejection "不完整 version patch" "$PARTIAL_VERSION" "detected incomplete version patch"
 
 DUP_MARKER="$T/duplicate-marker.mjs"
 cp -p "$PATCHED_RELEASE" "$DUP_MARKER"

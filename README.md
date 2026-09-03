@@ -78,6 +78,9 @@ docker compose：
 | ADMIN_TOKEN | 自动生成 | 管理端令牌（仅磁盘无值时初始化生效） |
 | CLIENT_TOKEN | 空（回退 ADMIN_TOKEN） | /v1/* 客户端令牌（仅磁盘无值时初始化生效） |
 | UPSTREAM_PORT / UPSTREAM_HOST | 3050 / 127.0.0.1 | 上游代理内部地址 |
+| CC_ENABLE_VERSION_REFRESH | 空（关闭） | 设为 1 才允许上游按 24h 边界访问固定 allowlist 的 npm registry；失败保留构建时版本，不影响启动和主请求 |
+| CC_VERSION_REFRESH_INTERVAL_MS | 24h | 可选的有界测试/运维间隔（50ms 至 24h）；默认保持 24h，失败后在下一边界重试 |
+| CC_VERSION_REFRESH_TIMEOUT_MS | 5000 | registry 请求超时（50ms 至 10s）；超时或响应异常只记录告警 |
 | EMBED_UPSTREAM | 1 | 设为 0 时不嵌入上游（上游独立部署/测试场景） |
 | SECURE_COOKIES | 空 | 设为 `1`/`true` 时给登录 SSE cookie 追加 `Secure` 属性（TLS 反代部署应开启，见「安全说明」） |
 

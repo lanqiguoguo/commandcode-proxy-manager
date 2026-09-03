@@ -703,18 +703,32 @@ if (SC === "pool") {
 // ════ stats ════
 if (SC === "stats") {
   console.log("=== stats 保留清理 ===");
+  process.env.CCPM_COMPACT_DELAY_MS = "10";
+  process.env.CCPM_COMPACT_RETRY_DELAY_MS = "10";
   const now = Date.now();
   const seed = [
     { ts: now - 8 * 864e5, keyId: "k1", ok: true, status: 200, model: "old" },
     { ts: now - 3 * 864e5, keyId: "k1", ok: false, status: 429, errorKind: "rate_limit", model: "mid" },
     { ts: now - 60e3, keyId: "k1", ok: true, status: 200, model: "new", inputTokens: 100, outputTokens: 50 },
   ];
-  writeFileSync(DATA + "/stats.jsonl", seed.map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
-  const { initStats, queryEvents, usageByKey, setRetention, appendEvent, poolStats } = await import("../src/stats.mjs");
+  writeFileSync(DATA + "/stats.jsonl", [
+    ...seed.map((e) => JSON.stringify(e)),
+    "{bad stats json",
+    JSON.stringify(null),
+    JSON.stringify([]),
+    JSON.stringify({ model: "missing-ts" })
+  ].join("\n") + "\n", { mode: 0o644 });
+  fs.chmodSync(DATA + "/stats.jsonl", 0o644);
+  const { initStats, queryEvents, usageByKey, setRetention, appendEvent, poolStats, MAX_EVENTS } = await import("../src/stats.mjs");
   initStats({ emit: () => {} }, 7);
   const q = queryEvents({});
   check(q.total === 2, "启动回放剔除超保留期事件", "total=" + q.total);
   check(q.items[0].model === "new", "时间倒序");
+  const startupStatsRows = readFileSync(DATA + "/stats.jsonl", "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  check(startupStatsRows.length === 2 && startupStatsRows.every((e) => e.model === "mid" || e.model === "new"),
+    "启动 dirty stats 物理重写：坏行/非法行/过期行均移除", JSON.stringify(startupStatsRows));
+  check((statSync(DATA + "/stats.jsonl").mode & 0o777).toString(8) === "600" && !fs.existsSync(DATA + "/stats.jsonl.tmp"),
+    "stats 启动收紧已有权限并清理 compact 临时文件");
   const u = usageByKey("k1");
   check(u.h5.requests === 1 && u.d7.requests === 2 && u.d30Valid === false, "窗口统计 + d30 回退标记");
   const ps = poolStats();
@@ -765,21 +779,71 @@ if (SC === "stats") {
     "load() 读侧净化：脏字段从回放事件删除（保持缺省语义）", JSON.stringify(dl));
   const cl = S2.queryEvents({}).items.find((e) => e.model === "clean");
   check(cl && cl.inputTokens === 10 && cl.status === 200, "load() 读侧净化不误伤合法数值字段");
+
+  // 超过 MAX_EVENTS 的真实物理文件：初始化与 append 后都检查磁盘行数和内容，
+  // 覆盖“内存长度前后相同但必须 compact”的路径。
+  const failurePath = DATA + "/stats.jsonl";
+  const failureOld = JSON.stringify({ ts: Date.now() - 10 * 864e5, keyId: "failure", ok: true, model: "failure-old" }) + "\n";
+  writeFileSync(failurePath, failureOld, { mode: 0o600 });
+  let renameFailure = true;
+  const realRename = fs.renameSync;
+  const compactErrors = [];
+  const realConsoleError = console.error;
+  fs.renameSync = (...args) => {
+    if (renameFailure && String(args[0]).endsWith("stats.jsonl.tmp")) throw new Error("unit compact rename failure");
+    return realRename(...args);
+  };
+  console.error = (...args) => {
+    compactErrors.push(args.map(String).join(" "));
+    realConsoleError(...args);
+  };
+  const S3 = await import("../src/stats.mjs?compactfailure");
+  S3.initStats({ emit: () => {} }, 7);
+  check(readFileSync(failurePath, "utf8") === failureOld && !fs.existsSync(failurePath + ".tmp"),
+    "stats compact rename 失败保留旧文件并清理临时文件");
+  check(compactErrors.some((line) => line.includes("compact failed") && line.includes("old file retained")),
+    "stats compact 失败输出告警", compactErrors.join(" | "));
+  renameFailure = false;
+  await new Promise((resolveP) => setTimeout(resolveP, 60));
+  check(readFileSync(failurePath, "utf8") === "" && !fs.existsSync(failurePath + ".tmp"),
+    "stats compact 失败按有界重试成功恢复");
+  fs.renameSync = realRename;
+  console.error = realConsoleError;
+
+  const overCapRows = Array.from({ length: MAX_EVENTS + 1 }, (_, i) => JSON.stringify({
+    ts: Date.now(), keyId: "over-cap", ok: true, model: "disk-" + i
+  })).join("\n") + "\n";
+  writeFileSync(failurePath, overCapRows, { mode: 0o600 });
+  const S4 = await import("../src/stats.mjs?overcap");
+  S4.initStats({ emit: () => {} }, 7);
+  const afterLoadRows = readFileSync(failurePath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  check(S4.queryEvents({}).total === MAX_EVENTS && afterLoadRows.length === MAX_EVENTS && afterLoadRows[0].model === "disk-1",
+    "超过 MAX_EVENTS 启动后物理 compact 保留最新行", JSON.stringify({ memory: S4.queryEvents({}).total, disk: afterLoadRows.length, first: afterLoadRows[0]?.model }));
+  const beforeAppendCount = S4.queryEvents({}).total;
+  S4.appendEvent({ keyId: "over-cap", ok: true, status: 200, model: "disk-after-append" });
+  check(S4.queryEvents({}).total === beforeAppendCount, "MAX_EVENTS append 前后内存长度相同");
+  await new Promise((resolveP) => setTimeout(resolveP, 60));
+  const afterAppendRows = readFileSync(failurePath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  check(afterAppendRows.length === MAX_EVENTS && afterAppendRows.at(-1)?.model === "disk-after-append" &&
+    !afterAppendRows.some((e) => e.model === "disk-1"),
+    "MAX_EVENTS append 触发真实物理 compact", JSON.stringify({ disk: afterAppendRows.length, first: afterAppendRows[0]?.model, last: afterAppendRows.at(-1)?.model }));
 }
 
 // ════ logs（持久化 + proxy 捕获）════
 if (SC === "logs") {
   console.log("=== logs 持久化与上游捕获 ===");
   const { EventEmitter } = await import("events");
+  process.env.CCPM_COMPACT_DELAY_MS = "10";
+  process.env.CCPM_COMPACT_RETRY_DELAY_MS = "10";
   const L = await import("../src/logs.mjs");
-  const { attachConsoleCapture, initLogs, getLogs, setRetention } = L;
+  const { attachConsoleCapture, initLogs, getLogs, setRetention, MEM_CAP } = L;
   const bus = new EventEmitter();
   const realLog = console.log;
 
   // 1) 捕获早于回放（两阶段启动）：先挂捕获。
   //    上游 log() 是单参数预格式化字符串（模板字面量），测试保持一致形态
   attachConsoleCapture();
-  const oldIso = new Date(Date.now() - 10 * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const oldIso = new Date(Date.now() - 2 * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
   const tsA = Date.now() - 5000;
   console.log(`[${oldIso}] [info] CC Proxy started {"url":"http://127.0.0.1:3050"}`);
   console.log(`[${new Date(tsA).toISOString().replace(/\.\d{3}Z$/, "Z")}] [warn] Stream idle timeout {"model":"m1"}`);
@@ -800,13 +864,24 @@ if (SC === "logs") {
   const afterReentry = readFileSync(DATA + "/events.jsonl", "utf8").split("\n").filter((line) => line.includes(reentryMarker)).length;
   check(afterReentry === beforeReentry + 1, "捕获挂接 + 重入防护只写入一条日志", `before=${beforeReentry} after=${afterReentry}`);
 
+  // 启动前注入真实坏/过期物理行，并把已有文件故意放宽到 0644；initLogs
+  // 必须同步清理磁盘并收紧权限，而不是只清理内存回放结果。
+  const logPath = DATA + "/events.jsonl";
+  fs.appendFileSync(logPath, [
+    JSON.stringify({ ts: Date.now() - 10 * 864e5, level: "info", msg: "expired-on-disk" }),
+    "{bad log json",
+    JSON.stringify({ ts: "bad", msg: "invalid-ts" }),
+    JSON.stringify({ ts: Date.now(), level: "warn" })
+  ].join("\n") + "\n");
+  fs.chmodSync(logPath, 0o644);
+
   // 2) initLogs 回放：文件里已有上面捕获的行，回放去重（不应翻倍）
   initLogs(bus, 7);
   const after = getLogs({});
   const proxyRows = after.filter((l) => l.src === "proxy");
   const dup = proxyRows.length - new Set(proxyRows.map((l) => l.ts + "|" + l.msg)).size;
   check(dup === 0, "捕获期直写 + 回放合并无重复", "proxyRows=" + proxyRows.length + " dup=" + dup);
-  check(after.some((l) => l.msg.includes("CC Proxy started") && l.level === "info" && Date.now() - l.ts > 9 * 864e5), "proxy 行按日志内 ISO 时间戳入库（非当前时间）", JSON.stringify(after.find((l) => l.msg.includes("CC Proxy started"))));
+  check(after.some((l) => l.msg.includes("CC Proxy started") && l.level === "info" && Date.now() - l.ts > 1 * 864e5), "proxy 行按日志内 ISO 时间戳入库（非当前时间）", JSON.stringify(after.find((l) => l.msg.includes("CC Proxy started"))));
   check(after.some((l) => l.msg.includes("boom") && l.level === "error"), "error 级捕获 + 附加参数拼接");
   const fp = after.find((l) => l.msg.includes("Fingerprint"));
   check(fp && fp.msg.includes("user_***") && !fp.msg.includes("ABCDEF"), "keyPrefix 脱敏", JSON.stringify(fp && fp.msg));
@@ -825,6 +900,49 @@ if (SC === "logs") {
   // 4) 落盘权限 + retention 清理
   const mode = (statSync(DATA + "/events.jsonl").mode & 0o777).toString(8);
   check(mode === "600", "events.jsonl 权限 600", mode);
+  const startupLogRows = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  check(startupLogRows.length === getLogs({}).length && !readFileSync(logPath, "utf8").includes("expired-on-disk") &&
+    !readFileSync(logPath, "utf8").includes("bad log json") && !fs.existsSync(logPath + ".tmp"),
+    "启动 dirty logs 物理重写：坏行/非法行/过期行均移除", JSON.stringify({ disk: startupLogRows.length, memory: after.length }));
+  fs.chmodSync(logPath, 0o644);
+  bus.emit("log", { level: "info", msg: "permission-after-append" });
+  check((statSync(logPath).mode & 0o777).toString(8) === "600", "logs append 收紧已有 0644 文件权限");
+
+  // 真实超过内存上限的连续 append：物理文件必须随 compact 保持在行数护栏内。
+  for (let i = 0; i <= MEM_CAP; i++) bus.emit("log", { ts: Date.now() + i, level: "info", msg: "cap-" + i });
+  await new Promise((resolveP) => setTimeout(resolveP, 60));
+  const cappedLogRows = readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  check(cappedLogRows.length === MEM_CAP && cappedLogRows.at(-1)?.msg === "cap-" + MEM_CAP &&
+    !cappedLogRows.some((entry) => entry.msg === "cap-0"),
+    "logs 超过 MEM_CAP 后真实物理 compact", JSON.stringify({ disk: cappedLogRows.length, first: cappedLogRows[0]?.msg, last: cappedLogRows.at(-1)?.msg }));
+
+  // rename 失败时不破坏旧文件，临时文件必须清理；恢复 rename 后由有界重试完成。
+  const oldLogDisk = readFileSync(logPath, "utf8");
+  let logRenameFailure = true;
+  const logRealRename = fs.renameSync;
+  const logCompactErrors = [];
+  const logRealConsoleError = console.error;
+  fs.renameSync = (...args) => {
+    if (logRenameFailure && String(args[0]).endsWith("events.jsonl.tmp")) throw new Error("unit logs compact rename failure");
+    return logRealRename(...args);
+  };
+  console.error = (...args) => {
+    logCompactErrors.push(args.map(String).join(" "));
+    logRealConsoleError(...args);
+  };
+  bus.emit("log", { level: "warn", msg: "compact-failure-trigger" });
+  await new Promise((resolveP) => setTimeout(resolveP, 25));
+  check(readFileSync(logPath, "utf8") === oldLogDisk && !fs.existsSync(logPath + ".tmp"),
+    "logs compact rename 失败保留旧文件并清理临时文件");
+  check(logCompactErrors.some((line) => line.includes("compact failed") && line.includes("old file retained")),
+    "logs compact 失败输出告警", logCompactErrors.join(" | "));
+  logRenameFailure = false;
+  await new Promise((resolveP) => setTimeout(resolveP, 60));
+  check(!fs.existsSync(logPath + ".tmp") && readFileSync(logPath, "utf8").includes("compact-failure-trigger"),
+    "logs compact 失败按有界重试成功恢复");
+  fs.renameSync = logRealRename;
+  console.error = logRealConsoleError;
+
   // 未来时间戳行：setRetention 缩小窗口后仍保留；旧行被清理
   const beforeN = getLogs({}).length;
   setRetention(1); // 1 天：ISO 2026-09-01T00:00 的行相对当前(09-01 中午后)可能仍在 1 天内；用远古 ts 行验证

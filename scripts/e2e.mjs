@@ -5,7 +5,7 @@ import http from "http";
 import net from "net";
 import { performance } from "perf_hooks";
 import { spawn } from "child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, realpathSync } from "fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, realpathSync, statSync } from "fs";
 import { resolve, dirname, isAbsolute, join, relative, parse, sep } from "path";
 import { tmpdir } from "os";
 import { fileURLToPath } from "url";
@@ -1481,6 +1481,50 @@ async function main() {
   logsAfter.length >= logsBefore.length && JSON.stringify(logsAfter).includes(addLine[0] ? addLine[0].msg.slice(0, 8) : "新增 Key")
     ? ok("重启后系统日志保留（" + logsBefore.length + " → " + logsAfter.length + " 条）") : bad("日志持久化", logsBefore.length + " → " + logsAfter.length);
   if (!JSON.stringify(logsAfter).includes("user_keyA")) ok("持久化日志无 Key 明文"); else bad("日志明文", "");
+
+  // ── T22b F10 dirty JSONL + existing permissions through a real restart ──
+  console.log("\n=== T22b stats/logs physical cleanup on restart (F10) ===");
+  await stopMgr();
+  const injectDirtyJsonl = (path, rows) => {
+    const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+    const separator = current && !current.endsWith("\n") ? "\n" : "";
+    writeFileSync(path, current + separator + rows.join("\n") + "\n", { mode: 0o644 });
+    chmodSync(path, 0o644);
+  };
+  const expiredF10 = JSON.stringify({ ts: Date.now() - 40 * 864e5, keyId: idA22, ok: true, model: "f10-expired" });
+  injectDirtyJsonl(resolve(DATA, "stats.jsonl"), [expiredF10, "{f10-invalid-stats-json", JSON.stringify({ model: "f10-missing-ts" })]);
+  injectDirtyJsonl(resolve(DATA, "events.jsonl"), [
+    JSON.stringify({ ts: Date.now() - 40 * 864e5, level: "info", msg: "f10-expired-log" }),
+    "{f10-invalid-log-json",
+    JSON.stringify({ ts: "bad", msg: "f10-invalid-ts" })
+  ]);
+  await startMgr();
+  const parseJsonl = (path) => {
+    if (!existsSync(path)) return { valid: false, rows: [], text: "" };
+    const text = readFileSync(path, "utf8");
+    const rows = [];
+    let valid = true;
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try { rows.push(JSON.parse(line)); } catch { valid = false; }
+    }
+    return { valid, rows, text };
+  };
+  const f10StatsDisk = parseJsonl(resolve(DATA, "stats.jsonl"));
+  const f10LogsDisk = parseJsonl(resolve(DATA, "events.jsonl"));
+  const f10StatsMode = (statSync(resolve(DATA, "stats.jsonl")).mode & 0o777).toString(8);
+  const f10LogsMode = (statSync(resolve(DATA, "events.jsonl")).mode & 0o777).toString(8);
+  f10StatsDisk.valid && !f10StatsDisk.text.includes("f10-invalid") && !f10StatsDisk.text.includes("f10-expired") && f10StatsMode === "600"
+    ? ok("真实重启后 stats 坏/过期行物理清除且权限 0600")
+    : bad("F10 stats 重启清理", JSON.stringify({ mode: f10StatsMode, disk: f10StatsDisk }));
+  f10LogsDisk.valid && !f10LogsDisk.text.includes("f10-invalid") && !f10LogsDisk.text.includes("f10-expired") && f10LogsMode === "600"
+    ? ok("真实重启后 logs 坏/过期行物理清除且权限 0600")
+    : bad("F10 logs 重启清理", JSON.stringify({ mode: f10LogsMode, disk: f10LogsDisk }));
+  const f10History = JSON.parse((await admin("/admin/api/history?keyId=" + idA22 + "&pageSize=500")).body).items;
+  const f10LogsApi = JSON.parse((await admin("/admin/api/logs?since=0")).body).logs;
+  !f10History.some((entry) => entry.model === "f10-expired") && !f10LogsApi.some((entry) => entry.msg.includes("f10-expired"))
+    ? ok("重启后 history/logs API 不暴露已清除脏数据")
+    : bad("F10 API 脏数据", JSON.stringify({ history: f10History.find((entry) => entry.model === "f10-expired"), logs: f10LogsApi.find((entry) => entry.msg.includes("f10-expired")) }));
 
   // ── T23 上游 proxy.mjs 日志捕获（嵌入模式）──
   console.log("\n=== T23 proxy log capture ===");

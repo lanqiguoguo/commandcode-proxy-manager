@@ -1,4 +1,21 @@
-// ── 入口：加载配置 → 同进程嵌入上游代理 → 启动管理网关 ──
+// NP-00 架构契约（后续实现必须保持；当前文件以下部分仍是改造前基线）：
+// - upstream/proxy.mjs 始终是上游原始发布文件。托管模式由 manager 以独立 Node 子进程
+//   启动原始入口（cwd=upstream，直接 server.listen），不得 import、注入 loader 或改写源码。
+// - EMBED_UPSTREAM=1 或未设置表示托管模式：先捕获上游 stdout/stderr，再以
+//   HOST=127.0.0.1、PORT=cfg.upstreamPort 启动子进程；等待上游 GET /health 返回 2xx
+//   后，manager 才监听 cfg.host:cfg.port。上游 /health 的原始响应为 200 text/plain OK。
+// - EMBED_UPSTREAM=0 表示外置模式：绝不创建上游子进程，manager/gateway 继续连接
+//   cfg.upstreamHost:cfg.upstreamPort；manager /health 保持现有 OK、UPSTREAM_DOWN 和
+//   持久化不可用响应语义。托管模式的 manager /health 仍只在上游就绪后对外可用。
+// - 启动超时、上游提前退出或 manager 监听失败均为启动失败：保留近期上游诊断日志，
+//   回收已启动的子进程并以非零状态退出。manager 运行期间上游异常退出只触发一次
+//   manager 关闭，同样以非零状态退出；不得留下孤儿进程。
+// - SIGTERM/SIGINT 由 manager（容器 PID 1）处理：先停止接收请求并排空 manager，
+//   再停止托管上游；停止动作幂等，SIGTERM 超时后对仍存活的子进程使用 SIGKILL。
+//   外置模式不执行子进程停止，重复信号不得产生未处理 rejection。
+// - 初始化并发/重试和版本刷新由上游原始版本负责；manager 不复制这些补丁语义，
+//   同步阶段也不应把本地逻辑写回 upstream/proxy.mjs。
+// ── 入口：加载配置 → 启动/监管上游 → 启动管理网关 ──
 import http from "http";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";

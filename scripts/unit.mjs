@@ -5,13 +5,13 @@
 //   logs 持久化 + 上游 proxy 日志捕获（时序/去重/脱敏/src 过滤）
 //   state 防抖写盘 flush 语义（P2-4：立即落盘/幂等/清 timer/未调度 no-op）
 //   durable 持久化提交/失败回滚语义（F04）
-// 用法：node scripts/unit.mjs [config|quota|pool|stats|logs|state|durable]   （缺省依次全部跑，每场景独立子进程）
+// 用法：node scripts/unit.mjs [config|persistence|quota|pool|stats|logs|state|durable]   （缺省依次全部跑，每场景独立子进程）
 import fs, { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const SC = process.argv[2];
-const SCENARIOS = ["config", "quota", "pool", "stats", "logs", "tokens", "state", "durable"];
+const SCENARIOS = ["config", "persistence", "quota", "pool", "stats", "logs", "tokens", "state", "durable"];
 
 if (SC && !SCENARIOS.includes(SC)) {
   console.error(`未知 unit 场景：${SC}。可选值：${SCENARIOS.join(", ")}`);
@@ -417,6 +417,220 @@ if (SC === "config") {
       else process.env[name] = previousEnv[name];
     }
   }
+}
+
+// ════ persistence（F13 JSON schema、隔离与未知 Key 兼容）════
+if (SC === "persistence") {
+  console.log("=== persistence schema/quarantine ===");
+  const { initKeyPool, listKeys, getHealth } = await import("../src/keyPool.mjs");
+  const { initQuota, getReport, probeKey } = await import("../src/quota.mjs");
+  const { validateKeysDocument, validateStateDocument, validateQuotaCacheDocument } = await import("../src/persistenceSchema.mjs");
+
+  const keyOne = { id: "k1", alias: "one", key: "user_schema_secret_one", note: "", enabled: true, priority: 0, createdAt: Date.now() };
+  const keyTwo = { id: "k2", alias: "two", key: "user_schema_secret_two", note: "", enabled: false, priority: 1, createdAt: Date.now() };
+  const poolCfg = { strategy: "active-standby", backoffBaseMs: 5000, backoffMaxMs: 120000 };
+  const writeRaw = (name, raw) => writeFileSync(DATA + "/" + name, raw);
+  const remove = (name) => { try { fs.unlinkSync(DATA + "/" + name); } catch {} };
+  const backupNames = (name) => fs.readdirSync(DATA).filter((entry) => new RegExp("^" + name.replace(".", "\\.") + "\\.corrupt-\\d+(?:-\\d+)?$").test(entry));
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  const captureLogs = (fn) => {
+    const lines = [];
+    const originalError = console.error;
+    const originalWarn = console.warn;
+    const capture = (...args) => lines.push(args.map((arg) => typeof arg === "string" ? arg : String(arg)).join(" "));
+    console.error = capture;
+    console.warn = capture;
+    let value;
+    let thrown = null;
+    try { value = fn(); } catch (error) { thrown = error; }
+    finally {
+      console.error = originalError;
+      console.warn = originalWarn;
+    }
+    return { value, thrown, lines };
+  };
+  const assertBackup = (name, raw, before, lines, field, label) => {
+    const added = backupNames(name).filter((entry) => !before.includes(entry));
+    check(added.length === 1 && readFileSync(DATA + "/" + added[0], "utf8") === raw && !fs.existsSync(DATA + "/" + name),
+      label + " → 原始字节隔离备份", JSON.stringify(added));
+    check(lines.some((line) => line.includes(field)), label + " → 出现字段诊断", field);
+  };
+  const runInvalid = (name, raw, init, field, label) => {
+    remove(name);
+    const before = backupNames(name);
+    writeRaw(name, raw);
+    const captured = captureLogs(init);
+    check(!captured.thrown, label + " → 初始化不崩", captured.thrown && captured.thrown.message);
+    assertBackup(name, raw, before, captured.lines, field, label);
+    return captured.lines;
+  };
+  const writeValidKeys = () => {
+    remove("keys.json");
+    writeRaw("keys.json", JSON.stringify({ keys: [keyOne, keyTwo] }));
+  };
+  const initPool = () => initKeyPool(poolCfg, {});
+
+  // keys.json: top-level shape, null element, identity/order/type checks, and
+  // secret-safe diagnostics. No malformed record may become a live Key.
+  for (const [raw, label] of [["null", "keys 顶层 null"], ["42", "keys 顶层标量"], ["[]", "keys 顶层数组"]]) {
+    remove("state.json");
+    runInvalid("keys.json", raw, initPool, "$", label);
+    check(listKeys().length === 0, label + " → fallback 不加载坏 Key");
+  }
+  remove("state.json");
+  runInvalid("keys.json", JSON.stringify({ keys: [null] }), initPool, "keys[0]", "keys 元素 null");
+  check(listKeys().length === 0, "keys 元素 null → fallback 不加载坏 Key");
+
+  const invalidKeysRaw = JSON.stringify({ keys: [
+    { id: "k1", key: "user_schema_secret_one", priority: 0, enabled: true },
+    { id: "k1", key: "user_schema_secret_one", priority: 0, enabled: "yes", type: {} },
+    { id: "bad id", key: 99, priority: -1, enabled: true },
+    { id: "k4", key: "user_schema_secret_four", priority: 1, enabled: true }
+  ] });
+  const keyLogs = runInvalid("keys.json", invalidKeysRaw, initPool, "keys[1].id", "keys 非法/重复字段");
+  for (const field of ["keys[1].id", "keys[1].key", "keys[1].priority", "keys[1].enabled", "keys[1].type", "keys[2].id", "keys[2].key", "keys[2].priority"]) {
+    check(keyLogs.some((line) => line.includes(field)), "keys 诊断覆盖 " + field);
+  }
+  check(!keyLogs.some((line) => line.includes("user_schema_secret")), "keys 诊断不泄露 key 明文");
+  check(listKeys().length === 0, "keys 非法/重复字段 → fallback 不加载任何坏 Key");
+
+  writeValidKeys();
+  remove("state.json");
+  const validPool = captureLogs(initPool);
+  check(!validPool.thrown && listKeys().length === 2 && listKeys()[0].id === "k1", "合法 keys.json 可初始化");
+
+  // state.json: malformed maps/health fall back to zeroed health. Unknown IDs
+  // are intentionally skipped using the knownIds callback and cannot poison a
+  // valid current Key.
+  const runInvalidState = (raw, field, label) => {
+    remove("state.json");
+    const before = backupNames("state.json");
+    writeRaw("state.json", raw);
+    const captured = captureLogs(initPool);
+    check(!captured.thrown && listKeys().length === 2, label + " → 初始化不崩且保留合法 keys", captured.thrown && captured.thrown.message);
+    assertBackup("state.json", raw, before, captured.lines, field, label);
+    const health = getHealth("k1");
+    check(health && health.failCount === 0 && health.backoffUntilMs === 0 && health.authError === false && health.lastErrorKind === "",
+      label + " → fallback 不带入坏 health", JSON.stringify(health));
+  };
+  runInvalidState(JSON.stringify({ keys: null }), "keys", "state keys=null");
+  runInvalidState(JSON.stringify({ keys: [] }), "keys", "state keys=array");
+  runInvalidState(JSON.stringify({ keys: { k1: { backoffUntilMs: -1 } } }), "keys.k1.backoffUntilMs", "state 坏 health 数字");
+  runInvalidState(JSON.stringify({ keys: { k1: { authError: "false" } } }), "keys.k1.authError", "state 坏 health 布尔");
+  runInvalidState(JSON.stringify({ keys: { k1: { lastErrorKind: "poison" } } }), "keys.k1.lastErrorKind", "state 坏错误类别");
+
+  remove("state.json");
+  const unknownStateRaw = JSON.stringify({ keys: {
+    k1: { failCount: 7, authError: true, lastErrorKind: "auth" },
+    "unknown-id": { failCount: "bad", authError: "bad", lastErrorKind: "poison" }
+  } });
+  const unknownStateBefore = backupNames("state.json");
+  writeRaw("state.json", unknownStateRaw);
+  const unknownState = captureLogs(initPool);
+  const loadedHealth = getHealth("k1");
+  check(!unknownState.thrown && backupNames("state.json").length === unknownStateBefore.length &&
+    readFileSync(DATA + "/state.json", "utf8") === unknownStateRaw,
+    "state 已知合法 + 未知坏 key → 保留原文件且不整份隔离");
+  check(loadedHealth && loadedHealth.failCount === 7 && loadedHealth.authError === true && loadedHealth.lastErrorKind === "auth" &&
+    getHealth("unknown-id") === null, "state unknown key 安全忽略且不污染已知 health", JSON.stringify(loadedHealth));
+  check(unknownState.lines.some((line) => line.includes("unknown-id")) && !unknownState.lines.some((line) => line.includes("poison")),
+    "state unknown key 仅安全诊断 ID，不输出坏字段值");
+
+  const missingStateRaw = JSON.stringify({ keys: {} });
+  remove("state.json");
+  writeRaw("state.json", missingStateRaw);
+  const missingState = captureLogs(initPool);
+  const missingHealth = getHealth("k1");
+  check(!missingState.thrown && backupNames("state.json").length === unknownStateBefore.length &&
+    readFileSync(DATA + "/state.json", "utf8") === missingStateRaw && missingHealth && missingHealth.failCount === 0,
+    "state 合法缺失 key → 保持文件且使用默认 health");
+
+  const quotaPoolCalls = [];
+  const quotaSoftCalls = [];
+  const quotaPool = {
+    listKeys: () => [{ id: "k1", key: "user_schema_quota", enabled: true }],
+    getKeyRecord: (id) => id === "k1" ? { id, key: "user_schema_quota" } : null,
+    getPoolCfg: () => ({ ...quotaCfg }),
+    setQuotaLimited: (...args) => quotaPoolCalls.push(["set", ...args]),
+    clearQuotaLimited: (...args) => quotaPoolCalls.push(["clear", ...args]),
+    setSoftLimited: (...args) => quotaSoftCalls.push(args)
+  };
+  const future = new Date(Date.now() + 3600000).toISOString();
+  const validReport = {
+    fiveHour: { cap: 100, used: 10, percent: 10, resetAt: future },
+    weekly: { cap: 100, used: 20, percent: 20, resetAt: future },
+    creditsUsd: { used: 1, remaining: 9, limit: 10, percent: 10, expiresAt: future, periodStart: "2026-09-01T00:00:00Z" },
+    totals: { runs: 2, completed: 2, failed: 0, tokensIn: 1, tokensOut: 2, tokens: 3, cost: 1, successRate: 100 },
+    updatedAt: Date.now(),
+    stale: false
+  };
+  const quotaCfg = { fiveHourHardStop: 90, weeklyHardStop: 90, softStop: 80, quotaRefreshMs: 60000000, quotaRefreshGapMs: 0 };
+  const initQuotaCache = () => initQuota(quotaPool, quotaCfg, {});
+  const runInvalidQuota = (raw, field, label) => {
+    remove("quota-cache.json");
+    const before = backupNames("quota-cache.json");
+    writeRaw("quota-cache.json", raw);
+    const captured = captureLogs(initQuotaCache);
+    check(!captured.thrown, label + " → 初始化不崩", captured.thrown && captured.thrown.message);
+    assertBackup("quota-cache.json", raw, before, captured.lines, field, label);
+    check(getReport("k1") === null, label + " → fallback 不带入坏 quota 报告");
+  };
+
+  // A legacy F06 report may omit totals and creditsUsd.periodStart.
+  const legacyReport = clone(validReport);
+  delete legacyReport.totals;
+  delete legacyReport.creditsUsd.periodStart;
+  remove("quota-cache.json");
+  writeRaw("quota-cache.json", JSON.stringify({ reports: { k1: legacyReport } }));
+  const legacyCache = captureLogs(initQuotaCache);
+  check(!legacyCache.thrown && getReport("k1") && getReport("k1").totals === undefined &&
+    getReport("k1").creditsUsd.periodStart === undefined, "F06 合法旧 quota-cache 格式仍可恢复");
+
+  for (const [raw, field, label] of [
+    ["null", "$", "quota-cache 顶层 null"],
+    ["42", "$", "quota-cache 顶层标量"],
+    ["[]", "$", "quota-cache 顶层数组"],
+    [JSON.stringify({ reports: null }), "reports", "quota-cache reports=null"],
+    [JSON.stringify({ reports: [] }), "reports", "quota-cache reports=array"],
+    [JSON.stringify({ reports: { k1: null } }), "reports.k1", "quota report=null"],
+    [JSON.stringify({ reports: { k1: { ...clone(validReport), fiveHour: { cap: 0, used: 0, percent: 0, resetAt: null } } } }), "reports.k1.fiveHour.cap", "quota 坏 window"],
+    [JSON.stringify({ reports: { k1: { ...clone(validReport), creditsUsd: { ...clone(validReport.creditsUsd), used: -1 } } } }), "reports.k1.creditsUsd.used", "quota 坏 credits"],
+    [JSON.stringify({ reports: { k1: { ...clone(validReport), totals: { ...clone(validReport.totals), runs: "bad" } } } }), "reports.k1.totals.runs", "quota 坏 totals"],
+    [JSON.stringify({ reports: { k1: { ...clone(validReport), stale: "false" } } }), "reports.k1.stale", "quota stale 坏值"],
+    [JSON.stringify({ reports: { k1: { ...clone(validReport), updatedAt: "now" } } }), "reports.k1.updatedAt", "quota updatedAt 坏值"]
+  ]) runInvalidQuota(raw, field, label);
+
+  const unknownQuotaReport = { ...clone(validReport), fiveHour: null, stale: "bad", updatedAt: "bad" };
+  const mixedQuotaRaw = JSON.stringify({ reports: { k1: validReport, "unknown-id": unknownQuotaReport } });
+  remove("quota-cache.json");
+  const mixedBefore = backupNames("quota-cache.json");
+  writeRaw("quota-cache.json", mixedQuotaRaw);
+  const mixedQuota = captureLogs(initQuotaCache);
+  check(!mixedQuota.thrown && backupNames("quota-cache.json").length === mixedBefore.length &&
+    readFileSync(DATA + "/quota-cache.json", "utf8") === mixedQuotaRaw,
+    "quota 已知合法 + 未知坏 key → 不整份隔离");
+  check(getReport("k1") && getReport("k1").creditsUsd.limit === 10 && getReport("unknown-id") === null,
+    "quota unknown key 安全忽略且保留已知报告", JSON.stringify(getReport("k1")));
+
+  // Loading a bad cache never invokes applyLimits. A failed fresh probe also
+  // remains stale and leaves existing pool restriction state untouched.
+  remove("quota-cache.json");
+  writeRaw("quota-cache.json", JSON.stringify({ reports: { k1: { ...clone(validReport), updatedAt: "bad" } } }));
+  initQuotaCache();
+  quotaPoolCalls.length = 0;
+  quotaSoftCalls.length = 0;
+  globalThis.fetch = async () => { throw new Error("offline"); };
+  const failedProbe = await probeKey("k1");
+  check(failedProbe.stale === true && failedProbe.fiveHour === null && failedProbe.creditsUsd === null &&
+    quotaPoolCalls.length === 0 && quotaSoftCalls.length === 0,
+    "坏 quota fallback 不进入 applyLimits 且失败探测不改变限制", JSON.stringify(failedProbe));
+
+  check(validateStateDocument({ keys: { k1: { lastErrorKind: "poison" }, "unknown-id": null } }, { knownIds: new Set(["k1"]) }).some((entry) => entry.field === "keys.k1.lastErrorKind"),
+    "validateStateDocument knownIds 仍校验已知 key");
+  check(validateStateDocument({ keys: { k1: { failCount: 1 }, "unknown-id": null } }, { knownIds: new Set(["k1"]) }).length === 0,
+    "validateStateDocument knownIds 跳过未知坏 key");
+  check(validateQuotaCacheDocument({ reports: { k1: validReport, "unknown-id": unknownQuotaReport } }, { knownIds: new Set(["k1"]) }).length === 0,
+    "validateQuotaCacheDocument knownIds 跳过未知坏报告");
 }
 
 // ════ keyPool ════

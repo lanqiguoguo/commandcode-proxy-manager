@@ -1,5 +1,6 @@
 // ── 官方额度探测（whoami / billing / usage，软失败 + TTL 缓存） ──
-import { readJson, debouncedWriter } from "./state.mjs";
+import { readValidatedJson, debouncedWriter } from "./state.mjs";
+import { validateQuotaCacheDocument } from "./persistenceSchema.mjs";
 
 // 真实端点；e2e 通过 CC_QUOTA_BASE 指向 mock（与 config 的 host/port 覆写同风格）。
 // 默认生产地址，未知环境变量不会产生任何行为差异。
@@ -36,9 +37,16 @@ export function initQuota(poolRef, poolCfg, opts = {}) {
   pool = poolRef;
   cfg = { ...cfg, ...poolCfg };
   emitter = opts.emitter || null;
-  const saved = readJson("quota-cache.json", null);
+  const knownIds = new Set(pool.listKeys().map((key) => key.id));
+  cache.clear();
+  const saved = readValidatedJson("quota-cache.json", { reports: {} }, (value) =>
+    validateQuotaCacheDocument(value, { knownIds })
+  );
   if (saved && saved.reports) {
-    for (const [id, r] of Object.entries(saved.reports)) cache.set(id, r);
+    for (const [id, r] of Object.entries(saved.reports)) {
+      if (knownIds.has(id)) cache.set(id, r);
+      else console.warn(`[quota] quota-cache.json reports.${id}: unknown key ignored`);
+    }
   }
   persistCache = debouncedWriter("quota-cache.json", () => ({ reports: Object.fromEntries(cache) }), 2000);
   startTimer();

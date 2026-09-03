@@ -1,6 +1,6 @@
 // ── /data 持久化小工具（原子写 + 防抖） ─────────────────────
 import fs from "fs";
-import { resolve } from "path";
+import { basename, resolve } from "path";
 import { DATA_DIR } from "./config.mjs";
 import { markPersistenceFailure, markPersistenceSuccess, persistenceError } from "./persistence.mjs";
 
@@ -12,6 +12,63 @@ export function readJson(name, fallback) {
     console.error("[state] read " + name + " failed:", e.message);
   }
   return fallback;
+}
+
+function quarantine(name, path) {
+  const stamp = Date.now();
+  let suffix = 0;
+  let backup = `${path}.corrupt-${stamp}`;
+  while (fs.existsSync(backup)) backup = `${path}.corrupt-${stamp}-${++suffix}`;
+  try {
+    fs.renameSync(path, backup);
+    console.error(`[state] ${name} invalid: isolated as ${basename(backup)}; original bytes preserved`);
+    return backup;
+  } catch (e) {
+    console.error(`[state] ${name} invalid: isolation failed (${e.message}); original file kept`);
+    return null;
+  }
+}
+
+// Read a mutable application document only after its caller-provided schema has
+// accepted it. A bad document is quarantined instead of being merged into live
+// state; the caller receives the documented safe fallback.
+export function readValidatedJson(name, fallback, validate) {
+  const path = resolve(DATA_DIR, name);
+  let raw;
+  try {
+    if (!fs.existsSync(path)) return fallback;
+    // Keep the original file untouched until validation has completed. If it
+    // is rejected, quarantine renames these exact bytes rather than writing a
+    // reconstructed JSON value.
+    raw = fs.readFileSync(path);
+  } catch (e) {
+    console.error(`[state] ${name} invalid: read failed (${e.message})`);
+    quarantine(name, path);
+    return fallback;
+  }
+  let value;
+  try {
+    value = JSON.parse(raw.toString("utf8"));
+  } catch (e) {
+    console.error(`[state] ${name} invalid: JSON parse failed (${e.message})`);
+    quarantine(name, path);
+    return fallback;
+  }
+  let errors;
+  try {
+    errors = validate(value);
+  } catch (e) {
+    errors = [{ field: "$", message: `schema validator failed: ${e.message}` }];
+  }
+  if (!Array.isArray(errors) || errors.length) {
+    const details = Array.isArray(errors) && errors.length
+      ? errors.map((e) => `${e.field || "$"} ${e.message || "invalid"}`).join("; ")
+      : "$ schema validator returned an invalid result";
+    console.error(`[state] ${name} invalid: schema validation failed (${details})`);
+    quarantine(name, path);
+    return fallback;
+  }
+  return value;
 }
 
 export function writeJson(name, data) {

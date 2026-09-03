@@ -1,6 +1,7 @@
 // ── Key 池：主备顺序、健康状态、429/额度退避（持久化到 /data） ──
 import { randomUUID } from "crypto";
-import { readJson, writeJson, debouncedWriter } from "./state.mjs";
+import { readValidatedJson, writeJson, debouncedWriter } from "./state.mjs";
+import { isRecord, validateKeysDocument, validateStateDocument } from "./persistenceSchema.mjs";
 
 let keys = [];        // 数组顺序即主备优先级（index 0 = 主 Key）
 let health = new Map();
@@ -16,17 +17,15 @@ export function initKeyPool(cfgPool, opts = {}) {
   emitter = opts.emitter || null;
   health.clear();
   healthVersion.clear();
-  const data = readJson("keys.json", null) || { keys: [] };
-  keys = Array.isArray(data.keys) ? data.keys : [];
-  keys.forEach((k) => {
-    if (!k.id) k.id = "k_" + randomUUID().replace(/-/g, "").slice(0, 14);
-    if (typeof k.priority !== "number") k.priority = 0;
-    if (typeof k.enabled !== "boolean") k.enabled = true;
-  });
+  const data = readValidatedJson("keys.json", { keys: [] }, validateKeysDocument);
+  keys = data.keys;
   keys.sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
-  const saved = readJson("state.json", null) || { keys: {} };
+  const knownIds = new Set(keys.map((key) => key.id));
+  const saved = readValidatedJson("state.json", { keys: {} }, (value) => validateStateDocument(value, { knownIds }));
+  const savedKeys = isRecord(saved.keys) ? saved.keys : {};
   keys.forEach((k) => {
-    const h = saved.keys[k.id] || {};
+    const hasSaved = Object.prototype.hasOwnProperty.call(savedKeys, k.id);
+    const h = hasSaved && isRecord(savedKeys[k.id]) ? savedKeys[k.id] : {};
     health.set(k.id, {
       backoffUntilMs: Number(h.backoffUntilMs) || 0,
       failCount: Number(h.failCount) || 0,
@@ -41,6 +40,9 @@ export function initKeyPool(cfgPool, opts = {}) {
     });
     healthVersion.set(k.id, 0);
   });
+  for (const id of Object.keys(savedKeys)) {
+    if (!knownIds.has(id)) console.warn(`[keyPool] state.json unknown key ${JSON.stringify(id)} ignored`);
+  }
   persistState = debouncedWriter("state.json", () => ({
     keys: Object.fromEntries([...health.entries()].map(([id, h]) => [id, { ...h }]))
   }));
@@ -434,7 +436,7 @@ export function getPoolStats() {
 }
 
 export function maskKey(key) {
-  if (!key) return "";
+  if (typeof key !== "string" || !key) return "";
   if (key.length <= 10) return key.slice(0, 3) + "***";
   return key.slice(0, 6) + "***" + key.slice(-4);
 }

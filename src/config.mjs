@@ -59,6 +59,8 @@ const POOL_FIELDS = ["strategy", ...Object.keys(POOL_INTEGER_RULES), ...POOL_BOO
 const CONFIG_SCALAR_FIELDS = ["port", "host", "clientToken", "adminToken", "upstreamPort", "upstreamHost"];
 
 let cfg = null;
+let persistedCfg = null;
+let runtimeUpstreamHost = null;
 
 export class ConfigValidationError extends Error {
   constructor(source, fields) {
@@ -298,6 +300,8 @@ function checkDataDirWritable() {
 }
 
 export function loadConfig() {
+  runtimeUpstreamHost = null;
+  persistedCfg = null;
   checkDataDirWritable();
   const path = resolve(DATA_DIR, "config.json");
   // P2-1：解析失败先把损坏文件备份为 config.json.corrupt-<ts> 再落默认值，
@@ -354,6 +358,7 @@ export function loadConfig() {
     throw e;
   }
   cfg = data;
+  persistedCfg = { ...data, pool: { ...data.pool } };
   try {
     saveConfig();
   } catch (e) {
@@ -366,16 +371,29 @@ export function loadConfig() {
 
 export function getConfig() { return cfg; }
 
+// Hosted mode uses loopback at runtime without rewriting the configured host.
+export function setRuntimeUpstreamHost(host) {
+  if (!cfg) throw new Error("配置尚未加载");
+  if (!hostIsValid(host)) throw new TypeError("运行时上游主机无效");
+  runtimeUpstreamHost = host;
+  cfg = { ...cfg, upstreamHost: host };
+  return cfg;
+}
+
 export function saveConfig(nextCfg = cfg) {
   if (!nextCfg || typeof nextCfg !== "object") throw new Error("配置尚未加载");
   const normalized = validateConfig(nextCfg, { source: "待保存配置" });
+  const persisted = runtimeUpstreamHost === null
+    ? normalized
+    : { ...normalized, upstreamHost: persistedCfg?.upstreamHost || normalized.upstreamHost };
   const path = resolve(DATA_DIR, "config.json");
   const tmp = path + ".tmp";
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(normalized, null, 2), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify(persisted, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, path);
-    cfg = normalized;
+    persistedCfg = { ...persisted, pool: { ...persisted.pool } };
+    cfg = runtimeUpstreamHost === null ? normalized : { ...normalized, upstreamHost: runtimeUpstreamHost };
     markPersistenceSuccess("config");
     return true;
   } catch (e) {

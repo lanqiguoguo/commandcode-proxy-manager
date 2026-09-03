@@ -1,4 +1,4 @@
-// NP-00 架构契约（后续实现必须保持；当前文件以下部分仍是改造前基线）：
+// NP-00 架构契约：
 // - upstream/proxy.mjs 始终是上游原始发布文件。托管模式由 manager 以独立 Node 子进程
 //   启动原始入口（cwd=upstream，直接 server.listen），不得 import、注入 loader 或改写源码。
 // - EMBED_UPSTREAM=1 或未设置表示托管模式：先捕获上游 stdout/stderr，再以
@@ -15,13 +15,13 @@
 //   外置模式不执行子进程停止，重复信号不得产生未处理 rejection。
 // - 初始化并发/重试和版本刷新由上游原始版本负责；manager 不复制这些补丁语义，
 //   同步阶段也不应把本地逻辑写回 upstream/proxy.mjs。
-// ── 入口：加载配置 → 启动/监管上游 → 启动管理网关 ──
+// ── 入口：加载配置 → 初始化日志和管理状态 → 启动/监管上游 → 启动管理网关 ──
 import http from "http";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { EventEmitter } from "events";
-import { loadConfig, getConfig, DATA_DIR } from "./config.mjs";
+import { loadConfig, getConfig, setRuntimeUpstreamHost, DATA_DIR } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as quota from "./quota.mjs";
 import { initStats, usageProviderForPool } from "./stats.mjs";
@@ -31,6 +31,11 @@ import { initAdminApi, handleAdmin, isAdminRequestAuthed } from "./adminApi.mjs"
 import { flushAllPending } from "./state.mjs";
 import { getPersistenceStatus } from "./persistence.mjs";
 import { createServerLifecycle } from "./serverLifecycle.mjs";
+import {
+  startUpstream,
+  DEFAULT_UPSTREAM_STARTUP_TIMEOUT_MS,
+  DEFAULT_UPSTREAM_SHUTDOWN_TIMEOUT_MS,
+} from "./upstreamProcess.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -41,30 +46,41 @@ process.on("unhandledRejection", (reason) => {
   console.error("[manager] unhandledRejection:", (reason && reason.message) || String(reason));
 });
 
-const cfg = loadConfig();
+const hostedUpstream = process.env.EMBED_UPSTREAM !== "0";
+const LOOPBACK_HOST = "127.0.0.1";
+const UPSTREAM_TIMEOUT_MIN_MS = 0;
+const UPSTREAM_TIMEOUT_MAX_MS = 120_000;
 
-// 0) 先挂上游日志捕获（早于上游 import：其启动/配置错误日志即刻入环），
-//    再回放磁盘历史并接事件总线
-attachConsoleCapture();
-
-// 1) 启动上游（vendored，同进程动态 import，零改动）
-//    EMBED_UPSTREAM=0 时不嵌入（便于独立部署上游/测试，转发仍走 UPSTREAM_HOST:UPSTREAM_PORT）
-let embeddedUpstream = null;
-if (process.env.EMBED_UPSTREAM !== "0") {
-  process.env.PORT = String(cfg.upstreamPort);
-  process.env.HOST = cfg.upstreamHost;
-  process.env.CC_EMBEDDED_UPSTREAM = "1";
-  try {
-    embeddedUpstream = await import(resolve(__dirname, "..", "upstream", "proxy.mjs"));
-    if (embeddedUpstream.ready) await embeddedUpstream.ready;
-  } catch (e) {
-    console.error(`[manager] embedded upstream startup failed: ${e.code || "ERROR"} ${e.message}`);
-    process.exitCode = 1;
-    process.exit(1);
+function readUpstreamTimeout(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`[manager] ${name} must be an integer in ${UPSTREAM_TIMEOUT_MIN_MS}..${UPSTREAM_TIMEOUT_MAX_MS}`);
   }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < UPSTREAM_TIMEOUT_MIN_MS || value > UPSTREAM_TIMEOUT_MAX_MS) {
+    throw new Error(`[manager] ${name} must be an integer in ${UPSTREAM_TIMEOUT_MIN_MS}..${UPSTREAM_TIMEOUT_MAX_MS}`);
+  }
+  return value;
 }
 
-// 2) 子系统
+const upstreamStartupTimeoutMs = readUpstreamTimeout(
+  "CC_UPSTREAM_STARTUP_TIMEOUT_MS",
+  DEFAULT_UPSTREAM_STARTUP_TIMEOUT_MS,
+);
+const upstreamShutdownTimeoutMs = readUpstreamTimeout(
+  "CC_UPSTREAM_SHUTDOWN_TIMEOUT_MS",
+  DEFAULT_UPSTREAM_SHUTDOWN_TIMEOUT_MS,
+);
+
+loadConfig();
+if (hostedUpstream) setRuntimeUpstreamHost(LOOPBACK_HOST);
+const cfg = getConfig();
+
+// 0) 先挂上游日志捕获（早于托管子进程启动），再回放磁盘历史并接事件总线。
+attachConsoleCapture();
+
+// 1) 子系统必须在托管上游启动前完成，确保其启动输出可以立即持久化。
 const emitter = new EventEmitter();
 initStats(emitter, cfg.pool.historyRetentionDays);
 initLogs(emitter, cfg.pool.historyRetentionDays); // 系统日志持久化（events.jsonl），先于其他子系统以捕获启动期日志
@@ -228,9 +244,19 @@ const server = http.createServer(async (req, res) => {
 
 const managerLifecycle = createServerLifecycle(server, { label: "manager" });
 
+let upstreamRuntime = null;
 let shutdownPromise = null;
+let shutdownRequested = false;
+
+function upstreamUnexpectedExit(info) {
+  const error = info?.error;
+  console.error(`[manager] upstream exited unexpectedly: ${error?.message || "unknown upstream exit"}`);
+  return shutdown(1, "upstream exited unexpectedly");
+}
+
 function shutdown(exitCode = 0, reason = "signal") {
   if (shutdownPromise) return shutdownPromise;
+  shutdownRequested = true;
   shutdownPromise = (async () => {
     let finalExitCode = exitCode;
     console.log(`[manager] shutdown started (${reason})`);
@@ -239,10 +265,10 @@ function shutdown(exitCode = 0, reason = "signal") {
     flushAllPending();
     try {
       // Close the public gateway first. Active gateway requests may still be
-      // using the embedded upstream, so upstream is closed only after the
+      // using the hosted upstream, so the child is stopped only after the
       // manager has drained or force-terminated those requests.
       await managerLifecycle.close();
-      if (embeddedUpstream?.shutdownUpstream) await embeddedUpstream.shutdownUpstream();
+      if (upstreamRuntime) await upstreamRuntime.stop({ reason });
     } catch (e) {
       finalExitCode = 1;
       console.error(`[manager] shutdown cleanup failed: ${e.message}`);
@@ -251,6 +277,7 @@ function shutdown(exitCode = 0, reason = "signal") {
     process.exitCode = finalExitCode;
     process.exit(finalExitCode);
   })();
+  shutdownPromise.catch(() => {});
   return shutdownPromise;
 }
 
@@ -286,7 +313,30 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   });
 }
 
-managerLifecycle.listen(cfg.port, cfg.host, onManagerListening).catch((e) => {
-  console.error(`[manager] startup failed: ${e.code || "ERROR"} ${e.message}`);
-  shutdown(1, "listen failure").catch(() => process.exit(1));
+async function bootstrap() {
+  if (hostedUpstream) {
+    upstreamRuntime = startUpstream({
+      command: process.execPath,
+      args: ["proxy.mjs"],
+      cwd: resolve(__dirname, "..", "upstream"),
+      host: LOOPBACK_HOST,
+      port: cfg.upstreamPort,
+      startupTimeoutMs: upstreamStartupTimeoutMs,
+      shutdownTimeoutMs: upstreamShutdownTimeoutMs,
+      onUnexpectedExit: upstreamUnexpectedExit,
+    });
+    await upstreamRuntime.ready;
+  }
+  if (shutdownRequested) return;
+
+  await managerLifecycle.listen(cfg.port, cfg.host, onManagerListening);
+}
+
+// Keep startup asynchronous without leaving a top-level await window in which
+// a signal or an early child exit can observe uninitialized shutdown state.
+void bootstrap().catch((error) => {
+  if (shutdownRequested) return;
+  const phase = error?.code === "UPSTREAM_PROCESS_ERROR" ? "upstream" : "manager";
+  console.error(`[manager] ${phase} startup failed: ${error?.code || "ERROR"} ${error?.message || String(error)}`);
+  shutdown(1, `${phase} startup failure`).catch(() => process.exit(1));
 });

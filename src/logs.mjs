@@ -290,7 +290,7 @@ function load() {
   needsCompact = dirty;
 }
 
-// 两阶段启动：attachConsoleCapture() 必须在上游 proxy.mjs import 之前调用，
+// 两阶段启动：attachConsoleCapture() 必须在托管上游子进程启动之前调用，
 // 否则上游启动日志发生在捕获挂钩之前会丢失；initLogs 再回放磁盘历史并接上总线。
 export function initLogs(emitter, retentionDaysArg = 7) {
   if (pruneTimer) clearInterval(pruneTimer);

@@ -2,27 +2,61 @@
 // 行为通道：
 //   1) 请求 body 的 testMode 字段（经网关原样转发的 body 传递）
 //   2) POST /__control {auth, responses:[{mode,...}]} 设置该 Key 的响应队列（优先）
-// 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | server5xx | hang | delay(delayMs)
+// 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | server5xx | hang | bodyhang | delay(delayMs)
 //          | cutstream（200 SSE 写数帧后 destroy，模拟上游流中途断连）| cutbody（200 JSON 写半身后 destroy）
 //          | badusage（200 JSON，usage 字段为字符串/对象/null 恶意值，P1-6 净化验证）
-// 管理端点：GET /__calls 调用记录；GET /__slow slowsse 断流观测；POST /__reset 清空
+// 初始化控制：POST /__control {auth, init:{fingerprint:[spec], lifecycle:[spec]}}
+// 管理端点：GET /__calls 调用记录；GET /__init-calls 初始化调用记录；GET /__slow slowsse 断流观测；POST /__reset 清空
 import http from "http";
 import { setTimeout as sleep } from "timers/promises";
 
 const PORT = Number(process.env.MOCK_PORT || 3051);
 const HOST = process.env.MOCK_HOST || "127.0.0.1";
 const scripts = new Map(); // authKey → [spec...]
+const initScripts = new Map(); // authKey → { fingerprint: [spec...], lifecycle: [spec...] }
 const calls = [];
+const initCalls = [];
 const slowLog = [];
 // 额度探测时间线（串行/间隔断言用）
 const quotaLog = [];
 let quotaActive = 0;
 let quotaMaxActive = 0;
 const quotaLatency = Number(process.env.MOCK_QUOTA_LATENCY || 120);
+let initActive = 0;
+let initMaxActive = 0;
 
 function json(res, status, data, headers) {
   res.writeHead(status, Object.assign({ "Content-Type": "application/json" }, headers || {}));
   res.end(JSON.stringify(data));
+}
+
+function observeClientAbort(req, res, entry) {
+  let settled = false;
+  let resolveDisconnected;
+  const disconnected = new Promise((resolve) => { resolveDisconnected = resolve; });
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (!res.writableEnded) entry.aborted = true;
+    resolveDisconnected();
+  };
+  const onRequestAborted = () => finish();
+  const onRequestError = () => finish();
+  const onResponseClose = () => {
+    if (!res.writableEnded) finish();
+  };
+  req.once("aborted", onRequestAborted);
+  req.once("error", onRequestError);
+  res.once("close", onResponseClose);
+  if (req.destroyed || res.destroyed) finish();
+  return {
+    disconnected,
+    cleanup() {
+      req.off("aborted", onRequestAborted);
+      req.off("error", onRequestError);
+      res.off("close", onResponseClose);
+    },
+  };
 }
 
 const server = http.createServer((req, res) => {
@@ -38,12 +72,29 @@ const server = http.createServer((req, res) => {
       let j = {};
       try { j = JSON.parse(body || "{}"); } catch {}
       scripts.set(j.auth, Array.isArray(j.responses) ? j.responses : []);
+      if (j.init && typeof j.init === "object" && !Array.isArray(j.init)) {
+        initScripts.set(j.auth, {
+          fingerprint: Array.isArray(j.init.fingerprint) ? [...j.init.fingerprint] : [],
+          lifecycle: Array.isArray(j.init.lifecycle) ? [...j.init.lifecycle] : [],
+        });
+      }
       json(res, 200, { ok: true }); return;
     }
     if (p === "/__calls") { json(res, 200, { calls }); return; }
+    if (p === "/__init-calls") { json(res, 200, { calls: initCalls, maxActive: initMaxActive }); return; }
     if (p === "/__quota") { json(res, 200, { quotaLog, maxActive: quotaMaxActive }); return; }
     if (p === "/__slow") { json(res, 200, { slowLog }); return; }
-    if (p === "/__reset") { scripts.clear(); calls.length = 0; slowLog.length = 0; quotaLog.length = 0; quotaMaxActive = quotaActive; json(res, 200, { ok: true }); return; }
+    if (p === "/__reset") {
+      scripts.clear();
+      initScripts.clear();
+      calls.length = 0;
+      initCalls.length = 0;
+      slowLog.length = 0;
+      quotaLog.length = 0;
+      quotaMaxActive = quotaActive;
+      initMaxActive = 0;
+      json(res, 200, { ok: true }); return;
+    }
 
     let parsed = {};
     try { parsed = JSON.parse(body || "{}"); } catch {}
@@ -69,10 +120,69 @@ const server = http.createServer((req, res) => {
       if (p === "/alpha/billing/subscriptions") return json(res, 200, { success: true, data: { currentPeriodStart: "2026-08-25T23:33:28.000Z", currentPeriodEnd: "2026-09-25T23:33:28.000Z", planId: "individual-goat" } });
       return json(res, 200, { totalCount: 42, completedCount: 42, failedCount: 0, successRate: 100, totalTokensIn: 1000, totalTokensOut: 234, totalTokens: 1234, totalCost: 5.5 });
     }
+    if (p === "/alpha/fingerprint/record" || p === "/alpha/lifecycle-events") {
+      const endpoint = p === "/alpha/fingerprint/record" ? "fingerprint" : "lifecycle";
+      const configured = initScripts.get(auth);
+      const queue = configured?.[endpoint];
+      const spec = queue && queue.length ? queue.shift() : { mode: "ok" };
+      const entry = { t: Date.now(), auth, path: p, endpoint, mode: spec.mode, aborted: false };
+      initCalls.push(entry);
+      initActive++;
+      if (initActive > initMaxActive) initMaxActive = initActive;
+      const abortWatcher = observeClientAbort(req, res, entry);
+      try {
+        if (spec.mode === "hang") {
+          await abortWatcher.disconnected;
+          return;
+        }
+        if (spec.mode === "bodyhang") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.write(JSON.stringify({ ok: true, endpoint }));
+          await abortWatcher.disconnected;
+          return;
+        }
+        if (spec.mode === "drop") {
+          req.socket.destroy();
+          await abortWatcher.disconnected;
+          return;
+        }
+        if (spec.mode === "delay") {
+          await Promise.race([sleep(spec.delayMs || 180), abortWatcher.disconnected]);
+          if (entry.aborted) return;
+        }
+        if (spec.mode === "status" || spec.mode === "server5xx") {
+          json(res, spec.status || 503, { error: { message: "initialization failure (mock)", type: "server_error" } });
+          return;
+        }
+        json(res, 200, { ok: true, endpoint });
+      } finally {
+        abortWatcher.cleanup();
+        entry.end = Date.now();
+        initActive--;
+      }
+      return;
+    }
     const q = scripts.get(auth);
     const spec = (q && q.length) ? q.shift() : { mode: parsed.testMode || "ok", retryAfter: parsed.retryAfter };
     calls.push({ t: Date.now(), auth, path: p, mode: spec.mode, model: typeof parsed.model === "string" ? parsed.model : "" });
     console.log(`[mock] ${p} auth=${auth.slice(0, 12)} mode=${spec.mode} call#${calls.length}`);
+
+    // Embedded upstream sends its native CC NDJSON request here rather than
+    // the OpenAI-compatible JSON used by the manager-only e2e scenarios.
+    if (p === "/alpha/generate") {
+      if (spec.mode === "hang") return;
+      if (spec.mode === "delay") await sleep(spec.delayMs || 180);
+      if (spec.mode === "status" || spec.mode === "server5xx") {
+        json(res, spec.status || 503, { error: { message: "generate failure (mock)", type: "server_error" } });
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.end([
+        JSON.stringify({ type: "text-delta", text: "hello from embedded mock" }),
+        JSON.stringify({ type: "finish", finishReason: "stop", totalUsage: { inputTokens: 5, outputTokens: 7, cachedInputTokens: 1 } }),
+      ].join("\n") + "\n");
+      return;
+    }
 
     if (spec.mode === "hang") return; // 永不响应
     if (spec.mode === "delay") {

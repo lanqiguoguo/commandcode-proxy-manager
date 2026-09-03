@@ -194,7 +194,7 @@ const sessionCleanupTimer = setInterval(() => {
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
+      evictExpiredKeyState(key); // 同时清理该 key 的指纹状态
       cleaned++;
     }
   }
@@ -220,9 +220,9 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
 // 每个请求独立 thread ID
 function newThreadId() { return randomUUID(); }
 
-// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
-// 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+// CCPM_INITIALIZATION_PATCH_V1
+// 每个 API Key 的初始化使用独立 flight；失败只清理 flight，不推进节流窗口。
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, initFlight, evictWhenIdle }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
@@ -230,6 +230,8 @@ function getOrCreateKeyState(apiKey) {
     state = {
       fingerprint: generateFingerprint(),
       nextInitAt: 0,
+      initFlight: null,
+      evictWhenIdle: false,
     };
     keyStateStore.set(apiKey, state);
     log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
@@ -237,17 +239,77 @@ function getOrCreateKeyState(apiKey) {
   return state;
 }
 
+function evictExpiredKeyState(apiKey) {
+  const state = keyStateStore.get(apiKey);
+  if (!state) return;
+  const flight = state.initFlight;
+  if (flight && !flight.settled) {
+    state.evictWhenIdle = true;
+    if (!flight.controller.signal.aborted) flight.controller.abort();
+    return;
+  }
+  keyStateStore.delete(apiKey);
+}
+
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
+const INIT_TIMEOUT_DEFAULT_MS = 10000;
+const INIT_TIMEOUT_MIN_MS = 50;
+const INIT_TIMEOUT_MAX_MS = 120000;
+const INIT_RESPONSE_MAX_BYTES = 64 * 1024;
 
-async function ensureInitialized(apiKey, signal) {
-  const state = getOrCreateKeyState(apiKey);
-  const now = Date.now();
-  if (now < state.nextInitAt) return;
+function initializationTimeoutMs() {
+  const value = Number(process.env.CC_INIT_TIMEOUT_MS);
+  return Number.isFinite(value) && value >= INIT_TIMEOUT_MIN_MS && value <= INIT_TIMEOUT_MAX_MS
+    ? Math.floor(value)
+    : INIT_TIMEOUT_DEFAULT_MS;
+}
+
+function initializationAbortError(signal) {
+  const reason = signal?.reason;
+  if (reason && reason.name === 'AbortError') return reason;
+  const error = new Error('The operation was aborted');
+  error.name = 'AbortError';
+  if (reason !== undefined) error.cause = reason;
+  return error;
+}
+
+function throwIfInitializationAborted(signal) {
+  if (signal?.aborted) throw initializationAbortError(signal);
+}
+
+async function consumeInitializationResponse(response, label) {
+  if (!response.ok) {
+    try { await response.body?.cancel(); } catch {}
+    throw new Error(`${label} responded with HTTP ${response.status}`);
+  }
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > INIT_RESPONSE_MAX_BYTES) {
+        try { await reader.cancel(); } catch {}
+        throw new Error(`${label} response body exceeds ${INIT_RESPONSE_MAX_BYTES} bytes`);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return response;
+}
+
+async function performInitialization(apiKey, state, signal) {
+  const timeoutController = new AbortController();
+  const timeoutTimer = setTimeout(() => timeoutController.abort(), initializationTimeoutMs());
+  timeoutTimer.unref?.();
+  const requestSignal = AbortSignal.any([signal, timeoutController.signal]);
 
   try {
-    // 并行发两个预请求
     const headers = {
       'Content-Type': 'application/json',
       'x-cli-environment': 'production',
@@ -255,44 +317,100 @@ async function ensureInitialized(apiKey, signal) {
       'x-command-code-version': CC_VERSION,
     };
     const fingerprint = state.fingerprint || {};
+    const request = (url, body, label) => fetch(url, {
+      method: 'POST', headers, signal: requestSignal, body: JSON.stringify(body),
+    }).then((response) => consumeInitializationResponse(response, label));
 
-    await Promise.all([
-      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify(fingerprint),
-      }).then(r => {
-        if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status });
-        else log('info', 'Fingerprint recorded');
-      }).catch(e => {
-        if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
-      }),
-
-      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
-        method: 'POST', headers, signal,
-        body: JSON.stringify({
-          eventType: 'cli_session_exists',
-          metadata: {
-            sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
-            cliVersion: CC_VERSION,
-            mode: 'interactive',
-            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
-          },
-        }),
-      }).then(r => {
-        if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status });
-        else log('info', 'Lifecycle event sent');
-      }).catch(e => {
-        if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message });
-      }),
+    // allSettled 确保另一条预请求也已收尾，避免失败后留下旧 flight 的网络活动。
+    const results = await Promise.allSettled([
+      request(`${CFG.apiBase}/alpha/fingerprint/record`, fingerprint, 'Fingerprint record'),
+      request(`${CFG.apiBase}/alpha/lifecycle-events`, {
+        eventType: 'cli_session_exists',
+        metadata: {
+          sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
+          cliVersion: CC_VERSION,
+          mode: 'interactive',
+          os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
+        },
+      }, 'Lifecycle event'),
     ]);
+    const failure = results.find((result) => result.status === 'rejected');
+    if (failure || requestSignal.aborted) {
+      const error = failure?.reason instanceof Error
+        ? failure.reason
+        : new Error('Initialization request aborted');
+      const reason = timeoutController.signal.aborted ? 'timeout' : signal.aborted ? 'abort' : 'failure';
+      log('warn', 'Fingerprint/lifecycle initialization failed; will retry', { reason, error: error.message });
+      return false;
+    }
 
-    // 成功：8h + 2h 随机抖动
+    // 只有两条请求都拿到 2xx，才开始 8h+2h 节流窗口。
     const jitter = Math.floor(Math.random() * INIT_JITTER_MS);
     state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
     log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` });
-  } catch (e) {
-    if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
+    return true;
+  } catch (error) {
+    // 保护 flight 的最终收尾；调用方的 abort 由 waitForInitialization 单独传播。
+    const message = error instanceof Error ? error.message : String(error);
+    log('warn', 'Fingerprint/lifecycle initialization exception; will retry', { error: message });
+    return false;
+  } finally {
+    clearTimeout(timeoutTimer);
   }
+}
+
+function finishInitialization(apiKey, state, flight) {
+  flight.settled = true;
+  if (state.initFlight !== flight) return;
+  state.initFlight = null;
+  if (state.evictWhenIdle && !sessionStore.has(apiKey)) keyStateStore.delete(apiKey);
+}
+
+function startInitialization(apiKey, state) {
+  const flight = { controller: new AbortController(), waiters: 0, settled: false, promise: null };
+  const operation = performInitialization(apiKey, state, flight.controller.signal);
+  flight.promise = operation.then((result) => {
+    finishInitialization(apiKey, state, flight);
+    return result;
+  }, (error) => {
+    finishInitialization(apiKey, state, flight);
+    throw error;
+  });
+  // 即使所有调用方都在 abort 后离开，也要显式消费异常 flight。
+  flight.promise.catch(() => {});
+  state.initFlight = flight;
+  return flight;
+}
+
+async function waitForInitialization(flight, signal) {
+  flight.waiters++;
+  let onAbort = null;
+  try {
+    if (!signal) return await flight.promise;
+    const abortPromise = new Promise((resolve, reject) => {
+      onAbort = () => reject(initializationAbortError(signal));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const result = await Promise.race([flight.promise, abortPromise]);
+    throwIfInitializationAborted(signal);
+    return result;
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+    flight.waiters--;
+    if (flight.waiters === 0 && !flight.settled && !flight.controller.signal.aborted) {
+      flight.controller.abort();
+    }
+  }
+}
+
+async function ensureInitialized(apiKey, signal) {
+  const state = getOrCreateKeyState(apiKey);
+  throwIfInitializationAborted(signal);
+  if (Date.now() < state.nextInitAt) return;
+
+  const flight = state.initFlight || startInitialization(apiKey, state);
+  await waitForInitialization(flight, signal);
 }
 
 // ── 模型列表 ───────────────────────────────────────
@@ -890,9 +1008,20 @@ async function handleChatCompletions(req, res) {
   let reader = null;
   let translator = null;
 
+  // CCPM_INITIALIZATION_ABORT_GUARD_V1
+  let initializationComplete = false;
+  const abortInitialization = () => {
+    if (initializationComplete || res.writableEnded) return;
+    if (!abortController.signal.aborted) abortController.abort();
+  };
+  req.once('aborted', abortInitialization);
+  res.once('close', abortInitialization);
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
+    initializationComplete = true;
+    req.off('aborted', abortInitialization);
+    res.off('close', abortInitialization);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
@@ -1662,9 +1791,20 @@ async function handleMessages(req, res) {
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
+  // CCPM_INITIALIZATION_ABORT_GUARD_V1
+  let initializationComplete = false;
+  const abortInitialization = () => {
+    if (initializationComplete || res.writableEnded) return;
+    if (!abortController.signal.aborted) abortController.abort();
+  };
+  req.once('aborted', abortInitialization);
+  res.once('close', abortInitialization);
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
+    initializationComplete = true;
+    req.off('aborted', abortInitialization);
+    res.off('close', abortInitialization);
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {

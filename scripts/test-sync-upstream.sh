@@ -45,8 +45,12 @@ const CC_VERSION_REFRESH_MS = 86400000;
 refreshCCVersion();
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
+function generateFingerprint() {
+  return { components: { platform: 'fixture', arch: 'x64' } };
+}
+const CC_VERSION = 'fixture';
+
 const sessionStore = new Map();
-const keyStateStore = new Map();
 // 定期清理过期 session
 setInterval(() => {
   for (const [key, entry] of sessionStore) {
@@ -57,6 +61,54 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 function getSessionId() { return 'fixture'; }
+
+// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
+// 每个 API Key 拥有自己的设备指纹和初始化定时器
+const keyStateStore = new Map();
+
+function getOrCreateKeyState(apiKey) {
+  let state = keyStateStore.get(apiKey);
+  if (!state) {
+    state = {
+      fingerprint: generateFingerprint(),
+      nextInitAt: 0,
+    };
+    keyStateStore.set(apiKey, state);
+  }
+  return state;
+}
+
+// ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
+async function ensureInitialized(apiKey, signal) {
+  const state = getOrCreateKeyState(apiKey);
+  if (Date.now() < state.nextInitAt) return;
+  await Promise.all([
+    fetch('http://127.0.0.1/fingerprint', { signal }),
+    fetch('http://127.0.0.1/lifecycle', { signal }),
+  ]);
+  state.nextInitAt = Date.now() + 1;
+}
+
+// ── 模型列表 ───────────────────────────────────────
+const MODELS = [];
+
+async function fixtureOpenAi(req, res, apiKey) {
+  const abortController = new AbortController();
+  let aborted = false;
+  try {
+    // 首次初始化（fingerprint + lifecycle）
+    await ensureInitialized(apiKey, abortController.signal);
+  } catch {}
+}
+
+async function fixtureAnthropic(req, res, apiKey) {
+  const abortController = new AbortController();
+  let aborted = false;
+  try {
+    // 首次初始化（fingerprint + lifecycle）
+    await ensureInitialized(apiKey, abortController.signal);
+  } catch {}
+}
 
 function sendJSON(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -172,6 +224,7 @@ FAKE="$T/fake-repo"
 mkdir -p "$FAKE/scripts" "$FAKE/src" "$FAKE/upstream"
 cp "$ROOT_DIR/scripts/sync-upstream.sh" "$FAKE/scripts/"
 cp "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$FAKE/scripts/"
+cp "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$FAKE/scripts/"
 cp "$ROOT_DIR/src/serverLifecycle.mjs" "$FAKE/src/"
 printf 'old-proxy\n' > "$FAKE/upstream/proxy.mjs"
 printf 'old-config\n' > "$FAKE/upstream/config.json"
@@ -238,10 +291,12 @@ assert_patch_applies_once() {
   local target=$2
   local first second before after
   first=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
+  first+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$target" 2>&1)
   echo "--- $label first patch ---"; echo "$first"
   echo "$first" | grep -Fq "upstream lifecycle patch applied" || fail "$label 首次应应用补丁"
   cp -p "$target" "$target.before-second"
   second=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
+  second+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$target" 2>&1)
   echo "--- $label second patch ---"; echo "$second"
   echo "$second" | grep -Fq "upstream lifecycle patch already present" || fail "$label 重复执行应报告 already present"
   cmp -- "$target.before-second" "$target" || fail "$label 重复执行改变了字节"
@@ -270,6 +325,8 @@ assert_patch_applies_once "当前上游 fixture" "$CURRENT_CLEAN"
 
 RELEASE_CLEAN="$T/release-upstream-clean.mjs"
 git -C "$UP" show "$TAG_COMMIT:proxy.mjs" > "$RELEASE_CLEAN"
+RELEASE_PRISTINE="$T/release-upstream-pristine.mjs"
+cp -p "$RELEASE_CLEAN" "$RELEASE_PRISTINE"
 assert_patch_applies_once "release test fixture" "$RELEASE_CLEAN"
 
 PATCHED_RELEASE="$T/release-upstream-patched.mjs"
@@ -277,6 +334,7 @@ cp -p "$FAKE/upstream/proxy.mjs" "$PATCHED_RELEASE"
 PATCHED_RELEASE_BEFORE="$T/release-upstream-patched.before"
 cp -p "$PATCHED_RELEASE" "$PATCHED_RELEASE_BEFORE"
 PATCHED_RELEASE_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$PATCHED_RELEASE" 2>&1)
+PATCHED_RELEASE_OUT+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PATCHED_RELEASE" 2>&1)
 echo "--- already patched byte check ---"; echo "$PATCHED_RELEASE_OUT"
 echo "$PATCHED_RELEASE_OUT" | grep -Fq "upstream lifecycle patch already present" || fail "已补丁输入应报告 already present"
 cmp -- "$PATCHED_RELEASE_BEFORE" "$PATCHED_RELEASE" || fail "已补丁输入重复执行改变了字节"
@@ -286,6 +344,48 @@ DUP_MARKER="$T/duplicate-marker.mjs"
 cp -p "$PATCHED_RELEASE" "$DUP_MARKER"
 printf '\n// CCPM_LIFECYCLE_PATCH_V1\n' >> "$DUP_MARKER"
 assert_patch_rejection "重复 lifecycle marker" "$DUP_MARKER" "生命周期标记重复"
+
+DUP_INIT_MARKER="$T/duplicate-init-marker.mjs"
+cp -p "$PATCHED_RELEASE" "$DUP_INIT_MARKER"
+printf '\n// CCPM_INITIALIZATION_PATCH_V1\n' >> "$DUP_INIT_MARKER"
+INIT_MARKER_BEFORE="$DUP_INIT_MARKER.before-rejection"
+cp -p "$DUP_INIT_MARKER" "$INIT_MARKER_BEFORE"
+if INIT_MARKER_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$DUP_INIT_MARKER" 2>&1); then
+  echo "$INIT_MARKER_OUT"
+  fail "重复 initialization marker 应拒绝"
+fi
+echo "--- 重复 initialization marker rejection ---"; echo "$INIT_MARKER_OUT"
+echo "$INIT_MARKER_OUT" | grep -Fq "初始化补丁标记重复" || fail "重复 initialization marker 缺少明确诊断"
+cmp -- "$INIT_MARKER_BEFORE" "$DUP_INIT_MARKER" || fail "重复 initialization marker 拒绝时修改了字节"
+ok "重复 initialization marker 拒绝且输入字节保持不变"
+
+PARTIAL_INIT="$T/partial-initialization-patch.mjs"
+cp -p "$RELEASE_PRISTINE" "$PARTIAL_INIT"
+printf '\n// partial F11 state: initFlight\n' >> "$PARTIAL_INIT"
+PARTIAL_INIT_BEFORE="$PARTIAL_INIT.before-rejection"
+cp -p "$PARTIAL_INIT" "$PARTIAL_INIT_BEFORE"
+if PARTIAL_INIT_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PARTIAL_INIT" 2>&1); then
+  echo "$PARTIAL_INIT_OUT"
+  fail "不完整 initialization patch 应拒绝"
+fi
+echo "--- 不完整 initialization patch rejection ---"; echo "$PARTIAL_INIT_OUT"
+echo "$PARTIAL_INIT_OUT" | grep -Fq "检测到不完整的初始化补丁" || fail "不完整 initialization patch 缺少明确诊断"
+cmp -- "$PARTIAL_INIT_BEFORE" "$PARTIAL_INIT" || fail "不完整 initialization patch 拒绝时修改了字节"
+ok "不完整 initialization patch 拒绝且输入字节保持不变"
+
+MISSING_INIT_CLEANUP="$T/missing-initialization-cleanup.mjs"
+cp -p "$RELEASE_PRISTINE" "$MISSING_INIT_CLEANUP"
+sed -i 's/keyStateStore\.delete(key);/sessionStore.delete(key);/' "$MISSING_INIT_CLEANUP"
+MISSING_INIT_BEFORE="$MISSING_INIT_CLEANUP.before-rejection"
+cp -p "$MISSING_INIT_CLEANUP" "$MISSING_INIT_BEFORE"
+if MISSING_INIT_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$MISSING_INIT_CLEANUP" 2>&1); then
+  echo "$MISSING_INIT_OUT"
+  fail "缺少初始化 cleanup 锚点应拒绝"
+fi
+echo "--- 缺少 initialization cleanup rejection ---"; echo "$MISSING_INIT_OUT"
+echo "$MISSING_INIT_OUT" | grep -Fq "过期 Key 状态清理锚点应恰好出现一次" || fail "缺少 initialization cleanup 缺少明确诊断"
+cmp -- "$MISSING_INIT_BEFORE" "$MISSING_INIT_CLEANUP" || fail "缺少 initialization cleanup 拒绝时修改了字节"
+ok "缺少 initialization cleanup 锚点拒绝且输入字节保持不变"
 
 DUP_UNREF="$T/duplicate-unref.mjs"
 cp -p "$PATCHED_RELEASE" "$DUP_UNREF"

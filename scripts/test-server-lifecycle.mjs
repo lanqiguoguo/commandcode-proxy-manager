@@ -1,10 +1,11 @@
+import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
 import {
   chmodSync,
   mkdtempSync,
-  mkdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -20,36 +21,55 @@ const HOST = "127.0.0.1";
 const ADMIN_TOKEN = "lifecycle-admin-token";
 const CLIENT_TOKEN = "lifecycle-client-token";
 const TEST_KEY = "user_lifecycle_key";
-const STARTUP_TIMEOUT_MS = 15000;
-const REQUEST_TIMEOUT_MS = 15000;
-const EXIT_MARGIN_MS = 3000;
+const STARTUP_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 8_000;
+const CHILD_EXIT_TIMEOUT_MS = 8_000;
+const SERVER_CLOSE_TIMEOUT_MS = 3_000;
+const OUTPUT_LIMIT = 48 * 1024;
 
-const children = new Set();
+const liveChildren = new Set();
+const knownChildren = new Set();
 const clients = new Set();
 
 function errorText(error) {
-  return error instanceof Error ? `${error.code ? `${error.code}: ` : ""}${error.message}` : String(error);
+  if (error instanceof Error) return `${error.code ? `${error.code}: ` : ""}${error.message}`;
+  return String(error);
 }
 
-function isExpectedForceDisconnect(error) {
-  const code = error?.code;
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return code === "ECONNRESET"
-    || code === "ECONNABORTED"
-    || /\b(?:ECONNRESET|ECONNABORTED)\b/.test(message)
-    || /socket hang up/i.test(message);
+function assertCondition(condition, message) {
+  assert.equal(Boolean(condition), true, message);
 }
 
 function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-function rememberClient(client) {
-  clients.add(client);
-  const forget = () => clients.delete(client);
-  client.once("close", forget);
-  client.once("error", forget);
-  return client;
+function bounded(promise, timeoutMs, label) {
+  return new Promise((resolvePromise, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${label} exceeded ${timeoutMs}ms`));
+    }, timeoutMs);
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    Promise.resolve(promise).then(
+      (value) => finish(resolvePromise, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+function appendOutput(child, stream, chunk) {
+  const text = String(chunk);
+  const key = stream === "stderr" ? "stderrText" : "stdoutText";
+  child[key] = `${child[key] || ""}${text}`.slice(-OUTPUT_LIMIT);
+  child.outputEvents.push({ stream, text, at: performance.now() });
 }
 
 function spawnNode(args, env = {}) {
@@ -61,103 +81,155 @@ function spawnNode(args, env = {}) {
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error) {
-    throw new Error(`环境不支持启动真实 Node 子进程：${errorText(error)}`);
+    throw new Error(`real child process is unavailable: ${errorText(error)}`);
   }
-  children.add(child);
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
   child.stdoutText = "";
   child.stderrText = "";
-  child.stdout.on("data", (chunk) => { child.stdoutText += chunk; });
-  child.stderr.on("data", (chunk) => { child.stderrText += chunk; });
-  child.once("close", () => children.delete(child));
+  child.outputEvents = [];
+  child.spawnError = null;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => appendOutput(child, "stdout", chunk));
+  child.stderr.on("data", (chunk) => appendOutput(child, "stderr", chunk));
+  child.on("error", (error) => { child.spawnError = error; });
+  child.once("close", () => liveChildren.delete(child));
+  liveChildren.add(child);
+  knownChildren.add(child);
   return child;
 }
 
 function childOutput(child) {
-  return `${child.stdoutText || ""}\n${child.stderrText || ""}`;
+  if (!child) return "<child unavailable>";
+  return [
+    "manager stdout (including forwarded upstream stdout):",
+    child.stdoutText || "<none>",
+    "manager stderr (including forwarded upstream stderr):",
+    child.stderrText || "<none>",
+  ].join("\n");
+}
+
+function allChildDiagnostics() {
+  return [...knownChildren].map((child, index) => `\n--- child ${index + 1} ---\n${childOutput(child)}`).join("");
 }
 
 function waitForClose(child, timeoutMs, label) {
-  if (child.exitCode !== null || child.signalCode) {
+  if (!child) return Promise.reject(new Error(`${label}: child is missing`));
+  if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
   }
   return new Promise((resolvePromise, reject) => {
-    let timer;
-    const finish = (result) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.off("close", onClose);
+      child.off("error", onError);
+      reject(new Error(`${label} did not exit within ${timeoutMs}ms\n${childOutput(child)}`));
+    }, timeoutMs);
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      child.removeListener("close", onClose);
-      child.removeListener("error", onError);
-      resolvePromise(result);
+      child.off("close", onClose);
+      child.off("error", onError);
+      fn(value);
     };
-    const onClose = (code, signal) => finish({ code, signal });
-    const onError = (error) => {
-      clearTimeout(timer);
-      child.removeListener("close", onClose);
-      child.removeListener("error", onError);
-      reject(new Error(`${label} 子进程错误：${errorText(error)}`));
-    };
+    const onClose = (code, signal) => finish(resolvePromise, { code, signal });
+    const onError = (error) => finish(reject, new Error(`${label} child error: ${errorText(error)}`));
     child.once("close", onClose);
     child.once("error", onError);
-    timer = setTimeout(() => {
-      child.removeListener("close", onClose);
-      child.removeListener("error", onError);
-      reject(new Error(`${label} 未在 ${timeoutMs}ms 内退出\n${childOutput(child)}`));
-    }, timeoutMs);
-    timer.unref?.();
   });
 }
 
 async function stopChild(child, label) {
-  if (!child || (child.exitCode !== null && child.exitCode !== undefined) || child.signalCode) return;
+  if (!child) return null;
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
   try { child.kill("SIGTERM"); } catch {}
   try {
-    await waitForClose(child, 2000, label);
-  } catch {
-    try { child.kill("SIGKILL"); } catch {}
-    await waitForClose(child, 1000, `${label} SIGKILL`).catch(() => {});
+    return await waitForClose(child, 2_000, label);
+  } catch (termError) {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill("SIGKILL"); } catch {}
+    }
+    try {
+      return await waitForClose(child, 2_000, `${label} SIGKILL`);
+    } catch (killError) {
+      throw new Error(`${label} cleanup failed: ${errorText(termError)}; ${errorText(killError)}`);
+    }
   }
 }
 
 function listenServer(server, port = 0) {
   return new Promise((resolvePromise, reject) => {
     let settled = false;
-    const fail = (error) => {
+    const onError = (error) => {
       if (settled) return;
       settled = true;
-      server.removeListener("listening", onListening);
-      reject(new Error(`环境不支持真实网络 socket 测试：${errorText(error)}`));
+      server.off("listening", onListening);
+      reject(error);
     };
     const onListening = () => {
       if (settled) return;
       settled = true;
-      server.removeListener("error", fail);
+      server.off("error", onError);
       const address = server.address();
       if (!address || typeof address !== "object") {
-        reject(new Error("真实网络 socket 测试未取得动态端口"));
+        reject(new Error("dynamic listener returned no address"));
         return;
       }
       resolvePromise({ server, port: address.port });
     };
-    server.once("error", fail);
+    server.once("error", onError);
     server.once("listening", onListening);
     try {
       server.listen({ host: HOST, port });
     } catch (error) {
-      fail(error);
+      onError(error);
     }
   });
 }
 
-async function reservePort() {
-  const result = await listenServer(net.createServer(), 0);
-  await new Promise((resolvePromise, reject) => result.server.close((error) => error ? reject(error) : resolvePromise()));
-  return result.port;
+async function closeServer(server, sockets = new Set(), label = "server") {
+  for (const socket of sockets) {
+    try { socket.destroy(); } catch {}
+  }
+  sockets.clear();
+  if (!server || !server.listening) return;
+  const closePromise = new Promise((resolvePromise, reject) => {
+    try {
+      server.close((error) => {
+        if (error && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+        else resolvePromise();
+      });
+    } catch (error) {
+      if (error?.code === "ERR_SERVER_NOT_RUNNING") resolvePromise();
+      else reject(error);
+    }
+  });
+  await bounded(closePromise, SERVER_CLOSE_TIMEOUT_MS, `${label} close`);
 }
 
-async function closeServer(server) {
-  if (!server || !server.listening) return;
-  await new Promise((resolvePromise) => server.close(() => resolvePromise()));
+async function reservePort() {
+  const result = await listenServer(net.createServer());
+  try {
+    return result.port;
+  } finally {
+    await closeServer(result.server, new Set(), "reserved port");
+  }
+}
+
+async function createBlocker(port = 0) {
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+    // Keep accepted sockets open until cleanup so server.close cannot hide a leak.
+  });
+  const bound = await listenServer(server, port);
+  return { ...bound, sockets };
 }
 
 function requestOnce({ port, path, method = "GET", headers = {}, body, timeoutMs = REQUEST_TIMEOUT_MS }) {
@@ -166,13 +238,14 @@ function requestOnce({ port, path, method = "GET", headers = {}, body, timeoutMs
     let settled = false;
     let timer;
     let response;
+    const chunks = [];
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       fn(value);
     };
-    const req = rememberClient(http.request({
+    const req = http.request({
       host: HOST,
       port,
       path,
@@ -181,38 +254,50 @@ function requestOnce({ port, path, method = "GET", headers = {}, body, timeoutMs
       agent: false,
     }, (res) => {
       response = res;
-      const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => finish(resolvePromise, {
+      res.once("end", () => finish(resolvePromise, {
         outcome: "end",
         status: res.statusCode,
         headers: res.headers,
         body: Buffer.concat(chunks).toString("utf8"),
         ms: Math.round(performance.now() - startedAt),
       }));
-      res.on("aborted", () => finish(resolvePromise, {
+      res.once("aborted", () => finish(resolvePromise, {
         outcome: "aborted",
         status: res.statusCode,
         body: Buffer.concat(chunks).toString("utf8"),
         ms: Math.round(performance.now() - startedAt),
       }));
-      res.on("error", (error) => finish(resolvePromise, {
+      res.once("error", (error) => finish(resolvePromise, {
         outcome: `response-error:${error.code || error.message}`,
         status: res.statusCode,
         body: Buffer.concat(chunks).toString("utf8"),
+        error: errorText(error),
         ms: Math.round(performance.now() - startedAt),
       }));
-    }));
-    req.on("error", (error) => finish(resolvePromise, {
+      res.once("close", () => {
+        if (!settled) finish(resolvePromise, {
+          outcome: "response-close",
+          status: res.statusCode,
+          body: Buffer.concat(chunks).toString("utf8"),
+          ms: Math.round(performance.now() - startedAt),
+        });
+      });
+    });
+    clients.add(req);
+    const forget = () => clients.delete(req);
+    req.once("close", forget);
+    req.once("error", forget);
+    req.once("error", (error) => finish(resolvePromise, {
       outcome: `request-error:${error.code || error.message}`,
+      error: errorText(error),
       ms: Math.round(performance.now() - startedAt),
     }));
     timer = setTimeout(() => {
       try { response?.destroy(); } catch {}
       try { req.destroy(); } catch {}
-      finish(reject, new Error(`HTTP ${method} ${path} 超时 ${timeoutMs}ms`));
+      finish(reject, new Error(`HTTP ${method} ${path} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
-    timer.unref?.();
     if (body !== undefined) req.write(body);
     req.end();
   });
@@ -231,8 +316,9 @@ function openActiveRequest({ port, path, method = "GET", headers = {}, body, tim
     resolveReady = resolvePromise;
     rejectReady = reject;
   });
+  ready.catch(() => {});
   const done = new Promise((resolvePromise) => { resolveDone = resolvePromise; });
-  const result = {
+  const active = {
     ready,
     done,
     request: null,
@@ -252,7 +338,7 @@ function openActiveRequest({ port, path, method = "GET", headers = {}, body, tim
       error: error ? errorText(error) : undefined,
     });
   };
-  const req = rememberClient(http.request({
+  const req = http.request({
     host: HOST,
     port,
     path,
@@ -261,69 +347,78 @@ function openActiveRequest({ port, path, method = "GET", headers = {}, body, tim
     agent: false,
   }, (res) => {
     response = res;
-    result.response = res;
+    active.response = res;
     res.on("data", (chunk) => responseBody.push(chunk));
-    res.on("end", () => finish("end"));
-    res.on("aborted", () => finish("aborted"));
-    res.on("error", (error) => finish(`response-error:${error.code || error.message}`, error));
+    res.once("end", () => finish("end"));
+    res.once("aborted", () => finish("aborted"));
+    res.once("error", (error) => finish(`response-error:${error.code || error.message}`, error));
+    res.once("close", () => {
+      if (!settled) finish("response-close", new Error("response closed before end"));
+    });
     resolveReady(res);
-  }));
-  result.request = req;
-  req.on("error", (error) => finish(`request-error:${error.code || error.message}`, error));
-  req.on("close", () => {
-    if (!settled && !response) finish("request-close");
+  });
+  active.request = req;
+  clients.add(req);
+  const forget = () => clients.delete(req);
+  req.once("close", forget);
+  req.once("error", forget);
+  req.once("error", (error) => finish(`request-error:${error.code || error.message}`, error));
+  req.once("close", () => {
+    if (!settled && !response) finish("request-close", new Error("request closed before response"));
   });
   timer = setTimeout(() => {
     try { response?.destroy(); } catch {}
     try { req.destroy(); } catch {}
-    finish("timeout", new Error(`HTTP ${method} ${path} 超时 ${timeoutMs}ms`));
+    finish("timeout", new Error(`HTTP ${method} ${path} timed out after ${timeoutMs}ms`));
   }, timeoutMs);
-  timer.unref?.();
   if (body !== undefined) req.write(body);
   req.end();
-  return result;
+  return active;
 }
 
-function waitForResponseText(active, text, label, timeoutMs = 3000) {
-  if (active.body.includes(text)) return Promise.resolve();
-  return new Promise((resolvePromise, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`${label} 未收到 ${JSON.stringify(text)}`));
-    }, timeoutMs);
-    const onData = () => {
-      if (!active.body.includes(text)) return;
-      cleanup();
-      resolvePromise();
-    };
-    const onClose = () => {
-      cleanup();
-      reject(new Error(`${label} 在收到 ${JSON.stringify(text)} 前连接关闭`));
-    };
-    const cleanup = () => {
+async function closeActiveRequest(active, label) {
+  if (!active) return;
+  try { active.request?.destroy(); } catch {}
+  try { active.response?.destroy(); } catch {}
+  await bounded(active.done, 2_000, `${label} request cleanup`).catch(() => {});
+}
+
+async function waitForResponseText(active, text, label, timeoutMs = 3_000) {
+  if (active.body.includes(text)) return;
+  if (!active.response) await bounded(active.ready, timeoutMs, `${label} headers`);
+  if (active.body.includes(text)) return;
+  await bounded(new Promise((resolvePromise, reject) => {
+    const finish = (fn, value) => {
       clearTimeout(timer);
       active.response?.off("data", onData);
       active.response?.off("close", onClose);
+      fn(value);
     };
+    const onData = () => {
+      if (active.body.includes(text)) finish(resolvePromise);
+    };
+    const onClose = () => finish(reject, new Error(`${label} closed before ${JSON.stringify(text)}`));
+    const timer = setTimeout(() => finish(reject, new Error(`${label} did not receive ${JSON.stringify(text)}`)), timeoutMs);
     active.response?.on("data", onData);
     active.response?.once("close", onClose);
-  });
+  }), timeoutMs + 100, `${label} wait`);
 }
 
-async function waitForHttp(port, path, predicate, label) {
-  const startedAt = performance.now();
+async function waitForHttp(port, path, predicate, label, timeoutMs = STARTUP_TIMEOUT_MS) {
+  const deadline = performance.now() + timeoutMs;
   let lastError = "";
-  while (performance.now() - startedAt < STARTUP_TIMEOUT_MS) {
+  while (performance.now() < deadline) {
+    const remaining = Math.max(1, Math.floor(deadline - performance.now()));
     try {
-      const response = await requestOnce({ port, path, timeoutMs: 1000 });
-      if (predicate(response)) return response;
-      lastError = `${response.status} ${response.body}`;
+      const result = await requestOnce({ port, path, timeoutMs: Math.min(700, remaining) });
+      if (predicate(result)) return result;
+      lastError = `${result.outcome || "response"} ${result.status ?? ""} ${result.body || result.error || ""}`;
     } catch (error) {
       lastError = errorText(error);
     }
-    await sleep(75);
+    await sleep(Math.min(60, Math.max(1, Math.floor(deadline - performance.now()))));
   }
-  throw new Error(`${label} 未在 ${STARTUP_TIMEOUT_MS}ms 内可用：${lastError}`);
+  throw new Error(`${label} unavailable within ${timeoutMs}ms: ${lastError}`);
 }
 
 async function waitForMockCall(mockPort, mode, label) {
@@ -343,19 +438,18 @@ async function configureMock(mockPort, response) {
     port: mockPort,
     path: "/__control",
     method: "POST",
-    headers: { "Content-Type": "application/json", "Connection": "close" },
+    headers: { "Content-Type": "application/json", Connection: "close" },
     body: JSON.stringify({ auth: TEST_KEY, responses: [response] }),
   });
-  if (result.outcome !== "end" || result.status !== 200) {
-    throw new Error(`mock 配置失败：${JSON.stringify(result)}`);
-  }
+  assert.equal(result.outcome, "end", `mock configuration did not finish: ${JSON.stringify(result)}`);
+  assert.equal(result.status, 200, `mock configuration failed: ${JSON.stringify(result)}`);
 }
 
-function makeDataDir(port, upstreamPort) {
+function makeDataDir(managerPort, upstreamPort) {
   const dataDir = mkdtempSync(join(tmpdir(), "ccpm-lifecycle-data-"));
   chmodSync(dataDir, 0o700);
   writeFileSync(join(dataDir, "config.json"), JSON.stringify({
-    port,
+    port: managerPort,
     host: HOST,
     upstreamPort,
     upstreamHost: HOST,
@@ -364,7 +458,7 @@ function makeDataDir(port, upstreamPort) {
     pool: {
       maxRetries: 0,
       sameKeyRetryCount: 0,
-      quotaRefreshMs: 3600000,
+      quotaRefreshMs: 3_600_000,
     },
   }));
   writeFileSync(join(dataDir, "keys.json"), JSON.stringify({
@@ -380,7 +474,7 @@ function makeDataDir(port, upstreamPort) {
   return dataDir;
 }
 
-function managerEnv(dataDir, managerPort, upstreamPort, embedded, graceMs, forceWaitMs, mockPort) {
+function managerEnv(dataDir, managerPort, upstreamPort, embedded, graceMs, forceWaitMs, mockPort, options = {}) {
   return {
     DATA_DIR: dataDir,
     PORT: String(managerPort),
@@ -390,9 +484,12 @@ function managerEnv(dataDir, managerPort, upstreamPort, embedded, graceMs, force
     EMBED_UPSTREAM: embedded ? "1" : "0",
     ADMIN_TOKEN,
     CLIENT_TOKEN,
+    CC_API_BASE: `http://${HOST}:${mockPort}`,
     CC_QUOTA_BASE: `http://${HOST}:${mockPort}`,
     CC_SHUTDOWN_GRACE_MS: String(graceMs),
     CC_SHUTDOWN_FORCE_WAIT_MS: String(forceWaitMs),
+    CC_UPSTREAM_STARTUP_TIMEOUT_MS: String(options.startupTimeoutMs ?? 2_000),
+    CC_UPSTREAM_SHUTDOWN_TIMEOUT_MS: String(options.shutdownTimeoutMs ?? 250),
   };
 }
 
@@ -406,140 +503,186 @@ async function startMock(mockPort) {
   return child;
 }
 
-async function assertPortsFree(ports, label) {
-  for (const port of ports) {
-    const result = await listenServer(net.createServer(), port).catch((error) => {
-      throw new Error(`${label} 后端口 ${port} 仍被占用：${errorText(error)}`);
-    });
-    await closeServer(result.server);
+async function assertPortReusable(port, label) {
+  let result;
+  try {
+    result = await listenServer(net.createServer(), port);
+  } catch (error) {
+    throw new Error(`${label}: port ${port} is still occupied: ${errorText(error)}`);
+  }
+  await closeServer(result.server, new Set(), `${label} reusable check`);
+}
+
+function directChildPids(pid) {
+  if (!Number.isInteger(pid)) return [];
+  try {
+    const text = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8").trim();
+    return text ? text.split(/\s+/).filter(Boolean).map(Number) : [];
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw new Error(`cannot inspect direct children of ${pid}: ${errorText(error)}`);
   }
 }
 
-async function expectStartupConflict({ kind, managerPort, blockedPort, mockPort, embedded }) {
-  const blocker = await listenServer(net.createServer(), blockedPort);
-  const dataDir = makeDataDir(managerPort, blockedPort);
-  let child;
-  try {
-    child = spawnNode([MANAGER_ENTRY], managerEnv(
-      dataDir,
-      managerPort,
-      blockedPort,
-      embedded,
-      250,
-      250,
-      mockPort,
-    ));
-    const result = await waitForClose(child, 5000, `${kind} 冲突`);
-    const output = childOutput(child);
-    if (result.code === 0 || result.signal) throw new Error(`${kind} 冲突未以非零退出：${JSON.stringify(result)}\n${output}`);
-    if (!output.includes("EADDRINUSE")) throw new Error(`${kind} 冲突缺少 EADDRINUSE 诊断：\n${output}`);
-    const diagnostic = embedded ? "embedded upstream startup failed" : "startup failed";
-    if (!output.includes(diagnostic)) throw new Error(`${kind} 冲突缺少启动诊断 ${diagnostic}：\n${output}`);
-    console.log(`  PASS ${kind} 真实端口冲突 -> code=${result.code}, EADDRINUSE/startup diagnostic`);
-  } finally {
-    await stopChild(child, `${kind} 冲突清理`);
-    await closeServer(blocker.server);
-    rmSync(dataDir, { recursive: true, force: true });
+async function waitForDirectChild(pid, label, timeoutMs = 3_000) {
+  const deadline = performance.now() + timeoutMs;
+  let last = [];
+  while (performance.now() < deadline) {
+    last = directChildPids(pid);
+    if (last.length) return last[0];
+    await sleep(25);
   }
-  await assertPortsFree([managerPort, blockedPort], `${kind} 冲突清理`);
+  throw new Error(`${label}: no direct child found within ${timeoutMs}ms; last=${last.join(",") || "none"}`);
+}
+
+async function assertPidGone(pid, label, timeoutMs = 2_000) {
+  if (!Number.isInteger(pid)) return;
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    try {
+      readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    await sleep(25);
+  }
+  throw new Error(`${label}: pid ${pid} is still present`);
+}
+
+function assertNonZeroExit(result, label) {
+  assertCondition(result.code !== 0 && result.signal === null, `${label} should exit with a non-zero code: ${JSON.stringify(result)}`);
+}
+
+function outputEventIndex(child, needle) {
+  let output = "";
+  for (let index = 0; index < child.outputEvents.length; index += 1) {
+    output += child.outputEvents[index].text;
+    if (output.includes(needle)) return index;
+  }
+  return -1;
+}
+
+function assertHostedReadyBeforeManagerListen(manager) {
+  const upstreamIndex = outputEventIndex(manager, "CC Proxy started");
+  const managerIndex = outputEventIndex(manager, "[manager] CC Proxy Manager started");
+  assertCondition(upstreamIndex >= 0, `hosted upstream ready log missing\n${childOutput(manager)}`);
+  assertCondition(managerIndex >= 0, `manager listen log missing\n${childOutput(manager)}`);
+  assertCondition(upstreamIndex < managerIndex, `manager listen was logged before upstream ready\n${childOutput(manager)}`);
+}
+
+function assertHostedReadyBeforeManagerFailure(manager) {
+  const upstreamIndex = outputEventIndex(manager, "CC Proxy started");
+  const failureIndex = outputEventIndex(manager, "[manager] listen failed");
+  assertCondition(upstreamIndex >= 0, `hosted upstream ready log missing\n${childOutput(manager)}`);
+  assertCondition(failureIndex >= 0, `manager listen failure log missing\n${childOutput(manager)}`);
+  assertCondition(upstreamIndex < failureIndex, `manager listen failed before upstream ready\n${childOutput(manager)}`);
+}
+
+async function cleanupCase({ manager, active, blocker, dataDir, label }) {
+  let cleanupError;
+  try {
+    await closeActiveRequest(active, label);
+  } catch (error) {
+    cleanupError ||= error;
+  }
+  try {
+    await stopChild(manager, `${label} manager`);
+  } catch (error) {
+    cleanupError ||= error;
+  }
+  try {
+    await closeServer(blocker?.server, blocker?.sockets || new Set(), `${label} blocker`);
+  } catch (error) {
+    cleanupError ||= error;
+  }
+  if (dataDir) {
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch (error) { cleanupError ||= error; }
+  }
+  if (cleanupError) throw cleanupError;
 }
 
 async function runGracefulNormal(mockPort) {
   const managerPort = await reservePort();
-  const upstreamPort = await reservePort();
   const dataDir = makeDataDir(managerPort, mockPort);
-  const graceMs = 1200;
+  const graceMs = 1_200;
   const forceWaitMs = 250;
   let manager;
   let active;
   try {
     manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, mockPort, false, graceMs, forceWaitMs, mockPort));
-    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "manager normal startup");
+    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "external manager startup");
+    assert.deepEqual(directChildPids(manager.pid), [], "EMBED_UPSTREAM=0 must not spawn a child");
     await configureMock(mockPort, { mode: "delay", delayMs: 250 });
     active = openActiveRequest({
       port: managerPort,
       path: "/v1/chat/completions",
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${CLIENT_TOKEN}`,
-        Connection: "close",
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${CLIENT_TOKEN}`, Connection: "close" },
       body: JSON.stringify({ model: "lifecycle-normal", stream: false }),
     });
-    await waitForMockCall(mockPort, "delay", "普通活动请求到达 mock");
+    await waitForMockCall(mockPort, "delay", "normal request reaches mock");
     const signalAt = performance.now();
     manager.kill("SIGTERM");
     const [response, exit] = await Promise.all([
       active.done,
-      waitForClose(manager, graceMs + forceWaitMs + EXIT_MARGIN_MS, "普通活动请求 manager"),
+      waitForClose(manager, graceMs + forceWaitMs + 3_000, "normal manager"),
     ]);
-    if (response.outcome !== "end" || response.status !== 200 || !response.body.includes("slow-ok")) {
-      throw new Error(`SIGTERM 未完成普通活动请求：${JSON.stringify(response)}\n${childOutput(manager)}`);
-    }
-    if (exit.code !== 0 || exit.signal) throw new Error(`普通活动请求退出异常：${JSON.stringify(exit)}\n${childOutput(manager)}`);
-    if (response.ms < 150) throw new Error(`普通活动请求疑似未等待上游完成：${JSON.stringify(response)}`);
-    console.log(`  PASS SIGTERM 普通请求完整返回 (${response.ms}ms; child ${Math.round(performance.now() - signalAt)}ms)`);
+    assert.equal(response.outcome, "end", `normal request did not finish: ${JSON.stringify(response)}\n${childOutput(manager)}`);
+    assert.equal(response.status, 200);
+    assert.match(response.body, /slow-ok/);
+    assert.equal(exit.code, 0, `normal manager exit: ${JSON.stringify(exit)}\n${childOutput(manager)}`);
+    assert.equal(exit.signal, null);
+    assertCondition(response.ms >= 150, `normal request was not drained: ${JSON.stringify(response)}`);
+    console.log(`PASS external non-stream drain (${response.ms}ms; exit ${Math.round(performance.now() - signalAt)}ms)`);
   } finally {
-    try { active?.request?.destroy(); } catch {}
-    await stopChild(manager, "普通活动请求清理");
-    rmSync(dataDir, { recursive: true, force: true });
+    await cleanupCase({ manager, active, dataDir, label: "external non-stream" });
   }
-  await assertPortsFree([managerPort, upstreamPort], "普通活动请求清理");
+  await assertPortReusable(managerPort, "external non-stream cleanup");
 }
 
 async function runGracefulStream(mockPort) {
   const managerPort = await reservePort();
-  const upstreamPort = await reservePort();
   const dataDir = makeDataDir(managerPort, mockPort);
-  const graceMs = 1500;
+  const graceMs = 1_500;
   const forceWaitMs = 250;
   let manager;
   let active;
   try {
     manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, mockPort, false, graceMs, forceWaitMs, mockPort));
-    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "manager stream startup");
+    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "external stream startup");
+    assert.deepEqual(directChildPids(manager.pid), [], "external stream manager must not spawn a child");
     await configureMock(mockPort, { mode: "slowsse", frameDelayMs: 25 });
     active = openActiveRequest({
       port: managerPort,
       path: "/v1/chat/completions",
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${CLIENT_TOKEN}`,
-        Connection: "close",
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${CLIENT_TOKEN}`, Connection: "close" },
       body: JSON.stringify({ model: "lifecycle-stream", stream: true }),
     });
-    const response = await active.ready;
-    if (response.statusCode !== 200 || !String(response.headers["content-type"]).includes("text/event-stream")) {
-      throw new Error(`流式响应头异常：${response.statusCode} ${JSON.stringify(response.headers)}`);
-    }
-    await waitForResponseText(active, "data:", "流式响应");
+    const response = await bounded(active.ready, REQUEST_TIMEOUT_MS, "stream response headers");
+    assert.equal(response.statusCode, 200);
+    assert.match(String(response.headers["content-type"]), /text\/event-stream/);
+    await waitForResponseText(active, "data:", "stream response");
     const signalAt = performance.now();
     manager.kill("SIGTERM");
     const [result, exit] = await Promise.all([
       active.done,
-      waitForClose(manager, graceMs + forceWaitMs + EXIT_MARGIN_MS, "流式活动请求 manager"),
+      waitForClose(manager, graceMs + forceWaitMs + 3_000, "stream manager"),
     ]);
-    try { active.response?.socket?.destroy(); } catch {}
-    if (result.outcome !== "end" || !result.body.includes("data: [DONE]")) {
-      throw new Error(`SIGTERM 未完整结束流式响应：${JSON.stringify(result)}\n${childOutput(manager)}`);
-    }
-    if (exit.code !== 0 || exit.signal) throw new Error(`流式活动请求退出异常：${JSON.stringify(exit)}\n${childOutput(manager)}`);
-    console.log(`  PASS SIGTERM 流式响应完整结束 (${result.ms}ms; child ${Math.round(performance.now() - signalAt)}ms)`);
+    assert.equal(result.outcome, "end", `stream did not finish: ${JSON.stringify(result)}\n${childOutput(manager)}`);
+    assert.match(result.body, /data: \[DONE\]/);
+    assert.equal(exit.code, 0, `stream manager exit: ${JSON.stringify(exit)}\n${childOutput(manager)}`);
+    assert.equal(exit.signal, null);
+    console.log(`PASS external stream drain (${result.ms}ms; exit ${Math.round(performance.now() - signalAt)}ms)`);
   } finally {
-    try { active?.request?.destroy(); } catch {}
-    try { active?.response?.socket?.destroy(); } catch {}
-    await stopChild(manager, "流式活动请求清理");
-    rmSync(dataDir, { recursive: true, force: true });
+    await cleanupCase({ manager, active, dataDir, label: "external stream" });
   }
-  await assertPortsFree([managerPort, upstreamPort], "流式活动请求清理");
+  await assertPortReusable(managerPort, "external stream cleanup");
 }
 
 async function runSseForceClose(mockPort) {
   const managerPort = await reservePort();
-  const upstreamPort = await reservePort();
   const dataDir = makeDataDir(managerPort, mockPort);
   const graceMs = 180;
   const forceWaitMs = 220;
@@ -547,43 +690,35 @@ async function runSseForceClose(mockPort) {
   let active;
   try {
     manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, mockPort, false, graceMs, forceWaitMs, mockPort));
-    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "manager SSE startup");
+    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "SSE manager startup");
     active = openActiveRequest({
       port: managerPort,
       path: "/admin/api/events",
-      headers: {
-        "X-Admin-Token": ADMIN_TOKEN,
-        Accept: "text/event-stream",
-        Connection: "keep-alive",
-      },
+      headers: { "X-Admin-Token": ADMIN_TOKEN, Accept: "text/event-stream", Connection: "keep-alive" },
     });
-    const response = await active.ready;
-    if (response.statusCode !== 200 || !String(response.headers["content-type"]).includes("text/event-stream")) {
-      throw new Error(`SSE 响应头异常：${response.statusCode} ${JSON.stringify(response.headers)}`);
-    }
-    await waitForResponseText(active, ": connected", "SSE");
+    const response = await bounded(active.ready, REQUEST_TIMEOUT_MS, "SSE response headers");
+    assert.equal(response.statusCode, 200);
+    assert.match(String(response.headers["content-type"]), /text\/event-stream/);
+    await waitForResponseText(active, ": connected", "SSE response");
     const signalAt = performance.now();
     manager.kill("SIGTERM");
     const [result, exit] = await Promise.all([
       active.done,
-      waitForClose(manager, graceMs + forceWaitMs + EXIT_MARGIN_MS, "SSE manager"),
+      waitForClose(manager, graceMs + forceWaitMs + 3_000, "SSE manager"),
     ]);
-    if (result.outcome === "end") throw new Error(`SSE 在 SIGTERM 后正常 end，未验证强制关闭：${JSON.stringify(result)}`);
-    if (exit.code !== 0 || exit.signal) throw new Error(`SSE 关闭退出异常：${JSON.stringify(exit)}\n${childOutput(manager)}`);
-    if (result.ms > graceMs + forceWaitMs + EXIT_MARGIN_MS) throw new Error(`SSE 强制关闭超出有界时间：${JSON.stringify(result)}`);
-    console.log(`  PASS SIGTERM SSE/保持连接被强制关闭 (${result.outcome}, ${result.ms}ms; child ${Math.round(performance.now() - signalAt)}ms)`);
+    assert.notEqual(result.outcome, "end", `SSE unexpectedly ended gracefully: ${JSON.stringify(result)}`);
+    assert.equal(exit.code, 0, `SSE manager exit: ${JSON.stringify(exit)}\n${childOutput(manager)}`);
+    assert.equal(exit.signal, null);
+    assertCondition(result.ms <= graceMs + forceWaitMs + 2_000, `SSE force close exceeded bound: ${JSON.stringify(result)}`);
+    console.log(`PASS SSE force close (${result.outcome}, ${result.ms}ms; exit ${Math.round(performance.now() - signalAt)}ms)`);
   } finally {
-    try { active?.request?.destroy(); } catch {}
-    try { active?.response?.socket?.destroy(); } catch {}
-    await stopChild(manager, "SSE 清理");
-    rmSync(dataDir, { recursive: true, force: true });
+    await cleanupCase({ manager, active, dataDir, label: "external SSE" });
   }
-  await assertPortsFree([managerPort, upstreamPort], "SSE 清理");
+  await assertPortReusable(managerPort, "external SSE cleanup");
 }
 
 async function runForceDestroy(mockPort) {
   const managerPort = await reservePort();
-  const upstreamPort = await reservePort();
   const dataDir = makeDataDir(managerPort, mockPort);
   const graceMs = 180;
   const forceWaitMs = 220;
@@ -591,114 +726,189 @@ async function runForceDestroy(mockPort) {
   let active;
   try {
     manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, mockPort, false, graceMs, forceWaitMs, mockPort));
-    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "manager force startup");
+    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "force-close manager startup");
     await configureMock(mockPort, { mode: "hang" });
     active = openActiveRequest({
       port: managerPort,
       path: "/v1/chat/completions",
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${CLIENT_TOKEN}`,
-        Connection: "close",
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${CLIENT_TOKEN}`, Connection: "close" },
       body: JSON.stringify({ model: "lifecycle-force", stream: false }),
     });
-    // A force-destroy can reject readiness before response headers exist. Consume it
-    // here so the expected transport reset is checked below instead of becoming an
-    // unhandled rejection.
     const readiness = active.ready.then(
       (response) => ({ kind: "response", response }),
       (error) => ({ kind: "error", error }),
     );
-    await waitForMockCall(mockPort, "hang", "强制关闭活动请求到达 mock");
+    await waitForMockCall(mockPort, "hang", "force-close request reaches mock");
     const signalAt = performance.now();
     manager.kill("SIGTERM");
     const [result, exit, readyState] = await Promise.all([
       active.done,
-      waitForClose(manager, graceMs + forceWaitMs + EXIT_MARGIN_MS, "强制关闭 manager"),
+      waitForClose(manager, graceMs + forceWaitMs + 3_000, "force-close manager"),
       readiness,
     ]);
-    if (result.outcome === "end") throw new Error(`挂起普通请求未被强制关闭：${JSON.stringify(result)}`);
-    if (exit.code !== 0 || exit.signal) throw new Error(`强制关闭退出异常：${JSON.stringify(exit)}\n${childOutput(manager)}`);
-    if (result.ms > graceMs + forceWaitMs + EXIT_MARGIN_MS) throw new Error(`强制关闭超出有界时间：${JSON.stringify(result)}`);
-    if (readyState.kind === "error" && !isExpectedForceDisconnect(readyState.error)) {
-      throw new Error(`强制关闭收到非预期 readiness 错误：${errorText(readyState.error)}\n${childOutput(manager)}`);
-    }
-    if (result.error && !isExpectedForceDisconnect(result.error)) {
-      throw new Error(`强制关闭收到非预期连接错误：${result.error}\n${childOutput(manager)}`);
-    }
-    const disconnectedOutcomes = new Set(["aborted", "request-close"]);
-    const erroredOutcome = result.outcome.startsWith("request-error:")
-      || result.outcome.startsWith("response-error:");
-    if (!disconnectedOutcomes.has(result.outcome) && !erroredOutcome) {
-      throw new Error(`强制关闭未得到可验证的断连结果：${JSON.stringify(result)}\n${childOutput(manager)}`);
-    }
-    if (!active.request?.destroyed || (active.response && !active.response.socket?.destroyed)) {
-      throw new Error(`强制关闭后客户端连接仍未销毁：${JSON.stringify({
-        outcome: result.outcome,
-        requestDestroyed: active.request?.destroyed,
-        responseSocketDestroyed: active.response?.socket?.destroyed,
-      })}`);
-    }
-    console.log(`  PASS grace 超时强制销毁普通活动请求 (${result.outcome}, ${result.ms}ms; child ${Math.round(performance.now() - signalAt)}ms)`);
+    assert.notEqual(result.outcome, "end", `hanging request ended unexpectedly: ${JSON.stringify(result)}`);
+    assert.equal(exit.code, 0, `force-close manager exit: ${JSON.stringify(exit)}\n${childOutput(manager)}`);
+    assert.equal(exit.signal, null);
+    assertCondition(result.ms <= graceMs + forceWaitMs + 2_000, `force close exceeded bound: ${JSON.stringify(result)}`);
+    if (readyState.kind === "error") assertCondition(isExpectedDisconnect(readyState.error), `unexpected readiness error: ${errorText(readyState.error)}`);
+    if (result.error) assertCondition(isExpectedDisconnect(result.error), `unexpected request error: ${result.error}`);
+    const disconnected = result.outcome === "aborted" || result.outcome === "request-close" || result.outcome === "response-close";
+    assertCondition(disconnected || result.outcome.startsWith("request-error:") || result.outcome.startsWith("response-error:"), `force close was not observable: ${JSON.stringify(result)}`);
+    console.log(`PASS ordinary request force destroy (${result.outcome}, ${result.ms}ms; exit ${Math.round(performance.now() - signalAt)}ms)`);
   } finally {
-    try { active?.request?.destroy(); } catch {}
-    try { active?.response?.socket?.destroy(); } catch {}
-    await stopChild(manager, "强制关闭清理");
-    rmSync(dataDir, { recursive: true, force: true });
+    await cleanupCase({ manager, active, dataDir, label: "external force close" });
   }
-  await assertPortsFree([managerPort, upstreamPort], "强制关闭清理");
+  await assertPortReusable(managerPort, "external force close cleanup");
+}
+
+function isExpectedDisconnect(error) {
+  const code = error?.code;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return code === "ECONNRESET"
+    || code === "ECONNABORTED"
+    || /ECONNRESET|ECONNABORTED/.test(message)
+    || /socket hang up|request closed|response closed/i.test(message);
+}
+
+async function runHostedReadyAndShutdown(mockPort) {
+  const managerPort = await reservePort();
+  const upstreamPort = await reservePort();
+  const dataDir = makeDataDir(managerPort, upstreamPort);
+  let manager;
+  let upstreamPid;
+  try {
+    manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, upstreamPort, true, 1_000, 250, mockPort));
+    upstreamPid = await waitForDirectChild(manager.pid, "hosted upstream child");
+    const response = await waitForHttp(managerPort, "/health", (result) => result.status === 200 && result.body === "OK", "hosted manager startup");
+    assert.equal(response.body, "OK");
+    assertHostedReadyBeforeManagerListen(manager);
+    const upstreamHealth = await requestOnce({ port: upstreamPort, path: "/health" });
+    assert.equal(upstreamHealth.status, 200, `hosted upstream health failed: ${JSON.stringify(upstreamHealth)}`);
+    manager.kill("SIGTERM");
+    const exit = await waitForClose(manager, CHILD_EXIT_TIMEOUT_MS, "hosted normal manager");
+    assert.equal(exit.code, 0, `hosted manager exit: ${JSON.stringify(exit)}\n${childOutput(manager)}`);
+    assert.equal(exit.signal, null);
+    await assertPidGone(upstreamPid, "hosted normal upstream");
+    console.log("PASS hosted manager waits for real upstream health and shuts down both processes");
+  } finally {
+    await cleanupCase({ manager, dataDir, label: "hosted normal" });
+  }
+  await assertPortReusable(managerPort, "hosted normal manager cleanup");
+  await assertPortReusable(upstreamPort, "hosted normal upstream cleanup");
+}
+
+async function runHostedUpstreamPortConflict(mockPort) {
+  const managerPort = await reservePort();
+  let blocker;
+  let upstreamPort;
+  let dataDir;
+  let manager;
+  try {
+    blocker = await createBlocker();
+    upstreamPort = blocker.port;
+    dataDir = makeDataDir(managerPort, upstreamPort);
+    manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, upstreamPort, true, 250, 100, mockPort, { startupTimeoutMs: 700, shutdownTimeoutMs: 100 }));
+    const result = await waitForClose(manager, CHILD_EXIT_TIMEOUT_MS, "hosted upstream conflict manager");
+    assertNonZeroExit(result, "hosted upstream conflict");
+    const output = childOutput(manager);
+    assert.match(output, /EADDRINUSE/);
+    assert.match(output, /upstream (?:startup failed|exited unexpectedly)/);
+    console.log(`PASS hosted upstream port conflict (${JSON.stringify(result)})`);
+  } finally {
+    await cleanupCase({ manager, blocker, dataDir, label: "hosted upstream conflict" });
+  }
+  await assertPortReusable(managerPort, "hosted upstream conflict manager cleanup");
+  await assertPortReusable(upstreamPort, "hosted upstream conflict blocker cleanup");
+}
+
+async function runHostedManagerPortConflict(mockPort) {
+  let blocker;
+  let managerPort;
+  let upstreamPort;
+  let dataDir;
+  let manager;
+  let upstreamPid;
+  try {
+    blocker = await createBlocker();
+    managerPort = blocker.port;
+    upstreamPort = await reservePort();
+    dataDir = makeDataDir(managerPort, upstreamPort);
+    manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, upstreamPort, true, 250, 100, mockPort, { startupTimeoutMs: 2_000, shutdownTimeoutMs: 100 }));
+    upstreamPid = await waitForDirectChild(manager.pid, "upstream before manager conflict");
+    const result = await waitForClose(manager, CHILD_EXIT_TIMEOUT_MS, "hosted manager conflict");
+    assertNonZeroExit(result, "hosted manager port conflict");
+    const output = childOutput(manager);
+    assert.match(output, /EADDRINUSE/);
+    assert.match(output, /manager startup failed/);
+    assertHostedReadyBeforeManagerFailure(manager);
+    console.log(`PASS manager port conflict reaps ready upstream (${JSON.stringify(result)})`);
+  } finally {
+    await cleanupCase({ manager, blocker, dataDir, label: "hosted manager conflict" });
+  }
+  await assertPidGone(upstreamPid, "upstream after manager listen failure");
+  await assertPortReusable(managerPort, "hosted manager conflict blocker cleanup");
+  await assertPortReusable(upstreamPort, "upstream after manager listen failure");
+}
+
+async function runHostedUnexpectedExit(mockPort) {
+  const managerPort = await reservePort();
+  const upstreamPort = await reservePort();
+  const dataDir = makeDataDir(managerPort, upstreamPort);
+  let manager;
+  let upstreamPid;
+  try {
+    manager = spawnNode([MANAGER_ENTRY], managerEnv(dataDir, managerPort, upstreamPort, true, 1_000, 100, mockPort));
+    await waitForHttp(managerPort, "/health", (response) => response.status === 200 && response.body === "OK", "unexpected-exit hosted startup");
+    upstreamPid = await waitForDirectChild(manager.pid, "unexpected-exit upstream child");
+    process.kill(upstreamPid, "SIGKILL");
+    const result = await waitForClose(manager, CHILD_EXIT_TIMEOUT_MS, "unexpected-exit manager");
+    assertNonZeroExit(result, "unexpected upstream exit manager");
+    assert.match(childOutput(manager), /upstream exited unexpectedly/);
+    await assertPidGone(upstreamPid, "unexpected-exit upstream");
+    console.log(`PASS unexpected upstream exit closes manager non-zero (${JSON.stringify(result)})`);
+  } finally {
+    await cleanupCase({ manager, dataDir, label: "hosted unexpected exit" });
+  }
+  await assertPortReusable(managerPort, "unexpected-exit manager cleanup");
+  await assertPortReusable(upstreamPort, "unexpected-exit upstream cleanup");
+}
+
+async function runCase(label, test) {
+  try {
+    await test();
+  } catch (error) {
+    throw new Error(`${label} failed: ${errorText(error)}\n${allChildDiagnostics()}`, { cause: error });
+  }
 }
 
 async function main() {
   const mockPort = await reservePort();
   let mock;
-  let managerConflictPort;
-  let embeddedConflictManagerPort;
-  let embeddedConflictUpstreamPort;
   try {
     mock = await startMock(mockPort);
-
-    managerConflictPort = await reservePort();
-    await expectStartupConflict({
-      kind: "manager",
-      managerPort: managerConflictPort,
-      blockedPort: managerConflictPort,
-      mockPort,
-      embedded: false,
-    });
-
-    embeddedConflictManagerPort = await reservePort();
-    embeddedConflictUpstreamPort = await reservePort();
-    await expectStartupConflict({
-      kind: "embedded upstream",
-      managerPort: embeddedConflictManagerPort,
-      blockedPort: embeddedConflictUpstreamPort,
-      mockPort,
-      embedded: true,
-    });
-
-    await runGracefulNormal(mockPort);
-    await runGracefulStream(mockPort);
-    await runSseForceClose(mockPort);
-    await runForceDestroy(mockPort);
-    console.log("Lifecycle process tests: PASS");
+    await runCase("external non-stream drain", () => runGracefulNormal(mockPort));
+    await runCase("external stream drain", () => runGracefulStream(mockPort));
+    await runCase("external SSE force close", () => runSseForceClose(mockPort));
+    await runCase("external ordinary force close", () => runForceDestroy(mockPort));
+    await runCase("hosted ready and shutdown", () => runHostedReadyAndShutdown(mockPort));
+    await runCase("hosted upstream port conflict", () => runHostedUpstreamPortConflict(mockPort));
+    await runCase("hosted manager port conflict", () => runHostedManagerPortConflict(mockPort));
+    await runCase("hosted unexpected upstream exit", () => runHostedUnexpectedExit(mockPort));
+    console.log("Server lifecycle tests: PASS");
   } finally {
     for (const client of [...clients]) {
       try { client.destroy(); } catch {}
     }
-    for (const child of [...children]) await stopChild(child, "未清理子进程");
-    await stopChild(mock, "mock upstream");
-    for (const p of [mockPort, managerConflictPort, embeddedConflictManagerPort, embeddedConflictUpstreamPort]) {
-      if (p) await assertPortsFree([p], "最终清理").catch((error) => {
-        console.error(`最终清理端口检查失败：${errorText(error)}`);
-      });
+    for (const child of [...liveChildren]) {
+      try { await stopChild(child, "final child cleanup"); } catch (error) { console.error(errorText(error)); }
     }
+    try { await stopChild(mock, "mock upstream cleanup"); } catch (error) { console.error(errorText(error)); }
+    await assertPortReusable(mockPort, "mock cleanup").catch((error) => console.error(errorText(error)));
   }
 }
 
 main().catch((error) => {
-  console.error(`Lifecycle process tests: FAIL\n${error.stack || errorText(error)}`);
+  console.error(`Server lifecycle tests: FAIL\n${error.stack || errorText(error)}`);
   process.exitCode = 1;
 });

@@ -265,7 +265,7 @@ assert_patch_rejection() {
 }
 
 CURRENT_CLEAN="$T/current-upstream-clean.mjs"
-git show HEAD:upstream/proxy.mjs > "$CURRENT_CLEAN"
+git -C "$UP" show "$TAG_COMMIT:proxy.mjs" > "$CURRENT_CLEAN"
 assert_patch_applies_once "当前上游 fixture" "$CURRENT_CLEAN"
 
 RELEASE_CLEAN="$T/release-upstream-clean.mjs"

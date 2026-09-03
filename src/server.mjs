@@ -64,9 +64,41 @@ for (const n of ["index.html", "app.mjs", "style.css"]) {
   if (existsSync(p)) staticFiles[n] = readFileSync(p);
 }
 
-function sendJson(res, status, data) {
-  res.writeHead(status, { "Content-Type": "application/json" });
+function sendJson(res, status, data, extraHeaders) {
+  if (res.writableEnded || res.destroyed) return false;
+  const headers = { "Content-Type": "application/json" };
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+  res.writeHead(status, headers);
   res.end(JSON.stringify(data));
+  return true;
+}
+
+function closeRequestAfterError(res, error) {
+  if (typeof error?.closeRequest !== "function") return;
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    res.off("finish", close);
+    res.off("close", close);
+    error.closeRequest();
+  };
+  if (res.writableEnded || res.destroyed) close();
+  else {
+    res.once("finish", close);
+    res.once("close", close);
+  }
+}
+
+function sendError(res, error) {
+  const status = Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode <= 599
+    ? error.statusCode
+    : 500;
+  const type = error?.errorType || (status >= 500 ? "internal_error" : "invalid_request_error");
+  closeRequestAfterError(res, error);
+  sendJson(res, status, {
+    error: { message: error?.message || "请求处理失败", type }
+  }, error?.closeRequest ? { Connection: "close" } : undefined);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -173,7 +205,7 @@ const server = http.createServer(async (req, res) => {
     }
     sendJson(res, 404, { error: { message: "Not found", type: "not_found" } });
   } catch (e) {
-    sendJson(res, 500, { error: { message: e.message, type: "internal_error" } });
+    sendError(res, e);
   }
 });
 

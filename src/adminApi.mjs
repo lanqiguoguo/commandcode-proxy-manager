@@ -84,41 +84,200 @@ export function isAdminRequestAuthed(req, p) {
 }
 
 function sendJson(res, status, data, extraHeaders) {
+  if (res.writableEnded || res.destroyed) return false;
   const headers = { "Content-Type": "application/json" };
   if (extraHeaders) Object.assign(headers, extraHeaders);
   if (data && data.retry_after !== undefined) headers["Retry-After"] = String(data.retry_after);
   res.writeHead(status, headers);
   res.end(JSON.stringify(data));
+  return true;
+}
+
+const ADMIN_BODY_LIMIT = 256 * 1024;
+const ADMIN_BODY_DRAIN_LIMIT = 32 * 1024;
+const ADMIN_BODY_TIMEOUT_MS = 10000;
+const ADMIN_BODY_IDLE_TIMEOUT_MS = 2000;
+const BODY_TIMEOUT_MIN_MS = 100;
+const BODY_TIMEOUT_MAX_MS = 120000;
+
+function boundedBodyTimeout(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= BODY_TIMEOUT_MIN_MS && n <= BODY_TIMEOUT_MAX_MS
+    ? Math.floor(n)
+    : fallback;
+}
+
+function boundedBodyBytes(value, fallback) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 0 && n <= 1024 * 1024
+    ? n
+    : fallback;
+}
+
+function requestBodyError(message, statusCode, errorType) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.errorType = errorType;
+  return error;
+}
+
+function attachRequestClose(error, req) {
+  Object.defineProperty(error, "closeRequest", {
+    configurable: true,
+    value: () => {
+      try { req.destroy(); } catch {}
+    }
+  });
+  return error;
 }
 
 function readJsonBody(req, opts = {}) {
-  const limit = opts.limit ?? 256 * 1024; // admin JSON 默认 256KB 上限
+  const limit = opts.limit ?? ADMIN_BODY_LIMIT;
+  const drainLimit = opts.drainLimit ?? boundedBodyBytes(process.env.CC_ADMIN_BODY_DRAIN_LIMIT, ADMIN_BODY_DRAIN_LIMIT);
+  const totalTimeoutMs = opts.totalTimeoutMs ?? boundedBodyTimeout(process.env.CC_ADMIN_BODY_TIMEOUT_MS, ADMIN_BODY_TIMEOUT_MS);
+  const idleTimeoutMs = opts.idleTimeoutMs ?? boundedBodyTimeout(process.env.CC_ADMIN_BODY_IDLE_TIMEOUT_MS, ADMIN_BODY_IDLE_TIMEOUT_MS);
   return new Promise((resolveBody, reject) => {
     const chunks = [];
     let size = 0;
     let overflow = false;
-    req.on("data", (c) => {
+    let drained = 0;
+    let settled = false;
+    let totalTimer;
+    const socketTimeout = req.socket?.timeout;
+
+    const onData = (c) => {
+      try { req.setTimeout(idleTimeoutMs); } catch {}
+      if (overflow) {
+        // Keep the response deliverable, but never drain an attacker-controlled
+        // body without a byte bound. A stalled remainder is stopped by timeout.
+        drained += c.length;
+        if (drained >= drainLimit) finishReject(requestBodyError("请求体过大", 413, "request_too_large"), true);
+        return;
+      }
       size += c.length;
       if (size > limit) {
         overflow = true;
-        // 丢弃后续数据，等待 end 再拒绝，避免破坏连接
+        chunks.length = 0;
+        drained = size - limit;
+        if (drained >= drainLimit) finishReject(requestBodyError("请求体过大", 413, "request_too_large"), true);
         return;
       }
       chunks.push(c);
-    });
-    req.on("end", () => {
+    };
+    const onEnd = () => {
       if (overflow) {
-        reject(Object.assign(new Error("请求体过大"), { statusCode: 413 }));
+        finishReject(requestBodyError("请求体过大", 413, "request_too_large"), true);
         return;
       }
       try {
-        resolveBody(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf-8")) : {});
+        finishResolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf-8")) : {});
       } catch {
-        resolveBody(null);
+        finishReject(requestBodyError("请求体必须是合法 JSON", 400, "invalid_request_error"));
       }
-    });
-    req.on("error", reject);
+    };
+    const onError = (error) => {
+      finishReject(requestBodyError("客户端请求中断", 400, "client_aborted"), true, true, error);
+    };
+    const onAborted = () => {
+      finishReject(requestBodyError("客户端请求中断", 400, "client_aborted"), true, true);
+    };
+    const onClose = () => {
+      if (!settled && !req.complete) onAborted();
+    };
+    const onTimeout = () => {
+      if (overflow) finishReject(requestBodyError("请求体过大", 413, "request_too_large"), true);
+      else finishReject(requestBodyError("请求体读取超时", 408, "request_timeout"), true);
+    };
+    const clearBodyListeners = (preserveError) => {
+      clearTimeout(totalTimer);
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("aborted", onAborted);
+      req.off("close", onClose);
+      req.off("timeout", onTimeout);
+      if (preserveError) {
+        req.off("error", onError);
+        const noopError = () => {};
+        const removeNoop = () => {
+          req.off("error", noopError);
+          req.off("close", removeNoop);
+        };
+        req.on("error", noopError);
+        req.once("close", removeNoop);
+      } else {
+        req.off("error", onError);
+      }
+      try { req.setTimeout(socketTimeout || 0); } catch {}
+    };
+    function finishResolve(value) {
+      if (settled) return;
+      settled = true;
+      clearBodyListeners(false);
+      resolveBody(value);
+    }
+    function finishReject(error, closeRequest = false, preserveError = closeRequest) {
+      if (settled) return;
+      settled = true;
+      if (closeRequest) {
+        try { req.pause(); } catch {}
+        attachRequestClose(error, req);
+      }
+      clearBodyListeners(preserveError);
+      reject(error);
+    }
+
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("aborted", onAborted);
+    req.on("close", onClose);
+    req.on("timeout", onTimeout);
+    try { req.setTimeout(idleTimeoutMs); } catch {}
+    totalTimer = setTimeout(() => {
+      if (overflow) finishReject(requestBodyError("请求体过大", 413, "request_too_large"), true);
+      else finishReject(requestBodyError("请求体读取超时", 408, "request_timeout"), true);
+    }, totalTimeoutMs);
+    totalTimer.unref?.();
+
+    const contentLength = Number(req.headers["content-length"]);
+    if (Number.isSafeInteger(contentLength) && contentLength > limit) {
+      overflow = true;
+      try { req.pause(); } catch {}
+      finishReject(requestBodyError("请求体过大", 413, "request_too_large"), true);
+    }
   });
+}
+
+function closeRequestAfterResponse(res, error) {
+  if (typeof error?.closeRequest !== "function") return;
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    res.off("finish", close);
+    res.off("close", close);
+    error.closeRequest();
+  };
+  if (res.writableEnded || res.destroyed) close();
+  else {
+    res.once("finish", close);
+    res.once("close", close);
+  }
+}
+
+function sendAdminError(res, error, fallbackStatus = 400) {
+  const persistenceFailure = error?.code === "PERSISTENCE_ERROR" || error?.persistence === true;
+  const candidate = Number(error?.statusCode);
+  const status = persistenceFailure
+    ? 503
+    : Number.isInteger(candidate) && candidate >= 400 && candidate <= 599 ? candidate : fallbackStatus;
+  const type = persistenceFailure
+    ? "persistence_error"
+    : error?.errorType || (status >= 500 ? "internal_error" : "invalid_request_error");
+  const bodyError = { message: error?.message || "请求处理失败", type };
+  if (Array.isArray(error?.fields) && error.fields.length) bodyError.fields = error.fields;
+  closeRequestAfterResponse(res, error);
+  sendJson(res, status, { error: bodyError }, error?.closeRequest ? { Connection: "close" } : undefined);
 }
 
 function sanitizePoolPatch(body) {
@@ -141,29 +300,34 @@ export async function handleAdmin(req, res, url) {
 
   if (p === "/admin/api/login") {
     if (req.method !== "POST") { sendJson(res, 405, { error: { message: "Method not allowed" } }); return true; }
-    const ip = req.socket.remoteAddress || "unknown";
-    const now = Date.now();
-    const locked = loginLocked(ip, now);
-    const body = await readJsonBody(req);
-    if (!body || !safeEqual(body.token, cfg.adminToken)) {
-      // 锁定期内的失败尝试直接 429（不再回 401，掐断爆破反馈）；
-      // 持正确令牌者即使在锁定期仍可登录并清零计数——限速防的是猜，不是合法管理员
-      if (locked) {
-        sendJson(res, 429, { error: "too many failed attempts" });
+    try {
+      const ip = req.socket.remoteAddress || "unknown";
+      const now = Date.now();
+      const locked = loginLocked(ip, now);
+      const body = await readJsonBody(req);
+      if (!body || !safeEqual(body.token, cfg.adminToken)) {
+        // 锁定期内的失败尝试直接 429（不再回 401，掐断爆破反馈）；
+        // 持正确令牌者即使在锁定期仍可登录并清零计数——限速防的是猜，不是合法管理员
+        if (locked) {
+          sendJson(res, 429, { error: "too many failed attempts" });
+          return true;
+        }
+        loginFailRecord(ip, Date.now());
+        sendJson(res, 401, { error: { message: "Invalid admin token", type: "auth_error" } });
         return true;
       }
-      loginFailRecord(ip, Date.now());
-      sendJson(res, 401, { error: { message: "Invalid admin token", type: "auth_error" } });
+      loginFails.delete(ip); // 成功登录清零该 IP 失败计数（含解除锁定）
+      // HttpOnly：JS 读不到；Path 限定 events 端点：其余请求浏览器不回传，
+      // 缩小泄漏面；SameSite=Strict：跨站页面无法携带此 cookie 建 SSE；
+      // Secure：仅 SECURE_COOKIES=1（TLS 反代部署）时附加，见 secureCookieAttr()
+      res.setHeader("Set-Cookie", SSE_COOKIE + "=" + sseCookieValue() +
+        "; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=86400" + secureCookieAttr());
+      sendJson(res, 200, { ok: true });
+      return true;
+    } catch (e) {
+      sendAdminError(res, e);
       return true;
     }
-    loginFails.delete(ip); // 成功登录清零该 IP 失败计数（含解除锁定）
-    // HttpOnly：JS 读不到；Path 限定 events 端点：其余请求浏览器不回传，
-    // 缩小泄漏面；SameSite=Strict：跨站页面无法携带此 cookie 建 SSE；
-    // Secure：仅 SECURE_COOKIES=1（TLS 反代部署）时附加，见 secureCookieAttr()
-    res.setHeader("Set-Cookie", SSE_COOKIE + "=" + sseCookieValue() +
-      "; HttpOnly; Path=/admin/api/events; SameSite=Strict; Max-Age=86400" + secureCookieAttr());
-    sendJson(res, 200, { ok: true });
-    return true;
   }
 
   if (!p.startsWith("/admin/api/")) return false;
@@ -360,12 +524,7 @@ export async function handleAdmin(req, res, url) {
     sendJson(res, 404, { error: { message: "Not found", type: "not_found" } });
     return true;
   } catch (e) {
-    const persistenceFailure = e.code === "PERSISTENCE_ERROR" || e.persistence === true;
-    const status = persistenceFailure ? 503 : 400;
-    const type = persistenceFailure ? "persistence_error" : "invalid_request_error";
-    const error = { message: e.message, type };
-    if (Array.isArray(e.fields) && e.fields.length) error.fields = e.fields;
-    sendJson(res, status, { error });
+    sendAdminError(res, e);
     return true;
   }
 }

@@ -4,6 +4,7 @@ import { getConfig } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as stats from "./stats.mjs";
 import { safeEqual } from "./tokens.mjs";
+import { randomUUID } from "crypto";
 
 // 非流式响应体读取上限：LLM 非流式 JSON 响应远小于此，纯防内存放大（M3）。
 // 请求体侧已有 100MB 上限（readBody），响应体原无上限——upRes.text() 被 undici
@@ -491,7 +492,47 @@ export async function handleGateway(req, res, url) {
   let attempts = 0;
   let lastStatus = 429;
   let lastBody = null;
+  let lastErrorKind = "rate_limit";
+  let lastKeyId = null;
   const startedAt = Date.now();
+  const requestId = randomUUID();
+  const attemptedKeyIds = [];
+  let requestEventRecorded = false;
+  // Statistics are external-request rows. Attempts remain local so a retry
+  // episode is represented once, with retries/attempts and its key path.
+  const recordRequestEvent = ({
+    keyId = lastKeyId,
+    stream: eventStream = stream,
+    ok = false,
+    status = lastStatus,
+    errorKind = lastErrorKind,
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+  } = {}) => {
+    if (requestEventRecorded) return;
+    requestEventRecorded = true;
+    stats.appendEvent({
+      eventType: stats.EVENT_TYPE_REQUEST,
+      requestId,
+      keyId: keyId || undefined,
+      model,
+      stream: eventStream,
+      ok,
+      status,
+      errorKind: ok ? undefined : errorKind,
+      inputTokens,
+      outputTokens,
+      cachedTokens,
+      attempts,
+      retries: Math.max(0, attempts - 1),
+      attemptedKeyIds: attemptedKeyIds.length ? [...attemptedKeyIds] : undefined,
+      latencyMs: Date.now() - startedAt,
+    });
+  };
+  const recordClientAbort = ({ keyId = lastKeyId, stream: eventStream = stream } = {}) => {
+    recordRequestEvent({ keyId, stream: eventStream, status: 499, ok: false, errorKind: "client" });
+  };
   const requestBudgetMs = 30000; // 同Key重试/退避等待的总预算（不限制单次等待上游响应头，见 connectTimeoutMs）
   const deadlineAt = startedAt + requestBudgetMs;
   // 本请求内已尝试过的 Key：5xx/网络错误不记退避（非 per-key 限流信号），若不排除，
@@ -503,12 +544,17 @@ export async function handleGateway(req, res, url) {
   while (attempts < maxAttempts && Date.now() < deadlineAt) {
     const chosen = pool.selectKey(triedKeys);
     if (!chosen) {
+      if (clientGone || res.writableEnded || res.destroyed) {
+        if (clientGone) recordClientAbort({ keyId: lastKeyId });
+        return;
+      }
       if (attempts === 0) {
         const wait = retryAfterSeconds(pool.nextRetryAfterMs());
         sendJson(res, 429, {
           error: { message: "No usable API key in pool (all backed off / quota limited)", type: "rate_limit_error" },
           retry_after: wait
         });
+        recordRequestEvent({ status: 429, ok: false, errorKind: "rate_limit" });
         return;
       }
       break;
@@ -519,7 +565,10 @@ export async function handleGateway(req, res, url) {
     // 而外层 while 条件不含 clientGone，若无此复查，新 fetch 将无中断源地完整执行
     // （浪费一次完整生成与上游计费）。所有"换 Key 后发起新尝试"的路径都汇聚于此
     // （selectKey 同步执行，本行与 fetch 发出之间无 await，close 不可能漏检），一处覆盖。
-    if (clientGone || res.writableEnded || res.destroyed) return;
+    if (clientGone || res.writableEnded || res.destroyed) {
+      if (clientGone) recordClientAbort({ keyId: lastKeyId });
+      return;
+    }
     triedKeys.add(chosen.id);
     let sameKeyTries = 0;
     let retriedOnce5xx = false;
@@ -527,6 +576,8 @@ export async function handleGateway(req, res, url) {
       const attempt = pool.beginAttempt(chosen.id);
       if (!attempt) break;
       attempts++;
+      lastKeyId = chosen.id;
+      attemptedKeyIds.push(chosen.id);
       const ac = new AbortController();
       activeAc = ac;
       let upRes = null;
@@ -561,21 +612,22 @@ export async function handleGateway(req, res, url) {
         if (clientGone || res.writableEnded || res.destroyed) {
           // 客户端已断开：停止一切重试与响应写入
           activeAc = null;
+          if (clientGone) recordClientAbort({ keyId: chosen.id });
           return;
         }
         const isTimeout = e && (e.code === "CONNECT_TIMEOUT" || /timeout/i.test(e.message || ""));
         if (isTimeout) {
           try { pool.recordTimeout(chosen.id); } catch {}
           lastStatus = 502;
+          lastErrorKind = "timeout";
           lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
-          stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 502, errorKind: "timeout", retries: attempts - 1, latencyMs: Date.now() - startedAt });
           // 超时退避后换 Key：外层 while 顶部的截止检查会决定是否继续发起新尝试，
           // 预算耗尽时此处 break 即进入最终响应路径（502）。
           break;
         }
         lastStatus = 502;
+        lastErrorKind = "upstream";
         lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
-        stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
         break;
       }
 
@@ -596,7 +648,13 @@ export async function handleGateway(req, res, url) {
           // 重放（上游已经接受了本次请求）；先取消未消费的 body，再返回明确 502。
           try { await upRes.body?.cancel(); } catch {}
           activeAc = null;
-          stats.appendEvent({ keyId: chosen.id, model, stream: true, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+          lastStatus = 502;
+          lastErrorKind = "upstream";
+          if (clientGone) {
+            recordClientAbort({ keyId: chosen.id, stream: true });
+            return;
+          }
+          recordRequestEvent({ keyId: chosen.id, stream: true, status: 502, errorKind: "upstream" });
           if (clientGone || res.writableEnded || res.destroyed) return;
           sendJson(res, 502, { error: { message: "Upstream returned a non-SSE response for a stream request", type: "proxy_error" } });
           return;
@@ -618,14 +676,20 @@ export async function handleGateway(req, res, url) {
         }
         activeAc = null;
         if (clientGone) {
-          // 客户端已断开：不计成功、不记 stats（无法确认真实结果）
+          // 客户端已断开：不计成功；记录一次可审计的客户端取消终态，不再重试。
+          recordClientAbort({ keyId: chosen.id, stream: isStream });
           return;
         }
-        if (pipeErr === "client") return;
+        if (pipeErr === "client") {
+          recordClientAbort({ keyId: chosen.id, stream: isStream });
+          return;
+        }
         if (pipeErr) {
           // 流式路径可能已经写出 200 头或部分内容，协议错误与上游断流一样只能
           // 终止当前连接，绝不能换 Key 重放；非流式尚未写头，返回可解析的 502。
-          stats.appendEvent({ keyId: chosen.id, model, stream: isStream, ok: false, status: 502, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+          lastStatus = 502;
+          lastErrorKind = "upstream";
+          recordRequestEvent({ keyId: chosen.id, stream: isStream, status: 502, errorKind: "upstream" });
           if (isStream) {
             try { res.destroy(); } catch {}
           } else if (!clientGone && !res.writableEnded && !res.destroyed) {
@@ -634,18 +698,19 @@ export async function handleGateway(req, res, url) {
           return;
         }
         if (!isStream) {
-          if (!responseBody || clientGone || res.writableEnded || res.destroyed) return;
+          if (!responseBody || clientGone || res.writableEnded || res.destroyed) {
+            if (clientGone) recordClientAbort({ keyId: chosen.id });
+            return;
+          }
           res.writeHead(200, headers);
           res.end(responseBody);
         }
         pool.recordSuccess(chosen.id, attempt);
-        stats.appendEvent({
-          keyId: chosen.id, model, stream: isStream, ok: true, status: 200,
+        recordRequestEvent({
+          keyId: chosen.id, stream: isStream, ok: true, status: 200,
           inputTokens: usage ? usage.inputTokens : undefined,
           outputTokens: usage ? usage.outputTokens : undefined,
           cachedTokens: usage ? usage.cachedTokens : undefined,
-          retries: attempts - 1,
-          latencyMs: Date.now() - startedAt
         });
         return;
       }
@@ -654,11 +719,21 @@ export async function handleGateway(req, res, url) {
       const retryAfterMs = parseRetryAfter(upRes, text);
 
       if (upRes.status === 401 || upRes.status === 403) {
+        if (clientGone) {
+          activeAc = null;
+          recordClientAbort({ keyId: chosen.id });
+          return;
+        }
         pool.markAuthError(chosen.id);
         activeAc = null;
-        stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "auth", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+        lastStatus = upRes.status;
+        lastErrorKind = "auth";
         // 错误体排空后客户端可能断开：sendJson 自带判空守卫，此处提前返回保持一致
-        if (clientGone || res.writableEnded || res.destroyed) return;
+        if (clientGone || res.writableEnded || res.destroyed) {
+          if (clientGone) recordClientAbort({ keyId: chosen.id });
+          return;
+        }
+        recordRequestEvent({ keyId: chosen.id, status: upRes.status, errorKind: "auth" });
         const mapped = mapError(upRes.status, text);
         sendJson(res, mapped.status, mapped.body);
         return;
@@ -673,6 +748,7 @@ export async function handleGateway(req, res, url) {
         : (upRes.status === 429 || upRes.status === 402);
       if (isRateLimit) {
         lastStatus = 429;
+        lastErrorKind = "rate_limit";
         const mapped = mapError(429, text);
         // Retry-After 为 0 表示“立即重试”，必须保留 0（不能回退成 30）。
         // 注意：mapped.body.retry_after 已是 mapError 默认填的 30，下面的回退只在
@@ -691,7 +767,10 @@ export async function handleGateway(req, res, url) {
           activeAc = null;
           if (Date.now() >= deadlineAt) break;
           // 等待期间客户端可能断开：中断重试
-          if (clientGone || res.writableEnded || res.destroyed) return;
+          if (clientGone || res.writableEnded || res.destroyed) {
+            if (clientGone) recordClientAbort({ keyId: chosen.id });
+            return;
+          }
           // L-a：睡眠期间本 Key 可能已被并发请求标退避 / 额度探测标 quotaLimited /
           // 401 标 authError——醒来复检不可用即放弃它，不再多发一次请求（break 后
           // 外层 selectKey 会排除它：triedKeys 已含 chosen，且退避/限额已使其不可选）。
@@ -706,41 +785,57 @@ export async function handleGateway(req, res, url) {
         // L-b：错误体已排空、不再重试（将走外层 while 换 Key 或最终 429）。此时客户端若
         // 断开，'close' 只置位 clientGone（activeAc 已 null，abort 落空）——外层 while 条件
         // 不含 clientGone，唯一的闸门是 while 顶部的 L-b 复检，故需在此提前返回。
-        if (clientGone || res.writableEnded || res.destroyed) return;
-        stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: 429, errorKind: "rate_limit", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+        if (clientGone || res.writableEnded || res.destroyed) {
+          if (clientGone) recordClientAbort({ keyId: chosen.id });
+          return;
+        }
         break;
       }
 
       if (upRes.status >= 500 && upRes.status < 600) {
         lastStatus = upRes.status;
+        lastErrorKind = "upstream";
         lastBody = mapError(upRes.status, text).body;
         if (!retriedOnce5xx && attempts < maxAttempts && Date.now() < deadlineAt) {
           retriedOnce5xx = true;
           await sleep(Math.min(500, Math.max(0, deadlineAt - Date.now())));
           activeAc = null;
-          if (clientGone || res.writableEnded || res.destroyed) return;
+          if (clientGone || res.writableEnded || res.destroyed) {
+            if (clientGone) recordClientAbort({ keyId: chosen.id });
+            return;
+          }
           continue;
         }
         activeAc = null;
         // L-b：错误体已排空、不再重试（将走外层 while 换 Key 或最终 502）——同 429
         // 持续限流分支，客户端若在排空后断开，需在此提前返回（外层唯一闸门在 while 顶部）。
-        if (clientGone || res.writableEnded || res.destroyed) return;
-        stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "upstream", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+        if (clientGone || res.writableEnded || res.destroyed) {
+          if (clientGone) recordClientAbort({ keyId: chosen.id });
+          return;
+        }
         break;
       }
 
       // 其余状态（400/404/422...）：透传，不重试
       activeAc = null;
-      stats.appendEvent({ keyId: chosen.id, model, stream, ok: false, status: upRes.status, errorKind: "client", retries: attempts - 1, latencyMs: Date.now() - startedAt });
+      lastStatus = upRes.status;
+      lastErrorKind = "client";
       // L-b：错误体已排空、即将透传响应——sendJson 自带判空守卫，此处提前返回保持一致
-      if (clientGone || res.writableEnded || res.destroyed) return;
+      if (clientGone || res.writableEnded || res.destroyed) {
+        if (clientGone) recordClientAbort({ keyId: chosen.id });
+        return;
+      }
+      recordRequestEvent({ keyId: chosen.id, status: upRes.status, errorKind: "client" });
       const mapped = mapError(upRes.status, text);
       sendJson(res, mapped.status, mapped.body);
       return;
     }
   }
 
-  if (clientGone || res.writableEnded || res.destroyed) return;
+  if (clientGone || res.writableEnded || res.destroyed) {
+    if (clientGone) recordClientAbort({ keyId: lastKeyId });
+    return;
+  }
   const wait = retryAfterSeconds(pool.nextRetryAfterMs());
   // 最终状态码如实反映失败类型：上游 5xx/网络错误 → 502（客户端 SDK 不应按限流退避），
   // 限流/池不可用 → 429（P2-2）
@@ -748,5 +843,10 @@ export async function handleGateway(req, res, url) {
   const finalBody = lastBody
     ? (finalStatus === 429 ? { ...lastBody, retry_after: wait } : lastBody)
     : { error: { message: "All API keys unavailable", type: "rate_limit_error" }, retry_after: wait };
+  recordRequestEvent({
+    status: finalStatus,
+    ok: false,
+    errorKind: finalStatus === 429 ? "rate_limit" : (lastErrorKind || "upstream"),
+  });
   sendJson(res, finalStatus, finalBody, { "Retry-After": String(wait) });
 }

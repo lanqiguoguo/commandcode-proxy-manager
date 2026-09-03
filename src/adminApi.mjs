@@ -465,6 +465,7 @@ export async function handleAdmin(req, res, url) {
         to: q.get("to") || undefined,
         status: q.get("status") || undefined,
         errorKind: q.get("errorKind") || undefined,
+        eventType: q.get("eventType") || undefined,
         page: q.get("page") || 1,
         pageSize: q.get("pageSize") || 50
       });

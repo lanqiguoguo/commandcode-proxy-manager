@@ -228,7 +228,8 @@ function response(status, body = {}) {
 
 function historyItem(model) {
   return { ts: 1725400000000, keyId: "key-1", model, stream: false, ok: true, status: 200,
-    inputTokens: 1, outputTokens: 2, cachedTokens: 0, retries: 0, latencyMs: 4 };
+    inputTokens: 1, outputTokens: 2, cachedTokens: 0, retries: 0, latencyMs: 4,
+    eventType: "request", requestId: model + "-request" };
 }
 
 async function flush() {
@@ -250,6 +251,13 @@ function createHarness({ token = "token-a", hash = "#/history" } = {}) {
   const historyRequests = [];
   const poolProbeResponses = [];
   const fetchCalls = [];
+  const csvBlobs = [];
+  class CaptureBlob extends Blob {
+    constructor(parts, options) {
+      super(parts, options);
+      csvBlobs.push(this);
+    }
+  }
   const fetch = (url, options = {}) => {
     fetchCalls.push({ url: String(url), options });
     if (String(url).startsWith("/admin/api/keys")) {
@@ -301,7 +309,7 @@ function createHarness({ token = "token-a", hash = "#/history" } = {}) {
     EventSource: FakeEventSource,
     URLSearchParams,
     AbortController,
-    Blob,
+    Blob: CaptureBlob,
     URL,
     Date,
     console: { error() {}, log() {} },
@@ -333,6 +341,7 @@ function createHarness({ token = "token-a", hash = "#/history" } = {}) {
     historyRequests,
     poolProbeResponses,
     fetchCalls,
+    csvBlobs,
     session,
     async ready() { await flush(); await flush(); },
     async resolveHistory(index, model, page = 1, total = 100) {
@@ -396,6 +405,20 @@ async function testHistoryRequestSequence() {
   assert.equal(harness.historyRequests.length, 5, "returning to history starts a fresh request");
   await harness.rejectHistory(4, new Error("history unavailable"));
   assert.equal(harness.document.app.innerHTML.includes("历史记录加载失败：history unavailable"), true, "current history errors are observable");
+}
+
+async function testCsvUsesExternalRequestRows() {
+  const harness = createHarness();
+  await harness.ready();
+  await harness.resolveHistory(0, "initial-page-1");
+  harness.document.getElementById("h-csv").click();
+  await flush();
+  assert.equal(harness.historyRequests.length, 2, "CSV export fetches the filtered history source");
+  await harness.resolveHistory(1, "csv-request-row", 1, 1);
+  assert.equal(harness.csvBlobs.length, 1, "CSV export creates one document");
+  const csv = await harness.csvBlobs[0].text();
+  assert.equal(csv.split("\n").length, 2, "one external request produces one CSV data row");
+  assert.equal(csv.includes("csv-request-row"), true, "CSV contains the returned request row");
 }
 
 async function testSseStateMachine() {
@@ -498,6 +521,7 @@ async function main() {
   process.on("unhandledRejection", onUnhandled);
   try {
     await testHistoryRequestSequence();
+    await testCsvUsesExternalRequestRows();
     await testSseStateMachine();
     await testSessionCleanup();
     await testLoginStartsSingleton();

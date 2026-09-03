@@ -235,6 +235,10 @@ async function addKey(alias, key) {
   });
 }
 const keysList = async () => (await adminJson("/admin/api/keys", "GET", undefined, 200, validateKeysPayload)).data.keys;
+const historyForModel = async (model, path = "/admin/api/history?pageSize=500") => {
+  const result = parseJsonResponse(await admin(path), "history for " + model);
+  return result.items.filter((event) => event.model === model);
+};
 
 async function waitUp(url, timeout = 20000, child) {
   const t0 = performance.now();
@@ -498,10 +502,134 @@ async function main() {
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   r.status === 200 && calls.length === 2 && calls.every((c) => c.auth === "user_keyA")
     ? ok("429(RA=1) 同 Key 重试成功未切换", Math.round(performance.now() - t0) + "ms") : bad("同 Key 重试", "status=" + r.status + " calls=" + JSON.stringify(calls.map((c) => c.auth)));
-  r = await admin("/admin/api/history?errorKind=rate_limit");
-  JSON.parse(r.body).total === 0 ? ok("重试成功不留 rate_limit 失败事件") : bad("重试事件", r.body.slice(0, 150));
+  const retryFailureRows = await historyForModel("m-retry", "/admin/api/history?errorKind=rate_limit&pageSize=500");
+  retryFailureRows.length === 0 ? ok("重试成功不留 rate_limit 失败事件") : bad("重试事件", JSON.stringify(retryFailureRows));
 
   // ── T3b 并发健康回写：A 慢生成期间 B 同 Key 429，A 的旧成功不得清掉 B 的退避 ──
+  // ── F17 外部请求统计契约：A→A→B 只产生一条 request 行 ──
+  console.log("\n=== F17 external request event semantics ===");
+  const keysF17 = await keysList();
+  const keyAF17 = keysF17.find((key) => key.alias === "keyA");
+  const keyBF17 = keysF17.find((key) => key.alias === "keyB");
+  const poolStatsF17 = async () => parseJsonResponse(await admin("/admin/api/pool"), "F17 pool").stats;
+
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [
+    { mode: "rate_limit", retryAfter: 1 },
+    { mode: "rate_limit", retryAfter: 30 }
+  ] });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "ok" }] });
+  const retryUsageBefore = await keysList();
+  const retryUsageBeforeA = retryUsageBefore.find((key) => key.id === keyAF17.id)?.usage?.h5;
+  const retryUsageBeforeB = retryUsageBefore.find((key) => key.id === keyBF17.id)?.usage?.h5;
+  const retryPoolBefore = await poolStatsF17();
+  r = await gw({ model: "m-f17-retry-success", messages: [] });
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  const retryRows = await historyForModel("m-f17-retry-success");
+  const retryPoolAfter = await poolStatsF17();
+  const retryEvent = retryRows[0];
+  const keysAfterRetry = await keysList();
+  const usageAAfterRetry = keysAfterRetry.find((key) => key.id === keyAF17.id)?.usage?.h5;
+  const usageBAfterRetry = keysAfterRetry.find((key) => key.id === keyBF17.id)?.usage?.h5;
+  r.status === 200 && calls.length === 3 && calls.map((call) => call.auth).join("→") === "user_keyA→user_keyA→user_keyB" &&
+    retryRows.length === 1 && retryEvent.eventType === "request" && typeof retryEvent.requestId === "string" &&
+    retryEvent.ok === true && retryEvent.status === 200 && retryEvent.attempts === 3 && retryEvent.retries === 2 &&
+    Number.isFinite(retryEvent.latencyMs) && retryEvent.latencyMs >= 0 && retryEvent.keyId === keyBF17.id &&
+    JSON.stringify(retryEvent.attemptedKeyIds) === JSON.stringify([keyAF17.id, keyAF17.id, keyBF17.id])
+    ? ok("A→A→B 成功只写一条外部 request 行，retries/attempts/Key 路径稳定")
+    : bad("F17 A→A→B 成功统计", JSON.stringify({ status: r.status, calls, rows: retryRows }));
+  retryPoolAfter.requests - retryPoolBefore.requests === 1 && retryPoolAfter.success - retryPoolBefore.success === 1 &&
+    retryPoolAfter.input - retryPoolBefore.input === 5 && retryPoolAfter.output - retryPoolBefore.output === 7 &&
+    usageAAfterRetry?.requests - retryUsageBeforeA.requests === 0 &&
+    usageBAfterRetry?.requests - retryUsageBeforeB.requests === 1 &&
+    usageBAfterRetry.input - retryUsageBeforeB.input === 5 && usageBAfterRetry.output - retryUsageBeforeB.output === 7
+    ? ok("重试不放大 poolStats/token，窗口按终态 Key 归属")
+    : bad("F17 成功聚合", JSON.stringify({ before: retryPoolBefore, after: retryPoolAfter, a: usageAAfterRetry, b: usageBAfterRetry }));
+  const retryRequestRows = parseJsonResponse(await admin("/admin/api/history?eventType=request&keyId=" + keyBF17.id + "&pageSize=500"), "F17 request query").items
+    .filter((event) => event.model === "m-f17-retry-success");
+  const retryAttemptRows = parseJsonResponse(await admin("/admin/api/history?eventType=attempt&keyId=" + keyBF17.id + "&pageSize=500"), "F17 attempt query").items
+    .filter((event) => event.model === "m-f17-retry-success");
+  retryRequestRows.length === 1 && retryRequestRows[0].requestId && retryAttemptRows.length === 0 &&
+    new Set(retryRequestRows.map((event) => event.requestId)).size === retryRequestRows.length
+    ? ok("history/CSV 默认数据源按外部 request 行查询")
+    : bad("F17 history/CSV 行数", JSON.stringify({ requests: retryRequestRows, attempts: retryAttemptRows }));
+
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [
+    { mode: "rate_limit", retryAfter: 1 },
+    { mode: "rate_limit", retryAfter: 30 }
+  ] });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "rate_limit", retryAfter: 30 }] });
+  const failedUsageBefore = await keysList();
+  const failedUsageBeforeA = failedUsageBefore.find((key) => key.id === keyAF17.id)?.usage?.h5;
+  const failedUsageBeforeB = failedUsageBefore.find((key) => key.id === keyBF17.id)?.usage?.h5;
+  const failedPoolBefore = await poolStatsF17();
+  r = await gw({ model: "m-f17-retry-failure", messages: [] });
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  const failedRows = await historyForModel("m-f17-retry-failure");
+  const failedPoolAfter = await poolStatsF17();
+  const failedEvent = failedRows[0];
+  r.status === 429 && calls.length === 3 && calls.map((call) => call.auth).join("→") === "user_keyA→user_keyA→user_keyB" &&
+    failedRows.length === 1 && failedEvent.ok === false && failedEvent.status === 429 && failedEvent.errorKind === "rate_limit" &&
+    failedEvent.attempts === 3 && failedEvent.retries === 2 && Number.isFinite(failedEvent.latencyMs) && failedEvent.latencyMs >= 0 &&
+    failedEvent.keyId === keyBF17.id &&
+    JSON.stringify(failedEvent.attemptedKeyIds) === JSON.stringify([keyAF17.id, keyAF17.id, keyBF17.id])
+    ? ok("A→A→B 最终限流只写一条失败 request 行，status/ok/retries 稳定")
+    : bad("F17 A→A→B 最终失败统计", JSON.stringify({ status: r.status, calls, rows: failedRows }));
+  failedPoolAfter.requests - failedPoolBefore.requests === 1 && failedPoolAfter.err429 - failedPoolBefore.err429 === 1 &&
+    failedPoolAfter.success - failedPoolBefore.success === 0
+    ? ok("所有限流 attempts 不重复计请求/失败率")
+    : bad("F17 限流聚合", JSON.stringify({ before: failedPoolBefore, after: failedPoolAfter }));
+  const failedKeysAfter = await keysList();
+  const failedUsageAfterA = failedKeysAfter.find((key) => key.id === keyAF17.id)?.usage?.h5;
+  const failedUsageAfterB = failedKeysAfter.find((key) => key.id === keyBF17.id)?.usage?.h5;
+  failedUsageAfterA?.requests - failedUsageBeforeA.requests === 0 && failedUsageAfterB?.requests - failedUsageBeforeB.requests === 1 &&
+    failedUsageAfterB.err429 - failedUsageBeforeB.err429 === 1
+    ? ok("失败重试按最终 Key 计一次每 Key 窗口")
+    : bad("F17 失败每 Key 窗口", JSON.stringify({ beforeA: failedUsageBeforeA, afterA: failedUsageAfterA, beforeB: failedUsageBeforeB, afterB: failedUsageAfterB }));
+
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [
+    { mode: "server5xx", status: 503 },
+    { mode: "server5xx", status: 503 }
+  ] });
+  await mock("/__control", { auth: "user_keyB", responses: [
+    { mode: "server5xx", status: 503 },
+    { mode: "server5xx", status: 503 }
+  ] });
+  r = await gw({ model: "m-f17-final-upstream-failure", messages: [] });
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  const finalUpstreamRows = await historyForModel("m-f17-final-upstream-failure");
+  const finalUpstreamEvent = finalUpstreamRows[0];
+  r.status === 502 && calls.length === 4 && finalUpstreamRows.length === 1 && finalUpstreamEvent.ok === false &&
+    finalUpstreamEvent.status === 502 && finalUpstreamEvent.errorKind === "upstream" && finalUpstreamEvent.attempts === 4 &&
+    finalUpstreamEvent.retries === 3 && finalUpstreamEvent.keyId === keyBF17.id
+    ? ok("最终上游失败只写一条 502/upstream request 终态")
+    : bad("F17 最终上游失败统计", JSON.stringify({ status: r.status, calls, rows: finalUpstreamRows }));
+
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "cutbody" }] });
+  r = await gw({ model: "m-f17-partial-json", messages: [] });
+  const partialJsonRows = await historyForModel("m-f17-partial-json");
+  partialJsonRows.length === 1 && partialJsonRows[0].ok === false && partialJsonRows[0].status === 502 &&
+    partialJsonRows[0].errorKind === "upstream" && partialJsonRows[0].attempts === 1 && partialJsonRows[0].retries === 0
+    ? ok("非流式部分响应按单条 502/upstream 终态记录")
+    : bad("F17 非流式部分失败统计", JSON.stringify({ status: r.status, rows: partialJsonRows }));
+
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "cutstream" }] });
+  const partialStreamResult = await rawGwOnce({ model: "m-f17-partial-stream", messages: [], stream: true });
+  await sleep(100);
+  const partialStreamRows = await historyForModel("m-f17-partial-stream");
+  partialStreamRows.length === 1 && partialStreamRows[0].ok === false && partialStreamRows[0].status === 502 &&
+    partialStreamRows[0].errorKind === "upstream" && partialStreamRows[0].attempts === 1 && partialStreamRows[0].retries === 0 &&
+    partialStreamResult.outcome !== "timeout"
+    ? ok("流式部分断流按单条 502/upstream 终态记录")
+    : bad("F17 流式部分失败统计", JSON.stringify({ result: partialStreamResult, rows: partialStreamRows }));
+
+  // F17 场景会主动制造 Key 退避；清理健康状态后再进入后续既有用例。
+  await restartClean();
+
   console.log("\n=== T3b concurrent health generation ===");
   await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [
@@ -861,7 +989,8 @@ async function main() {
   await sleep(250);
   r = await admin("/admin/api/history?keyId=" + idA9b + "&errorKind=upstream&status=502");
   let upstreamEv = JSON.parse(r.body);
-  upstreamEv.total === 1 && upstreamEv.items[0].ok === false && upstreamEv.items[0].model === "m-cut"
+  const cutEvents = upstreamEv.items.filter((event) => event.model === "m-cut");
+  cutEvents.length === 1 && cutEvents[0].ok === false && cutEvents[0].model === "m-cut" && cutEvents[0].attempts === 1 && cutEvents[0].retries === 0
     ? ok("恰 1 条 ok:false errorKind=upstream status:502 事件") : bad("upstream 事件", JSON.stringify(upstreamEv).slice(0, 200));
   r = await admin("/admin/api/history?keyId=" + idA9b + "&status=200");
   JSON.parse(r.body).items.every((e) => e.model !== "m-cut")
@@ -885,8 +1014,9 @@ async function main() {
     : bad("P1-1 非流式挂起", "outcome=" + cutbRes.outcome + " ms=" + cutbRes.ms);
   await sleep(250);
   r = await admin("/admin/api/history?keyId=" + idA9b + "&errorKind=upstream&status=502");
-  JSON.parse(r.body).total === 2
-    ? ok("cutbody 也记 ok:false upstream 事件（累计 2 条）") : bad("cutbody 事件", r.body.slice(0, 200));
+  const cutbodyEvents = JSON.parse(r.body).items.filter((event) => event.model === "m-cutb");
+  cutbodyEvents.length === 1 && cutbodyEvents[0].attempts === 1 && cutbodyEvents[0].retries === 0
+    ? ok("cutbody 也记单条 ok:false upstream 终态事件") : bad("cutbody 事件", r.body.slice(0, 200));
   mgrStderr.slice(stderrMark2).includes("unhandledRejection")
     ? bad("cutbody 拒绝噪音", mgrStderr.slice(stderrMark2).trim().split("\n").slice(0, 3).join(" | "))
     : ok("非流式断连无 unhandledRejection 噪音");
@@ -1011,6 +1141,12 @@ async function main() {
     ? ok("客户端断开中断上游拉取（P2-1 已修复）", "frames=" + slow[0].frames) : bad("P2-1 断连中断", JSON.stringify(slow));
   r = await http1(MG + "/health", "GET", {});
   r.status === 200 ? ok("断连场景后 manager 存活") : bad("断连存活", "health=" + r.status);
+  const clientDisconnectRows = await historyForModel("m-disc");
+  clientDisconnectRows.length === 1 && clientDisconnectRows[0].ok === false && clientDisconnectRows[0].status === 499 &&
+    clientDisconnectRows[0].errorKind === "client" && clientDisconnectRows[0].attempts === 1 && clientDisconnectRows[0].retries === 0 &&
+    Number.isFinite(clientDisconnectRows[0].latencyMs) && clientDisconnectRows[0].latencyMs >= 0
+    ? ok("客户端断连记为单条 499/client 终态且不重试")
+    : bad("客户端断连统计语义", JSON.stringify(clientDisconnectRows));
 
   // ── T11 慢非流式（P1-1 修复后：合法慢生成不再被误杀）──
   console.log("\n=== T11 slow non-stream ===");
@@ -1042,8 +1178,12 @@ async function main() {
   r.status === 200 && calls.length === 2 && dt11b >= 2500 && dt11b < 8000
     ? ok("connectTimeout=3s：挂死 → 超时退避 → 切 keyB 成功", Math.round(dt11b) + "ms")
     : bad("超时切换", "status=" + r.status + " dt=" + dt11b + " calls=" + JSON.stringify(calls.map((c) => [c.auth, c.mode])));
-  r = await admin("/admin/api/history?errorKind=timeout");
-  JSON.parse(r.body).total >= 1 ? ok("timeout 事件记录") : bad("timeout 事件", r.body.slice(0, 120));
+  const timeoutRows = await historyForModel("m-timeout");
+  const timeoutAttemptRows = await historyForModel("m-timeout", "/admin/api/history?errorKind=timeout&pageSize=500");
+  timeoutRows.length === 1 && timeoutRows[0].ok === true && timeoutRows[0].status === 200 && timeoutRows[0].attempts === 2 &&
+    timeoutRows[0].retries === 1 && timeoutRows[0].keyId === ks.find((k) => k.alias === "keyB")?.id && timeoutAttemptRows.length === 0
+    ? ok("超时 attempt 收敛到最终成功 request 终态")
+    : bad("timeout 事件", JSON.stringify({ rows: timeoutRows, timeoutAttemptRows }));
   ks = await keysList();
   ks.find((k) => k.alias === "keyA").health.backoffUntilMs > Date.now()
     ? ok("超时 Key 进入退避") : bad("超时退避", "");

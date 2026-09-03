@@ -8,6 +8,8 @@ export const MAX_EVENTS = 200000;
 export const MAX_DISK_LINES = MAX_EVENTS; // physical rows never exceed the memory contract
 export const MAX_DISK_BYTES = 64 * 1024 * 1024; // bounds unusually large event payloads
 export const MIN_FREE_BYTES = 16 * 1024 * 1024; // reserve space for the temp-file rename
+export const EVENT_TYPE_REQUEST = "request";
+export const EVENT_TYPE_ATTEMPT = "attempt";
 const MAX_RECORD_BYTES = 256 * 1024;
 const MAX_COMPACT_RETRIES = 3;
 const COMPACT_DELAY_MS = envMs("CCPM_COMPACT_DELAY_MS", 5000, 0, 10 * 60 * 1000);
@@ -26,6 +28,7 @@ let physicalKnown = false;
 let physicalCanonical = true;
 let needsCompact = false;
 let diskWarning = "";
+let requestIds = new Set();
 
 function envMs(name, fallback, min, max) {
   const n = Number(process.env[name]);
@@ -45,6 +48,7 @@ export function initStats(emitterRef, retentionDaysArg = 7) {
   physicalCanonical = true;
   needsCompact = false;
   emitter = emitterRef;
+  requestIds = new Set();
   retentionDays = clampDays(retentionDaysArg);
   load();
   // Startup cleanup is synchronous: a dirty file must not remain dirty for the
@@ -73,6 +77,19 @@ function isRecord(value) {
 
 function isValidEvent(value) {
   return isRecord(value) && typeof value.ts === "number" && Number.isFinite(value.ts);
+}
+
+// Rows written before the request/attempt contract have no eventType and are
+// intentionally treated as external request rows for backwards compatibility.
+function isRequestEvent(event) { return event?.eventType !== EVENT_TYPE_ATTEMPT; }
+function isAttemptEvent(event) { return event?.eventType === EVENT_TYPE_ATTEMPT; }
+function hasRequestId(event) { return typeof event?.requestId === "string" && event.requestId.length > 0; }
+
+function rebuildRequestIds() {
+  requestIds = new Set(events
+    .filter(isRequestEvent)
+    .map((event) => event.requestId)
+    .filter((requestId) => typeof requestId === "string" && requestId.length > 0));
 }
 
 function lineCount(body) {
@@ -245,6 +262,7 @@ function compactNow() {
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, p);
     events = packed.events;
+    rebuildRequestIds();
     setPhysicalState(packed.body);
     needsCompact = false;
     compactFailures = 0;
@@ -297,7 +315,23 @@ function load() {
         dirty = true;
         continue;
       }
+      if (isAttemptEvent(event) && !hasRequestId(event)) {
+        dirty = true;
+        continue;
+      }
+      if (event.requestId !== undefined && !hasRequestId(event)) {
+        delete event.requestId;
+        dirty = true;
+      }
       if (sanitizeNumeric(event, ["inputTokens", "outputTokens", "cachedTokens", "latencyMs", "retries", "status"])) dirty = true;
+      if (sanitizeNumeric(event, ["attempts"])) dirty = true;
+      if (isRequestEvent(event) && typeof event.requestId === "string" && event.requestId) {
+        if (requestIds.has(event.requestId)) {
+          dirty = true;
+          continue;
+        }
+        requestIds.add(event.requestId);
+      }
       loaded.push(event);
     } catch {
       dirty = true;
@@ -308,6 +342,7 @@ function load() {
     dirty = true;
   }
   events = loaded;
+  rebuildRequestIds();
   if (overPhysicalLimit()) dirty = true;
   needsCompact = dirty;
 }
@@ -343,10 +378,22 @@ function sanitizeNumeric(event, fields) {
 
 export function appendEvent(ev) {
   const event = { ts: Date.now(), ...ev };
+  if (event.eventType !== EVENT_TYPE_REQUEST && event.eventType !== EVENT_TYPE_ATTEMPT) {
+    event.eventType = EVENT_TYPE_REQUEST;
+  }
+  if (isAttemptEvent(event) && !hasRequestId(event)) {
+    warn("attempt event without requestId ignored");
+    return;
+  }
+  if (event.requestId !== undefined && !hasRequestId(event)) delete event.requestId;
   sanitizeNumeric(event, ["inputTokens", "outputTokens", "cachedTokens", "latencyMs", "retries", "status"]);
+  sanitizeNumeric(event, ["attempts"]);
+  if (isRequestEvent(event) && typeof event.requestId === "string" && event.requestId && requestIds.has(event.requestId)) return;
   events.push(event);
+  if (isRequestEvent(event) && typeof event.requestId === "string" && event.requestId) requestIds.add(event.requestId);
   if (events.length > MAX_EVENTS) {
     events = events.slice(-MAX_EVENTS);
+    rebuildRequestIds();
     needsCompact = true;
     warnGuard("MAX_EVENTS");
   }
@@ -376,7 +423,10 @@ export function appendEvent(ev) {
       scheduleCompact();
     }
   }
-  if (emitter) emitter.emit("stats", event);
+  // The regular stats stream has the same external-request contract as the
+  // history and aggregations; internal attempt rows, if ever retained, stay
+  // available only through the explicit attempt query.
+  if (emitter && isRequestEvent(event)) emitter.emit("stats", event);
 }
 
 export function prune() {
@@ -384,6 +434,7 @@ export function prune() {
   const before = events.length;
   events = events.filter((e) => e.ts >= cutoff);
   if (events.length > MAX_EVENTS) events = events.slice(-MAX_EVENTS);
+  rebuildRequestIds();
   if (events.length !== before) needsCompact = true;
   if (physicalKnown && overPhysicalLimit()) needsCompact = true;
   if (!needsCompact) return;
@@ -396,8 +447,10 @@ export function prune() {
   compactNow();
 }
 
-export function queryEvents({ keyId, from, to, status, errorKind, page = 1, pageSize = 50 } = {}) {
-  let list = events;
+export function queryEvents({ keyId, from, to, status, errorKind, eventType, page = 1, pageSize = 50 } = {}) {
+  let list = eventType === EVENT_TYPE_ATTEMPT
+    ? events.filter(isAttemptEvent)
+    : events.filter(isRequestEvent);
   if (keyId) list = list.filter((e) => e.keyId === keyId);
   if (from) list = list.filter((e) => e.ts >= Number(from));
   if (to) list = list.filter((e) => e.ts <= Number(to));
@@ -415,6 +468,7 @@ function windowCounts(keyId, msWindow) {
   const cutoff = Date.now() - msWindow;
   let requests = 0, success = 0, input = 0, output = 0, cached = 0, err429 = 0, errOther = 0;
   for (const e of events) {
+    if (!isRequestEvent(e)) continue;
     if (e.keyId !== keyId || e.ts < cutoff) continue;
     requests++;
     if (e.ok) success++;
@@ -442,6 +496,7 @@ export function poolStats() {
   const agg = { requests: 0, success: 0, err429: 0, errOther: 0, input: 0, output: 0, cached: 0 };
   const cutoff = Date.now() - 7 * 864e5;
   for (const e of events) {
+    if (!isRequestEvent(e)) continue;
     if (e.ts < cutoff) continue;
     agg.requests++;
     if (e.ok) agg.success++;

@@ -719,7 +719,7 @@ if (SC === "stats") {
     JSON.stringify({ model: "missing-ts" })
   ].join("\n") + "\n", { mode: 0o644 });
   fs.chmodSync(DATA + "/stats.jsonl", 0o644);
-  const { initStats, queryEvents, usageByKey, setRetention, appendEvent, poolStats, MAX_EVENTS } = await import("../src/stats.mjs");
+  const { initStats, queryEvents, usageByKey, setRetention, appendEvent, poolStats, MAX_EVENTS, EVENT_TYPE_ATTEMPT, EVENT_TYPE_REQUEST } = await import("../src/stats.mjs");
   initStats({ emit: () => {} }, 7);
   const q = queryEvents({});
   check(q.total === 2, "启动回放剔除超保留期事件", "total=" + q.total);
@@ -733,10 +733,23 @@ if (SC === "stats") {
   check(u.h5.requests === 1 && u.d7.requests === 2 && u.d30Valid === false, "窗口统计 + d30 回退标记");
   const ps = poolStats();
   check(ps.requests === 2 && ps.err429 === 1 && ps.success === 1, "poolStats 聚合", JSON.stringify(ps));
+  appendEvent({ eventType: EVENT_TYPE_ATTEMPT, requestId: "attempt-only", keyId: "k1", ok: false, status: 429, errorKind: "rate_limit", inputTokens: 99 });
+  check(queryEvents({}).total === 2 && queryEvents({}).items.every((event) => event.eventType !== EVENT_TYPE_ATTEMPT),
+    "默认 history 排除内部 attempt 行", JSON.stringify(queryEvents({})));
+  check(queryEvents({ eventType: EVENT_TYPE_REQUEST }).total === 2, "显式 request 查询保持默认外部口径");
+  check(queryEvents({ eventType: EVENT_TYPE_ATTEMPT }).total === 1, "attempt 行仅可通过显式类型查询");
+  appendEvent({ eventType: EVENT_TYPE_ATTEMPT, keyId: "k1", ok: false, status: 429, errorKind: "rate_limit" });
+  check(queryEvents({ eventType: EVENT_TYPE_ATTEMPT }).total === 1, "无 requestId 的 attempt 不进入历史");
+  const attemptPool = poolStats();
+  const attemptUsage = usageByKey("k1");
+  check(attemptPool.requests === ps.requests && attemptPool.input === ps.input && attemptUsage.h5.requests === 1 && attemptUsage.h5.input === 100,
+    "attempt 不污染 poolStats/每 Key 窗口聚合", JSON.stringify({ attemptPool, attemptUsage: attemptUsage.h5 }));
   setRetention(1);
   check(queryEvents({}).total === 1, "retention 调整即时 prune", String(queryEvents({}).total));
-  const fileLines = readFileSync(DATA + "/stats.jsonl", "utf8").trim().split("\n").length;
-  check(fileLines === 1, "prune 重写文件", "file=" + fileLines);
+  const retentionRows = readFileSync(DATA + "/stats.jsonl", "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  check(retentionRows.length === 2 && retentionRows.some((event) => event.eventType === EVENT_TYPE_ATTEMPT) &&
+    retentionRows.some((event) => event.eventType !== EVENT_TYPE_ATTEMPT && event.model === "new"),
+    "prune 重写文件并保留显式 attempt 行", "file=" + retentionRows.length);
   appendEvent({ keyId: "k1", ok: true, status: 200, model: "app" });
   check(queryEvents({}).total === 2, "appendEvent 落盘");
   // P1-6：appendEvent 入口数值净化——脏类型不落盘，有限数（含数字字符串）归一为 number
@@ -763,6 +776,20 @@ if (SC === "stats") {
   check(mode === "600", "stats.jsonl 权限 600", mode);
   setRetention(999); // clamp 31
   check(usageByKey("k1").d30Valid === true, "setRetention 越界后仍按 31 天上限启用 d30", JSON.stringify(usageByKey("k1")));
+  appendEvent({ eventType: EVENT_TYPE_REQUEST, requestId: "dedupe-request", keyId: "k1", ok: true, status: 200, model: "dedupe" });
+  appendEvent({ eventType: EVENT_TYPE_REQUEST, requestId: "dedupe-request", keyId: "k1", ok: true, status: 200, model: "dedupe-duplicate", inputTokens: 999 });
+  const deduped = queryEvents({}).items.filter((event) => event.requestId === "dedupe-request");
+  check(deduped.length === 1 && deduped[0].model === "dedupe" && deduped[0].inputTokens === undefined,
+    "相同 requestId 不重复写入终态", JSON.stringify(deduped));
+  writeFileSync(DATA + "/stats.jsonl", JSON.stringify({
+    ts: Date.now() - 2 * 864e5, eventType: EVENT_TYPE_REQUEST, requestId: "expired-request-id",
+    keyId: "k1", ok: true, status: 200, model: "expired"
+  }) + "\n", { mode: 0o600 });
+  const SRetention = await import("../src/stats.mjs?requestid-retention");
+  SRetention.initStats({ emit: () => {} }, 1);
+  SRetention.appendEvent({ eventType: EVENT_TYPE_REQUEST, requestId: "expired-request-id", keyId: "k1", ok: true, status: 200, model: "reused" });
+  const reused = SRetention.queryEvents({}).items.filter((event) => event.requestId === "expired-request-id");
+  check(reused.length === 1 && reused[0].model === "reused", "过期 requestId 不永久阻塞新终态", JSON.stringify(reused));
   // ── 终检加固：读侧净化——修复前已落盘的脏 usage 重启回放后不得进聚合（用 ?fresh
   //    查询串绕过模块缓存拿独立实例；DATA_DIR 经 config.mjs 缓存仍指向同一临时目录）──
   const now2 = Date.now();

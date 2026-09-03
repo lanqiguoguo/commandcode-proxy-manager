@@ -71,14 +71,33 @@ function startTimer() {
 // 边缘节点/鉴权抖动）。fetchJson 只看 res.ok 会把后者当成功解析，导致
 // 下游读不到 credits/windowLimits 而误标 stale 却无原因可查。
 async function fetchJson(url, key) {
+  return fetchJsonWithSignal(url, key);
+}
+
+function abortError(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("probe aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+async function fetchJsonWithSignal(url, key, signal) {
+  throwIfAborted(signal);
   let res;
   try {
     res = await fetch(url, {
       headers: { Accept: "application/json", Authorization: "Bearer " + key },
       redirect: "error",
-      signal: AbortSignal.timeout(PROBE_TIMEOUT)
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT)])
+        : AbortSignal.timeout(PROBE_TIMEOUT)
     });
   } catch (e) {
+    if (signal?.aborted) throw e;
     return { err: "network: " + (e.cause?.code || e.message), status: 0 };
   }
   if (!res.ok) {
@@ -192,11 +211,13 @@ function toMs(iso) {
   return Number.isFinite(t) ? t : 0;
 }
 
-export function probeKey(keyId) {
+export function probeKey(keyId, options = {}) {
+  const signal = options?.signal;
   return enqueue(async () => {
+    throwIfAborted(signal);
     emitStatus(keyId, "updating");
     try {
-      const out = await doProbe(keyId);
+      const out = await doProbe(keyId, signal);
       emitStatus(keyId, out && out.stale ? "error" : "done");
       return out;
     } catch (e) {
@@ -206,7 +227,8 @@ export function probeKey(keyId) {
   });
 }
 
-async function doProbe(keyId) {
+async function doProbe(keyId, signal) {
+  throwIfAborted(signal);
   const rec = pool.getKeyRecord(keyId);
   if (!rec || !rec.key) return null;
   const prev = cache.get(keyId) || null;
@@ -214,7 +236,7 @@ async function doProbe(keyId) {
   let ok = false;
   let probeErr = "";
   try {
-    const whoami = requirePayload("whoami", await fetchJson(API_BASE + PATH_WHOAMI, rec.key));
+    const whoami = requirePayload("whoami", await fetchJsonWithSignal(API_BASE + PATH_WHOAMI, rec.key, signal));
     if (whoami.org !== undefined && (!isRecord(whoami.org) || typeof whoami.org.id !== "string" || !whoami.org.id)) {
       throw new Error("whoami: invalid org structure");
     }
@@ -227,7 +249,7 @@ async function doProbe(keyId) {
     const orgId = whoami.org ? whoami.org.id : null;
     const orgQuery = orgId ? "?orgId=" + encodeURIComponent(orgId) : "";
 
-    const credits = requirePayload("credits", await fetchJson(API_BASE + PATH_CREDITS + orgQuery, rec.key));
+    const credits = requirePayload("credits", await fetchJsonWithSignal(API_BASE + PATH_CREDITS + orgQuery, rec.key, signal));
     const creditsObj = parseCredits(credits.credits);
     if (!creditsObj) throw new Error("credits: invalid or empty credits");
     if (!isRecord(credits.windowLimits)) throw new Error("credits: missing windowLimits");
@@ -238,7 +260,7 @@ async function doProbe(keyId) {
     report.weekly = weekly;
 
     // 订阅周期内美元额度：没有周期起点是合法的无账期数据，不请求裸 usage。
-    const sub = requirePayload("subscriptions", await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key));
+    const sub = requirePayload("subscriptions", await fetchJsonWithSignal(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key, signal));
     const rawPeriodStart = sub.currentPeriodStart;
     const periodEnd = optionalTime("subscriptions.currentPeriodEnd", sub.currentPeriodEnd);
     let periodStart = "";
@@ -251,7 +273,7 @@ async function doProbe(keyId) {
     if (periodStart) {
       // 无 orgId 时 orgQuery 为空串，必须用 ? 起始，否则 "&since=" 拼出非法 URL（真实 API 实测 404）
       const usageSep = orgQuery ? "&" : "?";
-      const usage = requirePayload("usage", await fetchJson(API_BASE + PATH_USAGE + orgQuery + usageSep + "since=" + encodeURIComponent(periodStart), rec.key));
+      const usage = requirePayload("usage", await fetchJsonWithSignal(API_BASE + PATH_USAGE + orgQuery + usageSep + "since=" + encodeURIComponent(periodStart), rec.key, signal));
       validateUsageNumbers(usage);
       const used = Object.prototype.hasOwnProperty.call(usage, "totalCost")
         ? nonNegativeNumber("usage", "totalCost", usage.totalCost)
@@ -292,9 +314,11 @@ async function doProbe(keyId) {
     probeErr = "";
     report.updatedAt = Date.now();
   } catch (e) {
+    if (signal?.aborted) throw e;
     probeErr = e && e.message ? e.message : ("exception: " + String(e));
     // 探测失败：走下方统一失败路径
   }
+  throwIfAborted(signal);
   // 决策 3：失败时保留上次成功值并标记 stale，绝不丢数据
   // updatedAt：保留上次成功时间戳；从未成功过时为 null（前端显示"获取失败"而非"过期"）
   const final = ok ? { ...report, stale: false } : {
@@ -345,8 +369,8 @@ function applyLimits(keyId, report) {
   pool.setSoftLimited(keyId, !!softHit);
 }
 
-export async function refreshKey(keyId) {
-  return probeKey(keyId);
+export async function refreshKey(keyId, options = {}) {
+  return probeKey(keyId, options);
 }
 
 export async function refreshAll() {

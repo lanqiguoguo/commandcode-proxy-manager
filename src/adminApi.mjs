@@ -57,10 +57,19 @@ function sseCookieValue() {
 }
 function parseCookies(req) {
   const out = {};
-  const raw = req.headers.cookie || "";
+  const raw = typeof req.headers.cookie === "string" ? req.headers.cookie : "";
   for (const part of raw.split(";")) {
     const i = part.indexOf("=");
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i <= 0) continue;
+    const name = part.slice(0, i).trim();
+    if (!name) continue;
+    try {
+      out[name] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      // A malformed value is an invalid credential, not a malformed request.
+      // Ignore only this cookie so a separate valid header/cookie keeps its
+      // existing authentication semantics.
+    }
   }
   return out;
 }
@@ -284,6 +293,44 @@ function sanitizePoolPatch(body) {
   return normalizePoolPatch(body, getConfig().pool);
 }
 
+const DEFAULT_REFRESH_QUOTA_TIMEOUT_MS = 35000;
+const REFRESH_QUOTA_TIMEOUT_MIN_MS = 100;
+const REFRESH_QUOTA_TIMEOUT_MAX_MS = 120000;
+
+function refreshQuotaTimeoutMs() {
+  const value = Number(process.env.CC_ADMIN_REFRESH_QUOTA_TIMEOUT_MS);
+  return Number.isInteger(value) && value >= REFRESH_QUOTA_TIMEOUT_MIN_MS && value <= REFRESH_QUOTA_TIMEOUT_MAX_MS
+    ? value
+    : DEFAULT_REFRESH_QUOTA_TIMEOUT_MS;
+}
+
+// Keep the request timer and the quota probe under one lifecycle. The signal
+// is consumed by quota.mjs so a timeout cannot leave a probe mutating state
+// after the HTTP response has already been returned.
+export async function refreshQuotaWithTimeout(keyId, options = {}) {
+  const refresh = options.refresh || quota.refreshKey;
+  const timeoutMs = options.timeoutMs ?? refreshQuotaTimeoutMs();
+  const scheduleTimeout = options.setTimeout || setTimeout;
+  const cancelTimeout = options.clearTimeout || clearTimeout;
+  const controller = new AbortController();
+  let timer = null;
+  const probe = Promise.resolve().then(() => refresh(keyId, { signal: controller.signal }));
+  const timeout = new Promise((_, reject) => {
+    timer = scheduleTimeout(() => {
+      controller.abort(new Error("probe timeout"));
+      reject(new Error("probe timeout"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([probe, timeout]);
+  } finally {
+    if (timer !== null) {
+      cancelTimeout(timer);
+      timer = null;
+    }
+  }
+}
+
 export async function handleAdmin(req, res, url) {
   const cfg = getConfig();
   const p = url.pathname;
@@ -385,10 +432,7 @@ export async function handleAdmin(req, res, url) {
     }
 
     if (parts.length === 5 && parts[2] === "keys" && parts[4] === "refresh-quota" && req.method === "POST") {
-      const report = await Promise.race([
-        quota.refreshKey(parts[3]),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("probe timeout")), 35000))
-      ]);
+      const report = await refreshQuotaWithTimeout(parts[3]);
       sendJson(res, 200, { quota: report });
       return true;
     }

@@ -1,29 +1,43 @@
 // ── 零构建管理 SPA：登录 / 总览 / Key 管理 / 历史 / 设置 / 日志 ──
 const app = document.getElementById("app");
+const VALID_VIEWS = new Set(["dashboard", "keys", "history", "settings", "logs"]);
+function viewFromHash(hash) {
+  const view = String(hash || "").slice(2);
+  return VALID_VIEWS.has(view) ? view : "dashboard";
+}
+const initialRouteHash = location.hash || "#/dashboard";
 
 const state = {
   token: sessionStorage.getItem("ccpm_token") || "",
-  view: location.hash.slice(2) || "dashboard",
+  sessionSeq: 0,
+  routeHash: initialRouteHash,
+  view: viewFromHash(initialRouteHash),
   keys: [],
   pool: null,
   history: { items: [], total: 0, page: 1 },
   filters: { keyId: "", status: "", errorKind: "", from: "", to: "" },
   page: 1,
+  historyLoading: false,
+  historyError: "",
   logs: [],
   lastLogTs: 0,
-  timer: null
+  logError: "",
+  timer: null,
+  logTimer: null,
+  sse: { status: "idle", retryAttempt: 0, message: "" }
 };
 
 function setView(v) {
-  state.view = v;
-  location.hash = "#/" + v;
-  if (v === "history") loadHistory().catch(() => {});
-  if (v === "logs") loadLogs().catch(() => {});
-  render();
+  const next = VALID_VIEWS.has(v) ? v : "dashboard";
+  location.hash = "#/" + next;
+  // Browsers dispatch hashchange asynchronously; apply immediately as well so
+  // a test harness and same-hash navigation have identical request invalidation.
+  applyRoute();
 }
 
 function render() {
-  document.getElementById("topbar").hidden = false;
+  const topbar = document.getElementById("topbar");
+  if (topbar) topbar.hidden = false;
   document.querySelectorAll("nav button").forEach((b) => {
     b.classList.toggle("active", b.dataset.view === state.view);
   });
@@ -32,6 +46,7 @@ function render() {
   else if (state.view === "history") renderHistory();
   else if (state.view === "settings") renderSettings();
   else if (state.view === "logs") renderLogs();
+  updateSseIndicator();
 }
 
 async function api(path, opts) {
@@ -41,9 +56,7 @@ async function api(path, opts) {
   if (state.token) headers["X-Admin-Token"] = state.token;
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   if (res.status === 401 && path !== "/admin/api/login") {
-    state.token = "";
-    sessionStorage.removeItem("ccpm_token");
-    location.reload();
+    resetSession(true);
     throw new Error("unauthorized");
   }
   if (res.status === 204) return null;
@@ -56,8 +69,11 @@ async function api(path, opts) {
 }
 
 async function refresh() {
+  const sessionSeq = state.sessionSeq;
+  const token = state.token;
   try {
     const [keysData, poolData] = await Promise.all([api("/admin/api/keys"), api("/admin/api/pool")]);
+    if (!token || sessionSeq !== state.sessionSeq || token !== state.token) return false;
     state.keys = keysData.keys || [];
     state.pool = poolData;
     return true;
@@ -95,7 +111,13 @@ function tick() {
 
 function startTicker() {
   if (state.timer) clearInterval(state.timer);
+  if (!state.token || document.hidden) { state.timer = null; return; }
   state.timer = setInterval(tick, 10000);
+}
+
+function stopTicker() {
+  if (state.timer) clearInterval(state.timer);
+  state.timer = null;
 }
 
 // ── 登录 ──
@@ -115,18 +137,25 @@ function showLogin() {
 }
 
 async function doLogin() {
-  const token = document.getElementById("login-token").value.trim();
+  const input = document.getElementById("login-token");
+  const token = input ? input.value.trim() : "";
   if (!token) return;
   try {
     await api("/admin/api/login", { method: "POST", body: JSON.stringify({ token }) });
+    state.sessionSeq++;
+    invalidateHistoryRequest();
+    stopEventStream("stopped");
+    stopTicker();
+    stopLogPoller();
     state.token = token;
     sessionStorage.setItem("ccpm_token", token);
-    await refresh();
+    if (!await refresh()) throw new Error("登录后无法读取管理数据");
     startTicker();
     startEventStream();
     render();
   } catch (e) {
-    document.getElementById("login-msg").innerHTML = '<div class="alert err">' + esc(e.message) + "</div>";
+    const msg = document.getElementById("login-msg");
+    if (msg) msg.innerHTML = '<div class="alert err">' + esc(e.message) + "</div>";
   }
 }
 
@@ -432,6 +461,8 @@ function renderHistory() {
   html += '<div class="alert info mb">本页是<b>本网关自身的代理日志</b>（经本 manager 转发的每一次请求：时间/Key/模型/状态/token/延迟/重试），' +
     "不是 commandcode.ai 官网 settings/usage 的账号级账单明细——上游 API 不向第三方暴露逐条调用记录（仅汇总统计，已在本账期卡片展示）。" +
     "未走本网关的 CLI 直连调用不会出现在这里。</div>";
+  if (state.historyLoading) html += '<div class="alert info mb" role="status">正在加载历史记录…</div>';
+  if (state.historyError) html += '<div class="alert err mb" role="alert">历史记录加载失败：' + esc(state.historyError) + "</div>";
   html += '<div class="card mb"><div class="filters">' +
     '<div><label>Key</label><select id="h-key">' + '<option value="">全部</option>' + state.keys.map((k) => '<option value="' + esc(k.id) + '">' + esc(k.alias || k.maskedKey) + "</option>").join("") + "</select></div>" +
     '<div><label>状态</label><select id="h-status"><option value="">全部</option><option>200</option><option>401</option><option>429</option><option>502</option></select></div>' +
@@ -467,11 +498,11 @@ function renderHistory() {
   document.getElementById("h-search").addEventListener("click", () => {
     state.filters = readFilters();
     state.page = 1;
-    loadHistory();
+    void loadHistory();
   });
   document.getElementById("h-csv").addEventListener("click", exportCsv);
-  document.getElementById("h-prev").addEventListener("click", () => { if (state.page > 1) { state.page--; loadHistory(); } });
-  document.getElementById("h-next").addEventListener("click", () => { if (state.page * 50 < state.history.total) { state.page++; loadHistory(); } });
+  document.getElementById("h-prev").addEventListener("click", () => { if (state.page > 1) { state.page--; void loadHistory(); } });
+  document.getElementById("h-next").addEventListener("click", () => { if (state.page * 50 < state.history.total) { state.page++; void loadHistory(); } });
   document.getElementById("h-key").value = state.filters.keyId || "";
   document.getElementById("h-status").value = state.filters.status || "";
   document.getElementById("h-err").value = state.filters.errorKind || "";
@@ -495,8 +526,47 @@ function toTs(dtLocal) {
   return Number.isFinite(d.getTime()) ? String(d.getTime()) : "";
 }
 
+let historyRequestSeq = 0;
+let historyController = null;
+function historyFilterKey(filters) {
+  return [filters.keyId, filters.status, filters.errorKind, filters.from, filters.to].map((v) => String(v || "")).join("\u001f");
+}
+function invalidateHistoryRequest() {
+  historyRequestSeq++;
+  if (historyController) {
+    try { historyController.abort(); } catch {}
+    historyController = null;
+  }
+  state.historyLoading = false;
+  state.historyError = "";
+}
+function isCurrentHistoryRequest(request) {
+  return request.seq === historyRequestSeq && request.sessionSeq === state.sessionSeq &&
+    state.view === "history" && state.routeHash === request.routeHash &&
+    (location.hash || "#/dashboard") === request.routeHash && state.page === request.page &&
+    historyFilterKey(state.filters) === request.filtersKey;
+}
+
 async function loadHistory() {
-  const f = state.filters;
+  if (historyController) {
+    try { historyController.abort(); } catch {}
+    historyController = null;
+  }
+  const controller = new AbortController();
+  historyController = controller;
+  const request = {
+    seq: ++historyRequestSeq,
+    sessionSeq: state.sessionSeq,
+    routeHash: state.routeHash,
+    page: state.page,
+    filters: { ...state.filters }
+  };
+  request.filtersKey = historyFilterKey(request.filters);
+  state.historyLoading = true;
+  state.historyError = "";
+  if (state.view === "history") renderHistory();
+
+  const f = request.filters;
   const params = new URLSearchParams();
   if (f.keyId) params.set("keyId", f.keyId);
   if (f.status) params.set("status", f.status);
@@ -504,11 +574,28 @@ async function loadHistory() {
   const from = toTs(f.from), to = toTs(f.to);
   if (from) params.set("from", from);
   if (to) params.set("to", to);
-  params.set("page", String(state.page));
+  params.set("page", String(request.page));
   params.set("pageSize", "50");
-  const data = await api("/admin/api/history?" + params.toString());
-  state.history = data;
-  if (state.view === "history") renderHistory();
+  try {
+    const data = await api("/admin/api/history?" + params.toString(), { signal: controller.signal });
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("历史响应无效");
+    if (!isCurrentHistoryRequest(request)) return false;
+    state.history = data;
+    state.historyLoading = false;
+    state.historyError = "";
+    renderHistory();
+    return true;
+  } catch (e) {
+    if (!isCurrentHistoryRequest(request)) return false;
+    state.historyLoading = false;
+    if (!e || (e.name !== "AbortError" && e.code !== "ABORT_ERR")) {
+      state.historyError = e && e.message ? e.message : "请求失败";
+      renderHistory();
+    }
+    return false;
+  } finally {
+    if (historyController === controller) historyController = null;
+  }
 }
 
 async function exportCsv() {
@@ -663,6 +750,7 @@ function renderLogs() {
   let filtered = src ? state.logs.filter((l) => (l.src || "manager") === src) : state.logs;
   filtered = sel ? filtered.filter((l) => l.msg.includes(sel)) : filtered;
   app.innerHTML = "<h2>日志</h2>" +
+    (state.logError ? '<div class="alert err mb" role="alert">日志加载失败：' + esc(state.logError) + "</div>" : "") +
     '<div class="card mb"><div class="row">' +
     '<div><label>来源</label><select id="log-src-filter"><option value="">全部</option>' +
     '<option value="manager"' + (src === "manager" ? " selected" : "") + ">管理网关</option>" +
@@ -702,13 +790,41 @@ function pushLogs(incoming) {
   if (state.logs.length) state.lastLogTs = state.logs[state.logs.length - 1].ts;
 }
 
+let logRequestSeq = 0;
+let logController = null;
 async function loadLogs() {
-  const data = await api("/admin/api/logs?since=" + (state.lastLogTs ? state.lastLogTs - 2000 : 0));
-  pushLogs(data.logs);
-  if (state.view === "logs") {
+  if (logController) {
+    try { logController.abort(); } catch {}
+    logController = null;
+  }
+  const controller = new AbortController();
+  logController = controller;
+  const request = {
+    seq: ++logRequestSeq,
+    sessionSeq: state.sessionSeq,
+    routeHash: state.routeHash,
+    lastLogTs: state.lastLogTs
+  };
+  try {
+    const data = await api("/admin/api/logs?since=" + (request.lastLogTs ? request.lastLogTs - 2000 : 0), { signal: controller.signal });
+    if (request.seq !== logRequestSeq || request.sessionSeq !== state.sessionSeq || state.view !== "logs" ||
+      state.routeHash !== request.routeHash || (location.hash || "#/dashboard") !== request.routeHash) return false;
+    pushLogs(Array.isArray(data && data.logs) ? data.logs : []);
+    state.logError = "";
     renderLogs();
     const el = document.getElementById("log-list");
     if (el) el.scrollTop = el.scrollHeight;
+    return true;
+  } catch (e) {
+    const current = request.seq === logRequestSeq && request.sessionSeq === state.sessionSeq && state.view === "logs" &&
+      state.routeHash === request.routeHash && (location.hash || "#/dashboard") === request.routeHash;
+    if (current && (!e || (e.name !== "AbortError" && e.code !== "ABORT_ERR"))) {
+      state.logError = e && e.message ? e.message : "请求失败";
+      renderLogs();
+    }
+    return false;
+  } finally {
+    if (logController === controller) logController = null;
   }
 }
 
@@ -739,114 +855,342 @@ document.addEventListener("toggle", (e) => {
   if (el.open) usageOpen[id] = true; else delete usageOpen[id];
 }, true);
 
-// ── 启动 ──
-window.addEventListener("hashchange", () => {
-  state.view = location.hash.slice(2) || "dashboard";
-  if (state.view === "history") loadHistory().catch(() => {});
-  if (state.view === "logs") { loadLogs().catch(() => {}); startLogPoller(); }
-  else stopLogPoller();
+// ── 路由与会话生命周期 ──
+function applyRoute() {
+  const routeHash = location.hash || "#/dashboard";
+  const nextView = viewFromHash(routeHash);
+  if (state.routeHash === routeHash && state.view === nextView) return;
+  state.routeHash = routeHash;
+  state.view = nextView;
+  invalidateHistoryRequest();
+  if (state.view === "logs") startLogPoller(); else stopLogPoller();
   render();
-});
+  if (state.view === "history") void loadHistory();
+  else if (state.view === "logs") void loadLogs();
+}
 
-document.getElementById("btn-logout").addEventListener("click", async () => {
-  try { await fetch("/admin/api/logout", { method: "POST" }); } catch {} // 撤销 HttpOnly SSE cookie
+function resetSession(reload) {
+  state.sessionSeq++;
   state.token = "";
   sessionStorage.removeItem("ccpm_token");
-  location.reload();
-});
+  invalidateHistoryRequest();
+  stopEventStream("stopped");
+  stopTicker();
+  stopLogPoller();
+  state.logError = "";
+  if (reload) location.reload();
+}
 
-document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
-
-state.logTimer = null;
+// ── 日志轮询 ──
 function startLogPoller() {
-  if (state.logTimer) clearInterval(state.logTimer);
-  state.logTimer = setInterval(() => { if (state.view === "logs") loadLogs().catch(() => {}); }, 3000);
+  if (!state.token || document.hidden || state.logTimer) return;
+  state.logTimer = setInterval(() => {
+    if (state.view === "logs" && !document.hidden) void loadLogs();
+  }, 3000);
   if (state.logTimer.unref) state.logTimer.unref?.();
 }
 function stopLogPoller() {
-  if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
+  if (state.logTimer) clearInterval(state.logTimer);
+  state.logTimer = null;
+  logRequestSeq++;
+  if (logController) {
+    try { logController.abort(); } catch {}
+    logController = null;
+  }
 }
 
 // ── SSE 实时事件（DESIGN §6：quota/health/usage/切换事件推送）──
 // 鉴权走登录时下发的 HttpOnly 专用 cookie（同源请求自动携带，URL 不含令牌）。
-// 10s tick 与日志轮询保留为断线兜底。
+// EventSource 的原生 error 事件不携带 HTTP 状态，因此错误时用受保护的管理 API
+// 做一次有界鉴权探测：401 永久停机，其余情况进入有上限的指数退避。
+const SSE_RETRY_BASE_MS = 1000;
+const SSE_RETRY_MAX_MS = 30000;
+const SSE_AUTH_PROBE_TIMEOUT_MS = 3000;
 let eventSource = null;
+let sseGeneration = 0;
+let sseRetryTimer = null;
+let sseAuthProbeTimer = null;
+let sseAuthProbeController = null;
+let sseAuthProbePromise = null;
 let statsDebounce = null;
 let quotaRenderTimer = null;
 // quota-status 合法 phase（后端 quota.mjs emitStatus 实际发出值）：
 // probeKey 发 updating→done/error，testKey 发 testing→idle。
-// updating/testing 置徽标；done/error/idle 清除；白名单外值一律忽略
-// （伪造 phase 既不 set 也不 clear，防伪造值清掉真实 busy）。
 const BUSY_SET_PHASES = new Set(["updating", "testing"]);
 const BUSY_CLEAR_PHASES = new Set(["done", "error", "idle"]);
-function startEventStream() {
-  if (eventSource) { try { eventSource.close(); } catch {} }
-  try {
-    eventSource = new EventSource("/admin/api/events");
-  } catch { return; }
-  // cookie 缺失/过期（如服务端换过令牌）时持续 401：关掉重试，轮询通道兜底
-  let sseErrors = 0;
-  eventSource.onerror = () => {
-    if (++sseErrors >= 3) { try { eventSource.close(); } catch {} eventSource = null; }
+
+function sseStatusLabel() {
+  const s = state.sse;
+  if (s.status === "connecting") return "实时连接中";
+  if (s.status === "connected") return "实时已连接";
+  if (s.status === "reconnecting") return "实时重连中（第 " + s.retryAttempt + " 次）";
+  if (s.status === "auth-failed") return "实时连接已停止：鉴权失败";
+  if (s.status === "paused") return "实时连接已暂停（页面隐藏）";
+  if (s.status === "stopped") return "实时连接已停止";
+  return "实时连接未启动";
+}
+function updateSseIndicator() {
+  const statusEl = document.getElementById("sse-status");
+  if (statusEl) {
+    statusEl.textContent = sseStatusLabel();
+    statusEl.className = "sse-status sse-" + state.sse.status;
+    statusEl.title = state.sse.message || "";
+  }
+  const retryBtn = document.getElementById("btn-sse-reconnect");
+  if (retryBtn) {
+    retryBtn.hidden = state.sse.status !== "auth-failed" && state.sse.status !== "stopped";
+    retryBtn.disabled = !state.token;
+  }
+}
+function setSseStatus(status, message) {
+  state.sse.status = status;
+  state.sse.message = message || "";
+  updateSseIndicator();
+}
+function isActiveSseGeneration(generation) {
+  return generation === sseGeneration && !!state.token && !document.hidden;
+}
+function isActiveSseSource(source, generation) {
+  return isActiveSseGeneration(generation) && eventSource === source;
+}
+function clearSseUiTimers() {
+  if (statsDebounce) clearTimeout(statsDebounce);
+  statsDebounce = null;
+  if (quotaRenderTimer) clearTimeout(quotaRenderTimer);
+  quotaRenderTimer = null;
+}
+function teardownEventStream() {
+  sseGeneration++;
+  if (sseRetryTimer) clearTimeout(sseRetryTimer);
+  sseRetryTimer = null;
+  if (sseAuthProbeTimer) clearTimeout(sseAuthProbeTimer);
+  sseAuthProbeTimer = null;
+  if (sseAuthProbeController) {
+    try { sseAuthProbeController.abort(); } catch {}
+  }
+  sseAuthProbeController = null;
+  sseAuthProbePromise = null;
+  clearSseUiTimers();
+  const source = eventSource;
+  eventSource = null;
+  if (source) {
+    try { source.close(); } catch {}
+  }
+}
+function stopEventStream(reason) {
+  teardownEventStream();
+  state.sse.retryAttempt = 0;
+  if (reason === "hidden") setSseStatus("paused");
+  else if (reason === "auth") setSseStatus("auth-failed", "服务器返回 401，需重新连接或重新登录");
+  else setSseStatus(state.token ? "stopped" : "idle");
+}
+function pauseEventStream() {
+  const authFailed = state.sse.status === "auth-failed";
+  teardownEventStream();
+  if (!authFailed) {
+    state.sse.retryAttempt = 0;
+    setSseStatus("paused");
+  }
+}
+function markSseAuthFailure(generation) {
+  if (!isActiveSseGeneration(generation)) return;
+  if (sseRetryTimer) clearTimeout(sseRetryTimer);
+  sseRetryTimer = null;
+  state.sse.retryAttempt = 0;
+  sseGeneration++;
+  setSseStatus("auth-failed", "服务器返回 401，需重新连接或重新登录");
+}
+function scheduleSseRetry(generation, message) {
+  if (!isActiveSseGeneration(generation)) return;
+  if (sseRetryTimer) return;
+  if (document.hidden) {
+    setSseStatus("paused");
+    return;
+  }
+  state.sse.retryAttempt = Math.min(state.sse.retryAttempt + 1, 31);
+  const exponent = Math.min(state.sse.retryAttempt - 1, 10);
+  const delay = Math.min(SSE_RETRY_BASE_MS * (2 ** exponent), SSE_RETRY_MAX_MS);
+  setSseStatus("reconnecting", message || "网络暂时不可用");
+  const timer = setTimeout(() => {
+    if (sseRetryTimer === timer) sseRetryTimer = null;
+    if (!isActiveSseGeneration(generation)) return;
+    startEventStream();
+  }, delay);
+  sseRetryTimer = timer;
+}
+function probeSseAuth(generation, event) {
+  if (!isActiveSseGeneration(generation)) return;
+  if (Number(event && event.status) === 401) {
+    markSseAuthFailure(generation);
+    return;
+  }
+  if (sseAuthProbePromise) return;
+  const token = state.token;
+  const controller = new AbortController();
+  const probeTimer = setTimeout(() => controller.abort(), SSE_AUTH_PROBE_TIMEOUT_MS);
+  sseAuthProbeController = controller;
+  sseAuthProbeTimer = probeTimer;
+  const probe = (async () => {
+    try {
+      const res = await fetch("/admin/api/pool", {
+        method: "GET",
+        headers: { "Content-Type": "application/json", "X-Admin-Token": token },
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: controller.signal
+      });
+      return res.status === 401 ? "auth" : "network";
+    } catch {
+      return "network";
+    } finally {
+      clearTimeout(probeTimer);
+      if (sseAuthProbeTimer === probeTimer) sseAuthProbeTimer = null;
+      if (sseAuthProbeController === controller) sseAuthProbeController = null;
+    }
+  })();
+  sseAuthProbePromise = probe;
+  probe.then((kind) => {
+    if (sseAuthProbePromise === probe) sseAuthProbePromise = null;
+    if (!isActiveSseGeneration(generation)) return;
+    if (kind === "auth") markSseAuthFailure(generation);
+    else scheduleSseRetry(generation);
+  }, () => {
+    if (sseAuthProbePromise === probe) sseAuthProbePromise = null;
+    if (isActiveSseGeneration(generation)) scheduleSseRetry(generation);
+  });
+}
+function attachEventSourceHandlers(source, generation) {
+  source.onerror = (event) => {
+    if (!isActiveSseSource(source, generation)) return;
+    // Clear the reference before close: implementations are allowed to emit a
+    // synchronous error during close, which must not start a second retry path.
+    eventSource = null;
+    try { source.close(); } catch {}
+    probeSseAuth(generation, event);
   };
-  eventSource.onopen = () => { sseErrors = 0; };
-  eventSource.addEventListener("log", (e) => {
+  source.onopen = () => {
+    if (!isActiveSseSource(source, generation)) return;
+    state.sse.retryAttempt = 0;
+    setSseStatus("connected");
+  };
+  source.addEventListener("log", (e) => {
+    if (!isActiveSseSource(source, generation)) return;
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
     if (!d) return;
-    pushLogs([d]); // 与轮询共用去重合并（防双通道竞态产生重复两条）
+    pushLogs([d]);
     if (state.view === "logs") {
       renderLogs();
       const el = document.getElementById("log-list");
       if (el) el.scrollTop = el.scrollHeight;
     }
   });
-  eventSource.addEventListener("quota", (e) => {
+  source.addEventListener("quota", (e) => {
+    if (!isActiveSseSource(source, generation)) return;
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
+    if (!d || typeof d.keyId !== "string") return;
     const k = state.keys.find((x) => x.id === d.keyId);
     if (k) k.quota = d.report;
-    if (state.view === "dashboard" || state.view === "keys") {
-      if (!quotaRenderTimer) quotaRenderTimer = setTimeout(() => { quotaRenderTimer = null; render(); }, 500);
+    if ((state.view === "dashboard" || state.view === "keys") && !quotaRenderTimer) {
+      quotaRenderTimer = setTimeout(() => {
+        quotaRenderTimer = null;
+        if (isActiveSseSource(source, generation)) render();
+      }, 500);
     }
   });
-  eventSource.addEventListener("stats", () => {
-    if (state.view !== "history") return;
+  source.addEventListener("stats", () => {
+    if (!isActiveSseSource(source, generation) || state.view !== "history") return;
     clearTimeout(statsDebounce);
-    statsDebounce = setTimeout(() => loadHistory().catch(() => {}), 2000);
+    statsDebounce = setTimeout(() => {
+      statsDebounce = null;
+      if (isActiveSseSource(source, generation) && state.view === "history") void loadHistory();
+    }, 2000);
   });
-  // 后端探测串行队列的即时状态（M2 加固）：keyId 必须真实存在、phase 必须在
-  // 后端合法枚举内，否则忽略——伪造/错序事件不得置/清任意 Key 的 busy。
-  // setBusy/clearBusy 立即生效（徽标即时），render 与 quota handler 共用一个
-  // 500ms 防抖（quotaRenderTimer），quota/quota-status 交错时合并渲染。
-  eventSource.addEventListener("quota-status", (e) => {
+  source.addEventListener("quota-status", (e) => {
+    if (!isActiveSseSource(source, generation)) return;
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
     if (!d || typeof d.keyId !== "string" || !state.keys.some((k) => k.id === d.keyId)) return;
     if (BUSY_SET_PHASES.has(d.phase)) setBusy(d.keyId, d.phase);
     else if (BUSY_CLEAR_PHASES.has(d.phase)) clearBusy(d.keyId);
-    else return; // 白名单外 phase：不 set 也不 clear
-    if (state.view === "dashboard" || state.view === "keys") {
-      if (!quotaRenderTimer) quotaRenderTimer = setTimeout(() => { quotaRenderTimer = null; render(); }, 500);
+    else return;
+    if ((state.view === "dashboard" || state.view === "keys") && !quotaRenderTimer) {
+      quotaRenderTimer = setTimeout(() => {
+        quotaRenderTimer = null;
+        if (isActiveSseSource(source, generation)) render();
+      }, 500);
     }
   });
 }
-function stopEventStream() {
-  if (eventSource) { try { eventSource.close(); } catch {} eventSource = null; }
+function startEventStream(force) {
+  if (force) stopEventStream("stopped");
+  if (!state.token) { setSseStatus("idle"); return; }
+  if (document.hidden) { if (state.sse.status !== "auth-failed") setSseStatus("paused"); return; }
+  if (eventSource || sseRetryTimer || sseAuthProbePromise) return;
+  const generation = ++sseGeneration;
+  setSseStatus("connecting");
+  let source;
+  try {
+    source = new EventSource("/admin/api/events");
+  } catch {
+    scheduleSseRetry(generation, "无法建立实时连接");
+    return;
+  }
+  eventSource = source;
+  attachEventSourceHandlers(source, generation);
 }
+function restartEventStream() {
+  if (!state.token) return;
+  stopEventStream("stopped");
+  startEventStream();
+}
+function handleVisibilityChange() {
+  if (document.hidden) {
+    stopTicker();
+    stopLogPoller();
+    if (state.token) pauseEventStream();
+    return;
+  }
+  if (!state.token) return;
+  startTicker();
+  if (state.view === "logs") startLogPoller();
+  if (state.sse.status !== "auth-failed") startEventStream();
+}
+
+window.addEventListener("hashchange", applyRoute);
+document.addEventListener("visibilitychange", handleVisibilityChange);
+const logoutButton = document.getElementById("btn-logout");
+if (logoutButton) logoutButton.addEventListener("click", async () => {
+  resetSession(false);
+  try { await fetch("/admin/api/logout", { method: "POST" }); } catch {} // 撤销 HttpOnly SSE cookie
+  location.reload();
+});
+const reconnectButton = document.getElementById("btn-sse-reconnect");
+if (reconnectButton) reconnectButton.addEventListener("click", restartEventStream);
+document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 
 if (!state.token) {
   showLogin();
 } else {
   (async () => {
+    const sessionSeq = state.sessionSeq;
+    const token = state.token;
     const ok = await refresh();
-    if (!ok) { showLogin(); return; }
-    startTicker();
-    startEventStream();
-    startLogPoller();
-    if (state.view === "history") loadHistory().catch(() => {});
-    // 直接刷新进日志页时立即拉一次，否则要等 3s 轮询首跳才见内容
-    if (state.view === "logs") loadLogs().catch(() => {});
+    if (!ok || sessionSeq !== state.sessionSeq || token !== state.token) {
+      if (!state.token) showLogin();
+      return;
+    }
     render();
+    if (!document.hidden) {
+      startTicker();
+      startEventStream();
+      if (state.view === "logs") startLogPoller();
+    } else {
+      setSseStatus("paused");
+    }
+    if (state.view === "history") void loadHistory();
+    // 直接刷新进日志页时立即拉一次，否则要等 3s 轮询首跳才见内容
+    if (state.view === "logs") void loadLogs();
   })();
 }

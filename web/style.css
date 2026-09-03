@@ -14,6 +14,10 @@ nav { display: flex; gap: 6px; flex: 1; }
 nav button { background: transparent; border: 1px solid transparent; color: var(--dim); padding: 6px 12px; border-radius: 8px; cursor: pointer; }
 nav button.active, nav button:hover { color: var(--text); background: var(--panel2); border-color: var(--border); }
 .top-right { display: flex; gap: 10px; align-items: center; color: var(--dim); font-size: 12px; }
+.sse-status { white-space: nowrap; }
+.sse-connected { color: var(--ok); }
+.sse-reconnecting, .sse-connecting, .sse-paused { color: var(--warn); }
+.sse-auth-failed, .sse-stopped { color: var(--bad); }
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 footer { text-align: center; color: var(--dim); font-size: 12px; padding: 20px; }
 button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 7px 14px; cursor: pointer; font-size: 13px; }

@@ -338,7 +338,11 @@ async function restartClean() {
   const p = resolve(DATA, "state.json");
   if (existsSync(p)) {
     const st = JSON.parse(readFileSync(p, "utf-8"));
-    for (const h of Object.values(st.keys || {})) { h.backoffUntilMs = 0; h.failCount = 0; h.quotaLimitedUntil = 0; h.authError = false; }
+    for (const h of Object.values(st.keys || {})) {
+      h.backoffUntilMs = 0; h.failCount = 0; h.lastErrorKind = "";
+      h.quotaLimitedUntil = 0; h.authError = false;
+      h.failoverCount = 0; h.lastFailoverAt = 0;
+    }
     writeFileSync(p, JSON.stringify(st));
   }
   await startMgr();
@@ -497,6 +501,55 @@ async function main() {
   r = await admin("/admin/api/history?errorKind=rate_limit");
   JSON.parse(r.body).total === 0 ? ok("重试成功不留 rate_limit 失败事件") : bad("重试事件", r.body.slice(0, 150));
 
+  // ── T3b 并发健康回写：A 慢生成期间 B 同 Key 429，A 的旧成功不得清掉 B 的退避 ──
+  console.log("\n=== T3b concurrent health generation ===");
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [
+    { mode: "delay", delayMs: 700 },
+    { mode: "rate_limit", retryAfter: 30 }
+  ] });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "ok" }] });
+  const concurrentStart = performance.now();
+  const requestA = gw({ model: "m-concurrent-a", messages: [] });
+  await sleep(60);
+  const requestB = gw({ model: "m-concurrent-b", messages: [] });
+  const resultB = await requestB;
+  const finishedB = performance.now();
+  const resultA = await requestA;
+  const finishedA = performance.now();
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  const concurrentKeyA = (await keysList()).find((k) => k.alias === "keyA");
+  resultA.status === 200 && resultB.status === 200 && finishedB < finishedA && finishedA - concurrentStart >= 600
+    ? ok("真实延迟交错：B 先完成，A 仍在生成后成功")
+    : bad("真实延迟交错", JSON.stringify({ a: resultA.status, b: resultB.status, elapsedA: Math.round(finishedA - concurrentStart), elapsedB: Math.round(finishedB - concurrentStart) }));
+  calls.length === 3 && calls[0].model === "m-concurrent-a" && calls[0].mode === "delay" &&
+    calls[1].model === "m-concurrent-b" && calls[1].mode === "rate_limit" && calls[2].auth === "user_keyB"
+    ? ok("并发 B 与 A 复用 keyA 后按退避切换 keyB")
+    : bad("并发调用序列", JSON.stringify(calls));
+  concurrentKeyA && concurrentKeyA.health.failCount === 1 && concurrentKeyA.health.backoffUntilMs > Date.now() && concurrentKeyA.health.lastErrorKind === "rate_limit"
+    ? ok("A 旧成功未清除 B 的 failCount/backoff/errorKind", JSON.stringify(concurrentKeyA.health))
+    : bad("并发健康状态被旧成功覆盖", JSON.stringify(concurrentKeyA && concurrentKeyA.health));
+  await sleep(1100);
+  const concurrentDisk = JSON.parse(readFileSync(resolve(DATA, "state.json"), "utf-8"));
+  const concurrentDiskHealth = concurrentDisk.keys[concurrentKeyA.id] || {};
+  concurrentDiskHealth.failCount === 1 && concurrentDiskHealth.lastErrorKind === "rate_limit" && concurrentDiskHealth.backoffUntilMs > Date.now()
+    ? ok("并发最新退避也已 durable 落盘")
+    : bad("并发退避落盘", JSON.stringify(concurrentDiskHealth));
+
+  // auth-only pool 只表示需要人工修复，不应让客户端等待 markAuthError 的一小时标记。
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "auth" }] });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "auth" }] });
+  const authA = await gw({ model: "m-auth-only-a", messages: [] });
+  const authB = await gw({ model: "m-auth-only-b", messages: [] });
+  r = await gw({ model: "m-auth-only-c", messages: [] });
+  const authOnlyBody = JSON.parse(r.body);
+  authA.status === 401 && authB.status === 401 && r.status === 429 && r.headers["retry-after"] === "0" && authOnlyBody.retry_after === 0
+    ? ok("auth-only pool Retry-After=0，不伪装一小时人工等待")
+    : bad("auth-only Retry-After", JSON.stringify({ a: authA.status, b: authB.status, c: r.status, header: r.headers["retry-after"], body: authOnlyBody }));
+  // auth-only 是负向场景；正向断言完成后恢复 Key 健康状态，避免污染后续 T4。
+  await restartClean();
+
   // ── T4 持续限流 RA=30 → 不等待、退避、切换、最终 429 ──
   console.log("\n=== T4 failover on sustained 429 ===");
   await mock("/__reset");
@@ -558,7 +611,7 @@ async function main() {
   {
     const stPath = resolve(DATA, "state.json");
     const st = JSON.parse(readFileSync(stPath, "utf-8"));
-    for (const h of Object.values(st.keys || {})) { h.backoffUntilMs = 0; h.failCount = 0; h.quotaLimitedUntil = 0; h.authError = false; }
+    for (const h of Object.values(st.keys || {})) { h.backoffUntilMs = 0; h.failCount = 0; h.lastErrorKind = ""; h.quotaLimitedUntil = 0; h.authError = false; }
     writeFileSync(stPath, JSON.stringify(st));
   }
   await startMgr();

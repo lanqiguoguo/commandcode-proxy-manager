@@ -284,6 +284,10 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function retryAfterSeconds(ms) {
+  return ms > 0 ? Math.ceil(ms / 1000) : 0;
+}
+
 export async function handleGateway(req, res, url) {
   const cfg = getConfig();
   // 决策 1：/v1/* 一律要求 token —— clientToken 未配置时回退 AdminToken
@@ -346,7 +350,7 @@ export async function handleGateway(req, res, url) {
     const chosen = pool.selectKey(triedKeys);
     if (!chosen) {
       if (attempts === 0) {
-        const wait = Math.max(1, Math.ceil(pool.nextRetryAfterMs() / 1000));
+        const wait = retryAfterSeconds(pool.nextRetryAfterMs());
         sendJson(res, 429, {
           error: { message: "No usable API key in pool (all backed off / quota limited)", type: "rate_limit_error" },
           retry_after: wait
@@ -366,6 +370,8 @@ export async function handleGateway(req, res, url) {
     let sameKeyTries = 0;
     let retriedOnce5xx = false;
     while (true) {
+      const attempt = pool.beginAttempt(chosen.id);
+      if (!attempt) break;
       attempts++;
       const ac = new AbortController();
       activeAc = ac;
@@ -453,7 +459,7 @@ export async function handleGateway(req, res, url) {
           try { res.destroy(); } catch {}
           return;
         }
-        pool.recordSuccess(chosen.id);
+        pool.recordSuccess(chosen.id, attempt);
         stats.appendEvent({
           keyId: chosen.id, model, stream: isStream, ok: true, status: 200,
           inputTokens: usage ? usage.inputTokens : undefined,
@@ -556,10 +562,12 @@ export async function handleGateway(req, res, url) {
   }
 
   if (clientGone || res.writableEnded || res.destroyed) return;
-  const wait = Math.max(1, Math.ceil((pool.nextRetryAfterMs() || 5000) / 1000));
+  const wait = retryAfterSeconds(pool.nextRetryAfterMs());
   // 最终状态码如实反映失败类型：上游 5xx/网络错误 → 502（客户端 SDK 不应按限流退避），
   // 限流/池不可用 → 429（P2-2）
   const finalStatus = lastStatus >= 500 ? 502 : 429;
-  const finalBody = lastBody || { error: { message: "All API keys unavailable", type: "rate_limit_error" }, retry_after: wait };
+  const finalBody = lastBody
+    ? (finalStatus === 429 ? { ...lastBody, retry_after: wait } : lastBody)
+    : { error: { message: "All API keys unavailable", type: "rate_limit_error" }, retry_after: wait };
   sendJson(res, finalStatus, finalBody, { "Retry-After": String(wait) });
 }

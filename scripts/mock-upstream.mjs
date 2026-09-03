@@ -71,7 +71,7 @@ const server = http.createServer((req, res) => {
     }
     const q = scripts.get(auth);
     const spec = (q && q.length) ? q.shift() : { mode: parsed.testMode || "ok", retryAfter: parsed.retryAfter };
-    calls.push({ t: Date.now(), auth, path: p, mode: spec.mode });
+    calls.push({ t: Date.now(), auth, path: p, mode: spec.mode, model: typeof parsed.model === "string" ? parsed.model : "" });
     console.log(`[mock] ${p} auth=${auth.slice(0, 12)} mode=${spec.mode} call#${calls.length}`);
 
     if (spec.mode === "hang") return; // 永不响应

@@ -4,6 +4,7 @@ import { readJson, writeJson, debouncedWriter } from "./state.mjs";
 
 let keys = [];        // 数组顺序即主备优先级（index 0 = 主 Key）
 let health = new Map();
+let healthVersion = new Map(); // 每次健康状态变更递增，供网关条件成功回写
 let poolCfg = {};
 let persistState = null;
 let usageProvider = null;   // (keyId) => 近 5h token 数（least-usage 策略用）
@@ -13,6 +14,8 @@ let emitter = null;
 export function initKeyPool(cfgPool, opts = {}) {
   poolCfg = { ...cfgPool };
   emitter = opts.emitter || null;
+  health.clear();
+  healthVersion.clear();
   const data = readJson("keys.json", null) || { keys: [] };
   keys = Array.isArray(data.keys) ? data.keys : [];
   keys.forEach((k) => {
@@ -27,6 +30,7 @@ export function initKeyPool(cfgPool, opts = {}) {
     health.set(k.id, {
       backoffUntilMs: Number(h.backoffUntilMs) || 0,
       failCount: Number(h.failCount) || 0,
+      lastErrorKind: typeof h.lastErrorKind === "string" ? h.lastErrorKind : "",
       authError: !!h.authError,
       quotaLimitedUntil: Number(h.quotaLimitedUntil) || 0,
       quotaLimitedReason: h.quotaLimitedReason || "",
@@ -35,6 +39,7 @@ export function initKeyPool(cfgPool, opts = {}) {
       lastFailoverAt: Number(h.lastFailoverAt) || 0,
       lastUsedAt: Number(h.lastUsedAt) || 0
     });
+    healthVersion.set(k.id, 0);
   });
   persistState = debouncedWriter("state.json", () => ({
     keys: Object.fromEntries([...health.entries()].map(([id, h]) => [id, { ...h }]))
@@ -52,17 +57,29 @@ function persistKeys() { return writeJson("keys.json", { keys }); }
 
 function snapshotKeys() { return keys.map((k) => ({ ...k })); }
 
+function currentHealthVersion(id) { return healthVersion.get(id) || 0; }
+
+function bumpHealthVersion(id) {
+  const next = currentHealthVersion(id) + 1;
+  healthVersion.set(id, next);
+  return next;
+}
+
 function commitHealthChange(id, mutate) {
   const h = health.get(id);
   if (!h) return { durable: true, changed: false };
   const before = { ...h };
+  const versionBefore = currentHealthVersion(id);
   mutate(h);
+  const changed = JSON.stringify(before) !== JSON.stringify(h);
+  if (changed) bumpHealthVersion(id);
   try {
     const result = persistState.flush({ force: true });
     if (!result || result.durable !== true) throw new Error("健康状态未完成 durable flush");
-    return { durable: true, changed: JSON.stringify(before) !== JSON.stringify(h) };
+    return { durable: true, changed };
   } catch (e) {
     Object.assign(h, before);
+    healthVersion.set(id, versionBefore);
     throw e;
   }
 }
@@ -101,10 +118,11 @@ export function addKey({ alias = "", key = "", note = "" }) {
     throw e;
   }
   health.set(rec.id, {
-    backoffUntilMs: 0, failCount: 0, authError: false,
+    backoffUntilMs: 0, failCount: 0, lastErrorKind: "", authError: false,
     quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false,
     failoverCount: 0, lastFailoverAt: 0, lastUsedAt: 0
   });
+  healthVersion.set(rec.id, 0);
   emitLog("新增 Key: " + maskKey(rec.key));
   return rec;
 }
@@ -171,6 +189,7 @@ export function removeKey(id) {
     health = healthBefore;
     throw e;
   }
+  healthVersion.delete(id);
   if (persistState) persistState();
   emitLog("删除 Key: " + maskKey(rec.key));
 }
@@ -182,6 +201,7 @@ export function recordRateLimit(id, retryAfterMs) {
   const h = health.get(id);
   if (!h) return;
   h.failCount = (h.failCount || 0) + 1;
+  h.lastErrorKind = "rate_limit";
   const base = poolCfg.backoffBaseMs || 5000;
   const cap = poolCfg.backoffMaxMs || 120000;
   const exp = Math.min(cap, base * Math.pow(2, h.failCount - 1));
@@ -189,6 +209,7 @@ export function recordRateLimit(id, retryAfterMs) {
   // 上游异常大值（如 Retry-After: 604800）不排除 Key 数天~数年（H2）
   const wait = retryAfterMs && retryAfterMs > 0 ? Math.min(cap, retryAfterMs) : exp;
   h.backoffUntilMs = nowMs() + wait;
+  bumpHealthVersion(id);
   persistState();
   emitLog("Key " + id + " 限流退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s（第 " + h.failCount + " 次）");
 }
@@ -197,25 +218,46 @@ export function recordTimeout(id) {
   const h = health.get(id);
   if (!h) return;
   h.failCount = (h.failCount || 0) + 1;
+  h.lastErrorKind = "timeout";
   const base = poolCfg.backoffBaseMs || 5000;
   h.backoffUntilMs = nowMs() + Math.min(poolCfg.backoffMaxMs || 120000, base * Math.pow(2, h.failCount - 1));
+  bumpHealthVersion(id);
   persistState();
   emitLog("Key " + id + " 超时退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s");
 }
 
-export function recordSuccess(id) {
+// 每次上游尝试开始前取得 token。成功只允许清理该 token 之后没有被其他路径更新过的状态。
+// 这样并发请求的旧成功不会覆盖后来产生的限流、超时或认证错误。
+export function beginAttempt(id) {
+  if (!health.has(id)) return null;
+  return Object.freeze({ id, version: currentHealthVersion(id) });
+}
+
+export function recordSuccess(id, attempt) {
   const h = health.get(id);
-  if (!h) return;
+  if (!h) return { applied: false, reason: "missing_key" };
+  const current = currentHealthVersion(id);
+  if (!attempt || attempt.id !== id || !Number.isInteger(attempt.version) || attempt.version !== current) {
+    return { applied: false, reason: "health_changed", version: current };
+  }
+  const changed = h.failCount !== 0 || h.backoffUntilMs !== 0 || h.lastErrorKind !== "";
   h.failCount = 0;
   h.backoffUntilMs = 0;
-  persistState();
+  h.lastErrorKind = "";
+  if (changed) {
+    bumpHealthVersion(id);
+    persistState();
+  }
+  return { applied: true, changed };
 }
 
 export function markAuthError(id) {
   const h = health.get(id);
   if (!h) return;
   h.authError = true;
+  h.lastErrorKind = "auth";
   h.backoffUntilMs = nowMs() + 3600 * 1000;
+  bumpHealthVersion(id);
   persistState();
   emitLog("Key " + id + " 认证失败（401/403），已标记异常并停止自动使用");
 }
@@ -225,6 +267,7 @@ export function clearAuthError(id) {
   const result = commitHealthChange(id, (h) => {
     h.authError = false;
     h.backoffUntilMs = 0;
+    h.lastErrorKind = "";
   });
   emitLog("Key " + id + " 认证异常已清除");
   return result;
@@ -239,6 +282,7 @@ export function clearBackoff(id) {
   const result = commitHealthChange(id, (healthState) => {
     healthState.backoffUntilMs = 0;
     healthState.failCount = 0;
+    if (!healthState.authError) healthState.lastErrorKind = "";
   });
   emitLog("Key " + id + " 退避已手动清除");
   return result;
@@ -250,8 +294,15 @@ export function setQuotaLimited(id, untilMs, reason) {
   const now = nowMs();
   const wasLimited = now < h.quotaLimitedUntil;
   const prevReason = h.quotaLimitedReason;
-  h.quotaLimitedUntil = untilMs || 0;
-  h.quotaLimitedReason = reason || "";
+  const nextUntil = untilMs || 0;
+  const nextReason = reason || "";
+  const changed = h.quotaLimitedUntil !== nextUntil || h.quotaLimitedReason !== nextReason;
+  h.quotaLimitedUntil = nextUntil;
+  h.quotaLimitedReason = nextReason;
+  if (changed) {
+    h.lastErrorKind = now < h.quotaLimitedUntil ? "quota" : (h.lastErrorKind === "quota" ? "" : h.lastErrorKind);
+    bumpHealthVersion(id);
+  }
   persistState();
   const isLimited = now < h.quotaLimitedUntil;
   // 探测每周期都会重设限制（credits 自延长场景），仅在状态翻转/原因变化时记日志防刷屏
@@ -267,6 +318,7 @@ export function setSoftLimited(id, val) {
   const next = !!val;
   if (h.softLimited === next) return;
   h.softLimited = next;
+  bumpHealthVersion(id);
   persistState();
   emitLog("Key " + id + (next ? " 额度将尽（软限制），降级为后备" : " 软限制解除"));
 }
@@ -278,6 +330,7 @@ export function recordFailover(id) {
   if (!h) return;
   h.failoverCount = (h.failoverCount || 0) + 1;
   h.lastFailoverAt = nowMs();
+  bumpHealthVersion(id);
   persistState();
   emitLog("Key " + id + " 发生主备切换（累计 " + h.failoverCount + " 次）");
 }
@@ -351,16 +404,19 @@ export function selectKey(excludeIds = null) {
 
 export function nextRetryAfterMs() {
   let min = null;
+  const now = nowMs();
   for (const k of keys) {
     if (k.enabled) {
       const h = health.get(k.id);
-      if (h) {
+      // authError 代表需要人工修复，backoffUntilMs 的一小时标记不是客户端应等待的限流窗口。
+      // 该 Key 当前无论如何都不可用，因此其 quota/backoff 也不应伪装成可恢复时间。
+      if (h && !h.authError) {
         const until = Math.max(h.backoffUntilMs, h.quotaLimitedUntil);
-        if (until > nowMs()) min = min === null ? until : Math.min(min, until);
+        if (until > now) min = min === null ? until : Math.min(min, until);
       }
     }
   }
-  return min ? min - nowMs() : 0;
+  return min ? Math.max(0, min - nowMs()) : 0;
 }
 
 export function getPoolStats() {
@@ -370,7 +426,7 @@ export function getPoolStats() {
     counts.enabled++;
     const h = health.get(k.id);
     if (!h) continue;
-    if (nowMs() < h.backoffUntilMs) counts.backingOff++;
+    if (!h.authError && nowMs() < h.backoffUntilMs) counts.backingOff++;
     if (nowMs() < h.quotaLimitedUntil) counts.quotaLimited++;
     if (h.authError) counts.authError++;
   }

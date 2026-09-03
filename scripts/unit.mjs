@@ -236,7 +236,7 @@ if (SC === "quota") {
 // ════ keyPool ════
 if (SC === "pool") {
   console.log("=== keyPool 选 Key ===");
-  const { initKeyPool, addKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, markAuthError, clearAuthError, recordFailover, nextRetryAfterMs, setPoolCfg, getPoolStats, recordSuccess } =
+  const { initKeyPool, addKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess } =
     await import("../src/keyPool.mjs");
   initKeyPool({ strategy: "active-standby", failoverCooldownMs: 0, backoffBaseMs: 5000, backoffMaxMs: 120000 }, {});
   const k1 = addKey({ alias: "A", key: "user_aaa111" });
@@ -244,18 +244,41 @@ if (SC === "pool") {
   check(selectKey().id === k1.id, "默认选主 Key");
   setQuotaLimited(k1.id, Date.now() + 60000, "fiveHour");
   check(selectKey().id === k2.id, "quota_limited 跳过主→备");
+  const quotaWait = nextRetryAfterMs();
+  check(quotaWait > 55000 && quotaWait <= 60000, "普通 quota window 仍作为 Retry-After 候选", String(quotaWait));
   setQuotaLimited(k1.id, 0, "");
   check(selectKey().id === k1.id, "解除→回主");
   recordRateLimit(k1.id, 30000);
   check(selectKey().id === k2.id, "退避跳过主→备");
+  check(getHealth(k1.id).lastErrorKind === "rate_limit", "429 退避保留 rate_limit 错误类别", JSON.stringify(getHealth(k1.id)));
   const ra = nextRetryAfterMs();
   check(ra > 25000 && ra <= 30000, "nextRetryAfterMs≈剩余退避", String(ra));
   markAuthError(k2.id);
   check(selectKey() === null, "authError+退避 → null 全不可用");
   check(getPoolStats().authError === 1, "poolStats.authError 计数");
-  // 软限制降级（P3-1）
+  check(getHealth(k2.id).lastErrorKind === "auth", "401 认证错误类别独立保留", JSON.stringify(getHealth(k2.id)));
+
+  // 真实异步交错：旧请求 A 在等待上游时，B 对同一 Key 先写入新的 429 状态。
+  // A 的成功 token 过期后必须跳过清理，不能只靠连续同步调用验证。
+  const staleAttempt = beginAttempt(k1.id);
+  const delayedSuccess = new Promise((resolveP) => setTimeout(() => resolveP(recordSuccess(k1.id, staleAttempt)), 25));
+  await new Promise((resolveP) => setTimeout(resolveP, 5));
+  recordRateLimit(k1.id, 60000);
+  const staleResult = await delayedSuccess;
+  const staleHealth = getHealth(k1.id);
+  check(staleResult && staleResult.applied === false && staleResult.reason === "health_changed", "并发旧成功被条件更新拒绝", JSON.stringify(staleResult));
+  check(staleHealth.failCount === 2 && staleHealth.backoffUntilMs > Date.now() && staleHealth.lastErrorKind === "rate_limit",
+    "并发交错保留最新 failCount/backoff/errorKind", JSON.stringify(staleHealth));
+  clearBackoff(k1.id);
+
+  // auth-only 池没有可恢复的自动等待；人工修复的一小时标记不得冒充 Retry-After。
+  markAuthError(k1.id);
+  check(nextRetryAfterMs() === 0, "auth-only pool Retry-After 不返回人工修复的一小时", String(nextRetryAfterMs()));
+  clearAuthError(k1.id);
   clearAuthError(k2.id);
-  recordSuccess(k1.id);
+
+  // 软限制降级（P3-1）
+  recordSuccess(k1.id, beginAttempt(k1.id));
   check(selectKey().id === k1.id, "恢复后选主");
   setSoftLimited(k1.id, true);
   check(selectKey().id === k2.id, "主 Key 软限制 → 降级选备（P3-1）");

@@ -5,13 +5,13 @@
 //   logs 持久化 + 上游 proxy 日志捕获（时序/去重/脱敏/src 过滤）
 //   state 防抖写盘 flush 语义（P2-4：立即落盘/幂等/清 timer/未调度 no-op）
 //   durable 持久化提交/失败回滚语义（F04）
-// 用法：node scripts/unit.mjs [quota|pool|stats|logs|state|durable]   （缺省依次全部跑，每场景独立子进程）
+// 用法：node scripts/unit.mjs [config|quota|pool|stats|logs|state|durable]   （缺省依次全部跑，每场景独立子进程）
 import fs, { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const SC = process.argv[2];
-const SCENARIOS = ["quota", "pool", "stats", "logs", "tokens", "state", "durable"];
+const SCENARIOS = ["config", "quota", "pool", "stats", "logs", "tokens", "state", "durable"];
 
 if (SC && !SCENARIOS.includes(SC)) {
   console.error(`未知 unit 场景：${SC}。可选值：${SCENARIOS.join(", ")}`);
@@ -324,6 +324,99 @@ if (SC === "quota") {
   check(r10.stale === true && typeof r10.error === "string" && r10.error.includes("RATE_UNAVAILABLE"), "stale 报告附带失败原因 error 字段", JSON.stringify(r10).slice(0, 200));
   check(quotaCalls.length === 0, "stale 不触发额度限制", JSON.stringify(quotaCalls));
   check(r10.fiveHour !== null && r10.fiveHour.cap === 14 && r10.fiveHour.percent === 0, "stale 保留上次成功的 fiveHour", JSON.stringify(r10.fiveHour));
+}
+
+// ════ config（F12 配置 schema、环境变量诊断与 token 优先级）════
+if (SC === "config") {
+  console.log("=== config 语义 schema ===");
+  const { loadConfig, getConfig, saveConfig, validateConfig, normalizePoolPatch, ConfigValidationError } = await import("../src/config.mjs");
+  const envNames = ["PORT", "HOST", "UPSTREAM_PORT", "UPSTREAM_HOST", "ADMIN_TOKEN", "CLIENT_TOKEN"];
+  const previousEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
+  const fieldsOf = (fn) => {
+    try { fn(); return []; } catch (e) { return e instanceof ConfigValidationError ? e.fields.map((f) => f.field) : ["unexpected:" + e.message]; }
+  };
+  const expectField = (name, value, expectedField) => {
+    const fields = fieldsOf(() => validateConfig(value, { source: "unit" }));
+    check(fields.includes(expectedField), name + " → 字段级拒绝", JSON.stringify(fields));
+  };
+  const valid = {
+    port: 3080,
+    host: "127.0.0.1",
+    upstreamPort: 3050,
+    upstreamHost: "localhost",
+    pool: { strategy: "active-standby", maxRetries: 3, zeroOutputCountsAs429: true }
+  };
+  check(validateConfig(valid).pool.strategy === "active-standby", "合法配置通过 schema");
+  expectField("port=0", { port: 0 }, "port");
+  expectField("port=Infinity", { port: Infinity }, "port");
+  expectField("port=数组", { port: [] }, "port");
+  expectField("host=对象", { host: {} }, "host");
+  expectField("host=URL", { host: "http://127.0.0.1" }, "host");
+  expectField("upstreamPort=65536", { upstreamPort: 65536 }, "upstreamPort");
+  expectField("pool=null", { pool: null }, "pool");
+  expectField("布尔值字符串", { pool: { zeroOutputCountsAs429: "false" } }, "pool.zeroOutputCountsAs429");
+  expectField("整数小数", { pool: { maxRetries: 1.5 } }, "pool.maxRetries");
+  expectField("整数数字字符串", { pool: { maxRetries: "3" } }, "pool.maxRetries");
+  expectField("整数非法对象", { pool: { quotaRefreshMs: {} } }, "pool.quotaRefreshMs");
+  expectField("非法 strategy", { pool: { strategy: "bogus" } }, "pool.strategy");
+  expectField("softStop 超过 5h", { pool: { softStop: 95, fiveHourHardStop: 90 } }, "pool.softStop");
+  expectField("softStop 超过 weekly", { pool: { softStop: 95, weeklyHardStop: 90 } }, "pool.softStop");
+  expectField("backoff 时间关系", { pool: { backoffBaseMs: 30000, backoffMaxMs: 5000 } }, "pool.backoffMaxMs");
+  expectField("quotaRefreshMs 越界", { pool: { quotaRefreshMs: 4999 } }, "pool.quotaRefreshMs");
+  expectField("顶层数组", [], "$");
+
+  const clamped = normalizePoolPatch({ maxRetries: 999 }, valid.pool);
+  check(clamped.maxRetries === 10, "管理 API 保持 maxRetries 越界 clamp=10", JSON.stringify(clamped));
+  check(fieldsOf(() => normalizePoolPatch({ zeroOutputCountsAs429: "false" }, valid.pool)).includes("pool.zeroOutputCountsAs429"),
+    "管理 API 拒绝字符串布尔值");
+  check(fieldsOf(() => normalizePoolPatch({ maxRetries: [1] }, valid.pool)).includes("pool.maxRetries"),
+    "管理 API 拒绝数组数字");
+  check(fieldsOf(() => normalizePoolPatch({ backoffBaseMs: 30000, backoffMaxMs: 5000 }, valid.pool)).includes("pool.backoffMaxMs"),
+    "管理 API 拒绝 backoff 反向关系");
+  check(fieldsOf(() => normalizePoolPatch({ softStop: 100, fiveHourHardStop: 90 }, valid.pool)).includes("pool.softStop"),
+    "管理 API 拒绝阈值反向关系");
+  check(fieldsOf(() => normalizePoolPatch({ quotaRefreshMs: "NaN" }, valid.pool)).includes("pool.quotaRefreshMs"),
+    "管理 API 拒绝 NaN 字符串");
+
+  try {
+    for (const name of envNames) delete process.env[name];
+    process.env.PORT = "NaN";
+    let envError = null;
+    try { loadConfig(); } catch (e) { envError = e; }
+    check(envError instanceof ConfigValidationError && envError.fields.some((f) => f.field === "env.PORT"),
+      "非法 PORT 环境变量拒绝启动并返回字段诊断", String(envError));
+    delete process.env.PORT;
+
+    process.env.ADMIN_TOKEN = "unit-env-admin-A";
+    process.env.CLIENT_TOKEN = "unit-env-client-A";
+    const first = loadConfig();
+    check(first.adminToken === "unit-env-admin-A" && first.clientToken === "unit-env-client-A", "无磁盘 token 时 env 初始化生效");
+
+    const configPath = DATA + "/config.json";
+    writeFileSync(configPath, JSON.stringify({ ...first, adminToken: "unit-disk-admin-B", clientToken: "unit-disk-client-B" }));
+    process.env.ADMIN_TOKEN = "unit-env-admin-C";
+    process.env.CLIENT_TOKEN = "unit-env-client-C";
+    const second = loadConfig();
+    check(second.adminToken === "unit-disk-admin-B" && second.clientToken === "unit-disk-client-B", "磁盘 token 优先，不被 env 静默覆盖");
+
+    const corruptRaw = JSON.stringify({ pool: { zeroOutputCountsAs429: "false" } });
+    writeFileSync(configPath, corruptRaw);
+    let semanticError = null;
+    try { loadConfig(); } catch (e) { semanticError = e; }
+    const backups = fs.readdirSync(DATA).filter((name) => /^config\.json\.corrupt-\d+$/.test(name));
+    const backupRaw = backups.length ? readFileSync(DATA + "/" + backups[backups.length - 1], "utf-8") : "";
+    check(semanticError instanceof ConfigValidationError && semanticError.fields.some((f) => f.field === "pool.zeroOutputCountsAs429"),
+      "磁盘语义损坏拒绝启动并返回字段诊断", String(semanticError));
+    check(backups.length === 1 && backupRaw === corruptRaw, "磁盘语义损坏原文件隔离保留", JSON.stringify(backups));
+
+    const saveFields = fieldsOf(() => saveConfig({ ...second, pool: { ...second.pool, maxRetries: NaN } }));
+    check(saveFields.includes("pool.maxRetries") && !fs.existsSync(configPath), "saveConfig 拒绝语义非法且不覆盖原文件", JSON.stringify(saveFields));
+  } finally {
+    for (const name of envNames) {
+      if (previousEnv[name] === undefined) delete process.env[name];
+      else process.env[name] = previousEnv[name];
+    }
+  }
 }
 
 // ════ keyPool ════

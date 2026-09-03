@@ -129,7 +129,7 @@ function reservePort() {
   });
 }
 async function allocatePorts() {
-  const names = ["manager", "mock", "corrupt", "tokenKeep", "readonly", "embedded", "embeddedUpstream"];
+  const names = ["manager", "mock", "corrupt", "semanticCorrupt", "badEnv", "tokenKeep", "readonly", "embedded", "embeddedUpstream"];
   const used = new Set();
   const ports = {};
   for (const name of names) {
@@ -652,6 +652,51 @@ async function main() {
     }
   }
 
+  // ── T5d2 语义损坏 config：隔离原文件并拒绝启动（F12）──
+  console.log("\n=== T5d2 semantic config validation ===");
+  {
+    const D5d2 = privateTempDir("ccpm-e2e-semantic-corrupt-");
+    const semanticRaw = JSON.stringify({ pool: { zeroOutputCountsAs429: "false" } });
+    writeFileSync(resolve(D5d2, "config.json"), semanticRaw);
+    try {
+      const result = await runChildForTest([resolve(ROOT, "src/server.mjs")], {
+        ...process.env, DATA_DIR: D5d2, PORT: String(TEST_PORTS.semanticCorrupt), HOST,
+        UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.mock), EMBED_UPSTREAM: "0",
+        ADMIN_TOKEN: "e2e-semantic-admin-1234", CLIENT_TOKEN: "e2e-semantic-client-1234", CC_QUOTA_BASE: UP
+      });
+      const corruptFiles = readdirSync(D5d2).filter((f) => /^config\.json\.corrupt-\d+$/.test(f));
+      const backupRaw = corruptFiles.length === 1 ? readFileSync(resolve(D5d2, corruptFiles[0]), "utf-8") : "";
+      const output = result.stdout + result.stderr;
+      result.code !== 0 && output.includes("pool.zeroOutputCountsAs429")
+        ? ok("T5d2 语义损坏按字段诊断并拒绝启动", output.match(/pool\.zeroOutputCountsAs429/g)?.length + " 次")
+        : bad("T5d2 语义损坏启动门禁", JSON.stringify({ code: result.code, output: output.slice(0, 500) }));
+      corruptFiles.length === 1 && backupRaw === semanticRaw
+        ? ok("T5d2 语义损坏原文件隔离保留", corruptFiles[0])
+        : bad("T5d2 语义备份", JSON.stringify({ files: corruptFiles, backupRaw }));
+    } finally {
+      try { rmSync(D5d2, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  // ── T5d3 非法基础设施 env：拒绝启动并指出具体变量（F12）──
+  console.log("\n=== T5d3 environment config validation ===");
+  {
+    const D5d3 = privateTempDir("ccpm-e2e-bad-env-");
+    try {
+      const result = await runChildForTest([resolve(ROOT, "src/server.mjs")], {
+        ...process.env, DATA_DIR: D5d3, PORT: "NaN", HOST,
+        UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.mock), EMBED_UPSTREAM: "0",
+        ADMIN_TOKEN: "e2e-env-admin-1234", CLIENT_TOKEN: "e2e-env-client-1234", CC_QUOTA_BASE: UP
+      });
+      const output = result.stdout + result.stderr;
+      result.code !== 0 && output.includes("env.PORT")
+        ? ok("T5d3 非法 PORT env 按字段诊断并拒绝启动")
+        : bad("T5d3 env 启动门禁", JSON.stringify({ code: result.code, output: output.slice(0, 500) }));
+    } finally {
+      try { rmSync(D5d3, { recursive: true, force: true }); } catch {}
+    }
+  }
+
   // ── T5e env 令牌不再回滚磁盘凭证（P2-2）──
   // 独立 DATA：首启用 env A 建立磁盘令牌 → 保留 DATA 换 env B 重启 → A 仍可登录、B 被拒。
   // 修复前：B 启动即把磁盘覆写回 B → A 登录 401（红）。不用 restartClean/主 DATA，避免清理干扰。
@@ -992,6 +1037,36 @@ async function main() {
   r = await admin("/admin/api/pool", "PUT", { strategy: "bogus" });
   const strat = JSON.parse((await admin("/admin/api/pool")).body).poolCfg.strategy;
   r.status === 400 && strat === "active-standby" ? ok("非法 strategy 被拒（保持原值）") : bad("非法 strategy", "status=" + r.status + " now=" + strat);
+  r = await admin("/admin/api/pool", "PUT", { zeroOutputCountsAs429: "false" });
+  let invalidPool = null;
+  try { invalidPool = parseJsonResponse(r, "字符串布尔 pool"); } catch {}
+  r.status === 400 && invalidPool?.error?.fields?.some((f) => f.field === "pool.zeroOutputCountsAs429")
+    ? ok("字符串布尔值被管理 API 拒绝并返回字段诊断") : bad("字符串布尔 pool", JSON.stringify({ status: r.status, body: r.body }));
+  r = await admin("/admin/api/pool", "PUT", { maxRetries: [1] });
+  invalidPool = null;
+  try { invalidPool = parseJsonResponse(r, "数组数字 pool"); } catch {}
+  r.status === 400 && invalidPool?.error?.fields?.some((f) => f.field === "pool.maxRetries")
+    ? ok("数组数字被管理 API 拒绝并返回字段诊断") : bad("数组数字 pool", JSON.stringify({ status: r.status, body: r.body }));
+  r = await admin("/admin/api/pool", "PUT", { backoffBaseMs: 30000, backoffMaxMs: 5000 });
+  invalidPool = null;
+  try { invalidPool = parseJsonResponse(r, "反向 backoff pool"); } catch {}
+  r.status === 400 && invalidPool?.error?.fields?.some((f) => f.field === "pool.backoffMaxMs")
+    ? ok("反向 backoff 时间关系被拒绝") : bad("反向 backoff pool", JSON.stringify({ status: r.status, body: r.body }));
+  r = await admin("/admin/api/pool", "PUT", { softStop: 100, fiveHourHardStop: 90 });
+  invalidPool = null;
+  try { invalidPool = parseJsonResponse(r, "反向阈值 pool"); } catch {}
+  r.status === 400 && invalidPool?.error?.fields?.some((f) => f.field === "pool.softStop")
+    ? ok("反向额度阈值关系被拒绝") : bad("反向阈值 pool", JSON.stringify({ status: r.status, body: r.body }));
+  r = await admin("/admin/api/pool", "PUT", { quotaRefreshMs: "NaN" });
+  invalidPool = null;
+  try { invalidPool = parseJsonResponse(r, "NaN 时间 pool"); } catch {}
+  r.status === 400 && invalidPool?.error?.fields?.some((f) => f.field === "pool.quotaRefreshMs")
+    ? ok("NaN 时间参数被拒绝") : bad("NaN 时间 pool", JSON.stringify({ status: r.status, body: r.body }));
+  r = await admin("/admin/api/security", "POST", { clientToken: false });
+  let invalidSecurity = null;
+  try { invalidSecurity = parseJsonResponse(r, "布尔 token"); } catch {}
+  r.status === 400 && invalidSecurity?.error?.fields?.some((f) => f.field === "clientToken")
+    ? ok("布尔 token 被 security API 拒绝") : bad("布尔 token", JSON.stringify({ status: r.status, body: r.body }));
   await admin("/admin/api/pool", "PUT", { strategy: "round-robin", maxRetries: 3 });
   await mock("/__reset");
   for (let i = 0; i < 4; i++) await gw({ model: "rr-" + i, messages: [] });

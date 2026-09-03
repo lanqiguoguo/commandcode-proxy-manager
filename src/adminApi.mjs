@@ -1,6 +1,6 @@
 // ── 管理 REST API + SSE + 系统日志（logs.mjs 持久化） ─────
 import crypto from "crypto";
-import { getConfig, saveConfig } from "./config.mjs";
+import { getConfig, saveConfig, normalizePoolPatch, ConfigValidationError } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as quota from "./quota.mjs";
 import * as stats from "./stats.mjs";
@@ -121,50 +121,8 @@ function readJsonBody(req, opts = {}) {
   });
 }
 
-const POOL_FIELDS = [
-  "strategy", "maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs",
-  "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
-  "softStop", "quotaRefreshMs", "quotaRefreshGapMs", "zeroOutputCountsAs429", "historyRetentionDays"
-];
-const INT_FIELDS = ["maxRetries", "sameKeyRetryCount", "sameKeyRetryDelayMs", "sameKeyRetryMaxWaitMs",
-  "backoffBaseMs", "backoffMaxMs", "connectTimeoutMs", "failoverCooldownMs", "fiveHourHardStop", "weeklyHardStop",
-  "softStop", "quotaRefreshMs", "quotaRefreshGapMs", "historyRetentionDays"];
-
 function sanitizePoolPatch(body) {
-  const patch = {};
-  for (const k of POOL_FIELDS) {
-    if (body[k] === undefined) continue;
-    if (INT_FIELDS.includes(k)) {
-      let v = Number(body[k]);
-      if (!Number.isFinite(v)) continue;
-      if (k === "maxRetries") v = Math.max(0, Math.min(10, Math.round(v)));
-      else if (k === "sameKeyRetryCount") v = Math.max(0, Math.min(5, Math.round(v)));
-      else if (k === "sameKeyRetryDelayMs") v = Math.max(100, Math.min(10000, Math.round(v)));
-      else if (k === "sameKeyRetryMaxWaitMs") v = Math.max(500, Math.min(30000, Math.round(v)));
-      else if (k === "backoffBaseMs") v = Math.max(1000, Math.min(30000, Math.round(v)));
-      else if (k === "backoffMaxMs") v = Math.max(5000, Math.min(600000, Math.round(v)));
-      else if (k === "connectTimeoutMs") v = Math.max(1000, Math.min(300000, Math.round(v)));
-      else if (k === "failoverCooldownMs") v = Math.max(0, Math.min(3600000, Math.round(v)));
-      else if (k === "fiveHourHardStop") v = Math.max(50, Math.min(100, Math.round(v)));
-      else if (k === "weeklyHardStop") v = Math.max(50, Math.min(100, Math.round(v)));
-      else if (k === "softStop") v = Math.max(50, Math.min(100, Math.round(v)));
-      else if (k === "quotaRefreshMs") v = Math.max(5000, Math.min(3600000, Math.round(v)));
-      else if (k === "quotaRefreshGapMs") v = Math.max(0, Math.min(60000, Math.round(v)));
-      else if (k === "historyRetentionDays") v = Math.max(1, Math.min(31, Math.round(v)));
-      else v = Math.round(v);
-      // 语义约束：backoffMax 必须 >= backoffBase，阈值需 softStop <= hardStop 在调用方处理
-      patch[k] = v;
-    } else if (k === "strategy") {
-      if (["active-standby", "round-robin", "least-usage"].includes(body[k])) patch[k] = body[k];
-    } else {
-      patch[k] = !!body[k];
-    }
-  }
-  // 交叉约束：backoffMaxMs 必须 >= backoffBaseMs
-  if (patch.backoffMaxMs !== undefined && patch.backoffBaseMs !== undefined) {
-    if (patch.backoffMaxMs < patch.backoffBaseMs) patch.backoffMaxMs = patch.backoffBaseMs;
-  }
-  return patch;
+  return normalizePoolPatch(body, getConfig().pool);
 }
 
 export async function handleAdmin(req, res, url) {
@@ -337,13 +295,22 @@ export async function handleAdmin(req, res, url) {
 
     if (p === "/admin/api/security" && req.method === "POST") {
       const body = await readJsonBody(req);
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        throw new ConfigValidationError("管理端 security 配置", [{ field: "security", message: "请求体必须是对象" }]);
+      }
       const nextCfg = { ...cfg };
       if (body.clientToken !== undefined) {
+        if (typeof body.clientToken !== "string") {
+          throw new ConfigValidationError("管理端 security 配置", [{ field: "clientToken", message: "必须是字符串" }]);
+        }
         nextCfg.clientToken = String(body.clientToken).slice(0, 128);
       }
       if (body.adminToken !== undefined) {
+        if (typeof body.adminToken !== "string") {
+          throw new ConfigValidationError("管理端 security 配置", [{ field: "adminToken", message: "必须是字符串" }]);
+        }
         const t = String(body.adminToken).trim();
-        if (t.length < 8) throw new Error("AdminToken 至少 8 位");
+        if (t.length < 8) throw new ConfigValidationError("管理端 security 配置", [{ field: "adminToken", message: "至少 8 位" }]);
         nextCfg.adminToken = t;
       }
       saveConfig(nextCfg);
@@ -396,7 +363,9 @@ export async function handleAdmin(req, res, url) {
     const persistenceFailure = e.code === "PERSISTENCE_ERROR" || e.persistence === true;
     const status = persistenceFailure ? 503 : 400;
     const type = persistenceFailure ? "persistence_error" : "invalid_request_error";
-    sendJson(res, status, { error: { message: e.message, type } });
+    const error = { message: e.message, type };
+    if (Array.isArray(e.fields) && e.fields.length) error.fields = e.fields;
+    sendJson(res, status, { error });
     return true;
   }
 }

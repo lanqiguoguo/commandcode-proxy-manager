@@ -80,9 +80,10 @@ async function fetchJson(url, key) {
   }
   let j;
   try { j = await res.json(); } catch { return { err: "bad JSON", status: res.status }; }
-  if (j && j.success === false && j.error) {
-    // HTTP 200 但业务层报错：按失败处理（真实额度数据不会带 success:false 封装）
-    return { err: "api " + (j.error.code || j.error.status || "error"), status: j.error.status || res.status };
+  if (j && j.success === false) {
+    // HTTP 200 但业务层报错：任何 success:false 都按失败处理。
+    const detail = j.error && (j.error.code || j.error.status || j.error.message);
+    return { err: "api " + (detail || "error"), status: j.error?.status || res.status };
   }
   return { data: j };
 }
@@ -91,15 +92,85 @@ function num(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+function isRecord(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+function unwrapData(v) {
+  if (!isRecord(v)) return null;
+  return Object.prototype.hasOwnProperty.call(v, "data") ? v.data : v;
+}
+
+function requirePayload(label, result) {
+  if (result.err) throw new Error(label + ": " + result.err);
+  const payload = unwrapData(result.data);
+  if (!isRecord(payload) || Object.keys(payload).length === 0) {
+    throw new Error(label + ": empty or invalid response");
+  }
+  return payload;
+}
+
+function parseCredits(v) {
+  if (!isRecord(v)) return null;
+  const fields = ["monthlyCredits", "purchasedCredits", "freeCredits"];
+  let present = 0;
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(v, field)) continue;
+    const value = num(v[field]);
+    if (value === undefined || value < 0) return null;
+    present++;
+  }
+  return present > 0 ? v : null;
+}
+
+function optionalTime(label, value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !value.trim() || !Number.isFinite(Date.parse(value))) {
+    throw new Error(label + ": invalid time");
+  }
+  return value;
+}
+
+function nonNegativeNumber(label, field, value) {
+  const parsed = num(value);
+  if (parsed === undefined || parsed < 0) throw new Error(label + ": invalid " + field);
+  return parsed;
+}
+
+function validateUsageNumbers(usage) {
+  const fields = [
+    "totalCost", "totalMonthlyCredits", "totalCredits", "totalCount",
+    "completedCount", "failedCount", "totalTokensIn", "totalTokensOut", "totalTokens",
+    "successRate"
+  ];
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(usage, field)) continue;
+    const value = nonNegativeNumber("usage", field, usage[field]);
+    if (field === "successRate" && value > 100) throw new Error("usage: invalid successRate");
+  }
+}
+
 // 真实 API 中 resetAt 有两种形态：ISO 字符串 或 epoch 毫秒数字（0=无值），均可能出现
 function parseWindow(w) {
-  if (!w || typeof w !== "object") return null;
+  if (!isRecord(w)) return null;
   const cap = num(w.cap);
   const used = num(w.used);
   if (cap === undefined || used === undefined || cap <= 0 || used < 0) return null;
   let resetAt = null;
-  if (typeof w.resetAt === "number" && w.resetAt > 0) resetAt = new Date(w.resetAt).toISOString();
-  else if (typeof w.resetAt === "string" && w.resetAt) resetAt = w.resetAt;
+  if (w.resetAt !== undefined && w.resetAt !== null && w.resetAt !== "") {
+    if (typeof w.resetAt === "number") {
+      if (!Number.isFinite(w.resetAt) || w.resetAt < 0) return null;
+      if (w.resetAt > 0) {
+        const date = new Date(w.resetAt);
+        if (!Number.isFinite(date.getTime())) return null;
+        resetAt = date.toISOString();
+      }
+    } else if (typeof w.resetAt === "string" && Number.isFinite(Date.parse(w.resetAt))) {
+      resetAt = w.resetAt;
+    } else {
+      return null;
+    }
+  }
   return {
     cap,
     used,
@@ -135,70 +206,85 @@ async function doProbe(keyId) {
   let ok = false;
   let probeErr = "";
   try {
-    const whoamiR = await fetchJson(API_BASE + PATH_WHOAMI, rec.key);
-    if (whoamiR.err) probeErr = "whoami: " + whoamiR.err;
-    const w = (whoamiR.data && (whoamiR.data.data || whoamiR.data)) || {};
-    const orgId = w.org && typeof w.org.id === "string" && w.org.id ? w.org.id : null;
+    const whoami = requirePayload("whoami", await fetchJson(API_BASE + PATH_WHOAMI, rec.key));
+    if (whoami.org !== undefined && (!isRecord(whoami.org) || typeof whoami.org.id !== "string" || !whoami.org.id)) {
+      throw new Error("whoami: invalid org structure");
+    }
+    if (whoami.user !== undefined && (!isRecord(whoami.user) || typeof whoami.user.id !== "string" || !whoami.user.id)) {
+      throw new Error("whoami: invalid user structure");
+    }
+    if (whoami.org === undefined && whoami.user === undefined) {
+      throw new Error("whoami: missing org or user structure");
+    }
+    const orgId = whoami.org ? whoami.org.id : null;
     const orgQuery = orgId ? "?orgId=" + encodeURIComponent(orgId) : "";
 
-    const creditsR = await fetchJson(API_BASE + PATH_CREDITS + orgQuery, rec.key);
-    if (creditsR.err) probeErr = "credits: " + creditsR.err;
-    const body = creditsR.data ? (creditsR.data.data || creditsR.data) : null;
-    const creditsObj = body ? (body.credits || null) : null;
-    const limits = body ? (body.windowLimits || null) : null;
-    if (creditsObj || limits) {
-      if (limits) {
-        report.fiveHour = parseWindow(limits.fiveHour);
-        report.weekly = parseWindow(limits.weekly);
-      }
+    const credits = requirePayload("credits", await fetchJson(API_BASE + PATH_CREDITS + orgQuery, rec.key));
+    const creditsObj = parseCredits(credits.credits);
+    if (!creditsObj) throw new Error("credits: invalid or empty credits");
+    if (!isRecord(credits.windowLimits)) throw new Error("credits: missing windowLimits");
+    const fiveHour = parseWindow(credits.windowLimits.fiveHour);
+    const weekly = parseWindow(credits.windowLimits.weekly);
+    if (!fiveHour || !weekly) throw new Error("credits: invalid fiveHour or weekly window");
+    report.fiveHour = fiveHour;
+    report.weekly = weekly;
 
-      // 订阅周期内美元额度（软失败，无周期起点时不展示）
-      const subsR = await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key);
-      const sub = subsR.data ? (subsR.data.data || subsR.data) : null;
-      const periodStart = sub && typeof sub.currentPeriodStart === "string" ? sub.currentPeriodStart : "";
-      if (periodStart && creditsObj) {
-        // 无 orgId 时 orgQuery 为空串，必须用 ? 起始，否则 "&since=" 拼出非法 URL（真实 API 实测 404）
-        const usageSep = orgQuery ? "&" : "?";
-        const usageR = await fetchJson(API_BASE + PATH_USAGE + orgQuery + usageSep + "since=" + encodeURIComponent(periodStart), rec.key);
-        const u = usageR.data ? (usageR.data.data || usageR.data) : null;
-        const used = u && u.totalCost !== undefined ? num(u.totalCost) : num(u && u.totalMonthlyCredits);
-        const pools = ["monthlyCredits", "purchasedCredits", "freeCredits"]
-          .map((k) => num(creditsObj[k]))
-          .filter((v) => v !== undefined)
-          .map((v) => Math.max(0, v));
-        if (used !== undefined && pools.length > 0) {
-          const remaining = pools.reduce((s, v) => s + v, 0);
-          const limit = used + remaining;
-          report.creditsUsd = {
-            used,
-            remaining,
-            limit,
-            percent: limit > 0 ? Math.round((used / limit) * 1000) / 10 : 0,
-            expiresAt: sub.currentPeriodEnd || undefined,
-            periodStart
-          };
-        }
-        // 账期总用量（对应官网 settings/usage 页的 Total 卡片）：调用次数/Token/成功率
-        if (u && (num(u.totalCount) !== undefined || num(u.totalTokens) !== undefined)) {
-          report.totals = {
-            runs: num(u.totalCount) ?? 0,
-            completed: num(u.completedCount) ?? 0,
-            failed: num(u.failedCount) ?? 0,
-            successRate: num(u.successRate),
-            tokensIn: num(u.totalTokensIn) ?? 0,
-            tokensOut: num(u.totalTokensOut) ?? 0,
-            tokens: num(u.totalTokens) ?? 0,
-            cost: num(u.totalCost) ?? num(u.totalCredits) ?? 0
-          };
-        }
+    // 订阅周期内美元额度：没有周期起点是合法的无账期数据，不请求裸 usage。
+    const sub = requirePayload("subscriptions", await fetchJson(API_BASE + PATH_SUBSCRIPTIONS + orgQuery, rec.key));
+    const rawPeriodStart = sub.currentPeriodStart;
+    const periodEnd = optionalTime("subscriptions.currentPeriodEnd", sub.currentPeriodEnd);
+    let periodStart = "";
+    if (rawPeriodStart !== undefined && rawPeriodStart !== null && rawPeriodStart !== "") {
+      if (typeof rawPeriodStart !== "string" || !rawPeriodStart.trim() || !Number.isFinite(Date.parse(rawPeriodStart))) {
+        throw new Error("subscriptions: invalid currentPeriodStart");
       }
-      ok = true;
-      probeErr = "";
-    } else if (!probeErr) {
-      probeErr = "credits: no quota fields in response";
+      periodStart = rawPeriodStart;
     }
+    if (periodStart) {
+      // 无 orgId 时 orgQuery 为空串，必须用 ? 起始，否则 "&since=" 拼出非法 URL（真实 API 实测 404）
+      const usageSep = orgQuery ? "&" : "?";
+      const usage = requirePayload("usage", await fetchJson(API_BASE + PATH_USAGE + orgQuery + usageSep + "since=" + encodeURIComponent(periodStart), rec.key));
+      validateUsageNumbers(usage);
+      const used = Object.prototype.hasOwnProperty.call(usage, "totalCost")
+        ? nonNegativeNumber("usage", "totalCost", usage.totalCost)
+        : Object.prototype.hasOwnProperty.call(usage, "totalMonthlyCredits")
+          ? nonNegativeNumber("usage", "totalMonthlyCredits", usage.totalMonthlyCredits)
+          : undefined;
+      if (used === undefined) throw new Error("usage: missing valid totalCost or totalMonthlyCredits");
+      const pools = ["monthlyCredits", "purchasedCredits", "freeCredits"]
+        .map((k) => num(creditsObj[k]))
+        .filter((v) => v !== undefined)
+        .map((v) => Math.max(0, v));
+      const remaining = pools.reduce((s, v) => s + v, 0);
+      const limit = used + remaining;
+      if (!Number.isFinite(remaining) || !Number.isFinite(limit)) throw new Error("usage: numeric result overflow");
+      report.creditsUsd = {
+        used,
+        remaining,
+        limit,
+        percent: limit > 0 ? Math.round((used / limit) * 1000) / 10 : 0,
+        expiresAt: periodEnd,
+        periodStart
+      };
+      // 账期总用量（对应官网 settings/usage 页的 Total 卡片）：调用次数/Token/成功率
+      if (num(usage.totalCount) !== undefined || num(usage.totalTokens) !== undefined) {
+        report.totals = {
+          runs: num(usage.totalCount) ?? 0,
+          completed: num(usage.completedCount) ?? 0,
+          failed: num(usage.failedCount) ?? 0,
+          successRate: num(usage.successRate),
+          tokensIn: num(usage.totalTokensIn) ?? 0,
+          tokensOut: num(usage.totalTokensOut) ?? 0,
+          tokens: num(usage.totalTokens) ?? 0,
+          cost: num(usage.totalCost) ?? num(usage.totalCredits) ?? 0
+        };
+      }
+    }
+    ok = true;
+    probeErr = "";
+    report.updatedAt = Date.now();
   } catch (e) {
-    probeErr = probeErr || ("exception: " + e.message);
+    probeErr = e && e.message ? e.message : ("exception: " + String(e));
     // 探测失败：走下方统一失败路径
   }
   // 决策 3：失败时保留上次成功值并标记 stale，绝不丢数据
@@ -214,7 +300,7 @@ async function doProbe(keyId) {
   };
   cache.set(keyId, final);
   persistCache();
-  applyLimits(keyId, final);
+  if (!final.stale) applyLimits(keyId, final);
   if (emitter) emitter.emit("quota", { keyId, report: final });
   return final;
 }

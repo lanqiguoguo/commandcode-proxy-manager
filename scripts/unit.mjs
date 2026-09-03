@@ -68,9 +68,15 @@ if (SC === "quota") {
     usage: { data: { totalCost: 4.5 } },
   };
   let netDown = false;
+  let quotaFailure = "";
+  let usageCalls = 0;
   globalThis.fetch = async (url) => {
     if (netDown) throw new Error("network down");
     const u = String(url);
+    const pathname = new URL(u).pathname;
+    if (quotaFailure === "subscriptions" && pathname === "/alpha/billing/subscriptions") throw new Error("subscriptions down");
+    if (quotaFailure === "usage" && pathname === "/alpha/usage/summary") throw new Error("usage down");
+    if (pathname === "/alpha/usage/summary") usageCalls++;
     let j = null;
     if (u.includes("/alpha/whoami")) j = responses.whoami;
     else if (u.includes("/billing/credits")) j = responses.credits;
@@ -81,14 +87,26 @@ if (SC === "quota") {
   };
   const quotaCalls = [];
   const softCalls = [];
+  const poolState = { quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false };
   const liveCfg = { fiveHourHardStop: 90, weeklyHardStop: 90, softStop: 80, quotaRefreshMs: 60000000 };
   const fakePool = {
     getKeyRecord: (id) => ({ id, key: "user_testkey" }),
     listKeys: () => [{ id: "k1", key: "user_testkey", enabled: true }],
     getPoolCfg: () => ({ ...liveCfg }),
-    setQuotaLimited: (id, until, reason) => quotaCalls.push(["set", reason, until]),
-    clearQuotaLimited: () => quotaCalls.push(["clear"]),
-    setSoftLimited: (id, v) => softCalls.push(v),
+    setQuotaLimited: (id, until, reason) => {
+      poolState.quotaLimitedUntil = until;
+      poolState.quotaLimitedReason = reason;
+      quotaCalls.push(["set", reason, until]);
+    },
+    clearQuotaLimited: () => {
+      poolState.quotaLimitedUntil = 0;
+      poolState.quotaLimitedReason = "";
+      quotaCalls.push(["clear"]);
+    },
+    setSoftLimited: (id, v) => {
+      poolState.softLimited = !!v;
+      softCalls.push(!!v);
+    },
   };
   const { initQuota, probeKey, testKey } = await import("../src/quota.mjs");
   initQuota(fakePool, liveCfg, {});
@@ -133,8 +151,9 @@ if (SC === "quota") {
   // 陷阱1：无周期起点 → 不展示 creditsUsd
   quotaCalls.length = 0;
   responses.subs = { data: { planId: "pro" } };
+  const usageCallsBeforeNoPeriod = usageCalls;
   r = await probeKey("k1");
-  check(r.creditsUsd === null, "无 currentPeriodStart → creditsUsd 不展示（陷阱1）", JSON.stringify(r.creditsUsd));
+  check(r.creditsUsd === null && !r.stale && !r.error && usageCalls === usageCallsBeforeNoPeriod, "无 currentPeriodStart → 无账期成功且不请求 usage（陷阱1）", JSON.stringify(r));
 
   // P3-3: credits 耗尽 + expiresAt 缺失 → 退到窗口 resetAt
   quotaCalls.length = 0;
@@ -166,14 +185,88 @@ if (SC === "quota") {
   check(!quotaCalls.some((c) => c[1] === "fiveHour"), "fiveHour resetAt 缺失 → 不做硬限制（保守）", JSON.stringify(quotaCalls));
   responses.credits.data.windowLimits.fiveHour = { cap: 100, used: 50, resetAt: new Date(Date.now() + 3600e3).toISOString() };
 
+  // F06：必要端点逐个失败/非法时，保留上一份完整报告和既有限制。
+  r = await probeKey("k1");
+  const previousReport = JSON.parse(JSON.stringify(r));
+  const oldPoolState = { quotaLimitedUntil: Date.now() + 123456, quotaLimitedReason: "old-quota", softLimited: true };
+  const resetOldPoolState = () => {
+    Object.assign(poolState, oldPoolState);
+    quotaCalls.length = 0;
+    softCalls.length = 0;
+  };
+  const checkTransactionalFailure = (failed, name) => {
+    check(failed.stale === true && typeof failed.error === "string" && failed.updatedAt === previousReport.updatedAt &&
+      JSON.stringify(failed.fiveHour) === JSON.stringify(previousReport.fiveHour) &&
+      JSON.stringify(failed.weekly) === JSON.stringify(previousReport.weekly) &&
+      JSON.stringify(failed.creditsUsd) === JSON.stringify(previousReport.creditsUsd), name + " → stale 保留完整旧报告", JSON.stringify(failed));
+    check(quotaCalls.length === 0 && softCalls.length === 0 && JSON.stringify(poolState) === JSON.stringify(oldPoolState), name + " → 不清除旧 quota/soft 限制", JSON.stringify({ quotaCalls, softCalls, poolState }));
+  };
+
+  resetOldPoolState();
+  quotaFailure = "subscriptions";
+  let failed = await probeKey("k1");
+  quotaFailure = "";
+  checkTransactionalFailure(failed, "subscriptions 失败");
+
+  resetOldPoolState();
+  quotaFailure = "usage";
+  failed = await probeKey("k1");
+  quotaFailure = "";
+  checkTransactionalFailure(failed, "usage 失败");
+
+  const goodPeriodEndValue = responses.subs.data.currentPeriodEnd;
+  resetOldPoolState();
+  responses.subs.data.currentPeriodEnd = "not-a-time";
+  failed = await probeKey("k1");
+  responses.subs.data.currentPeriodEnd = goodPeriodEndValue;
+  checkTransactionalFailure(failed, "非法 currentPeriodEnd");
+
+  const goodUsageData = responses.usage.data;
+  resetOldPoolState();
+  responses.usage.data = { ...goodUsageData, totalCount: "not-a-number" };
+  failed = await probeKey("k1");
+  responses.usage.data = goodUsageData;
+  checkTransactionalFailure(failed, "非法 usage 统计字段");
+
+  const goodCreditsData = responses.credits.data.credits;
+  resetOldPoolState();
+  responses.credits.data.credits = { monthlyCredits: -1 };
+  failed = await probeKey("k1");
+  responses.credits.data.credits = goodCreditsData;
+  checkTransactionalFailure(failed, "负数 credits");
+
+  const goodCreditsResponse = responses.credits;
+  resetOldPoolState();
+  responses.credits = { success: false, error: { code: "CREDITS_UNAVAILABLE", status: 503 } };
+  failed = await probeKey("k1");
+  responses.credits = goodCreditsResponse;
+  check(failed.stale === true && failed.error.includes("CREDITS_UNAVAILABLE"), "credits HTTP 200 success:false → stale 且明确报错", JSON.stringify(failed));
+  check(quotaCalls.length === 0 && softCalls.length === 0 && JSON.stringify(poolState) === JSON.stringify(oldPoolState), "credits 业务失败 → 不改变旧限制", JSON.stringify({ quotaCalls, softCalls, poolState }));
+
+  const goodCreditsObject = responses.credits.data.credits;
+  resetOldPoolState();
+  responses.credits.data.credits = {};
+  failed = await probeKey("k1");
+  responses.credits.data.credits = goodCreditsObject;
+  checkTransactionalFailure(failed, "空 credits");
+
+  const goodWindowLimits = responses.credits.data.windowLimits;
+  resetOldPoolState();
+  responses.credits.data.windowLimits = { ...goodWindowLimits, weekly: undefined };
+  failed = await probeKey("k1");
+  responses.credits.data.windowLimits = goodWindowLimits;
+  checkTransactionalFailure(failed, "缺失 weekly window");
+
   // stale 降级
   r = await probeKey("k1"); // 建立 prev
   const prevUpdatedAt = r.updatedAt;
   quotaCalls.length = 0; softCalls.length = 0;
+  Object.assign(poolState, { quotaLimitedUntil: Date.now() + 654321, quotaLimitedReason: "old-network-quota", softLimited: true });
+  const oldNetworkPoolState = { ...poolState };
   netDown = true;
   const r2 = await probeKey("k1");
   netDown = false;
-  check(r2.stale && r2.fiveHour && quotaCalls.length === 0 && softCalls.length === 0, "网络失败 → stale 保留旧值、不触发任何限制", JSON.stringify(quotaCalls));
+  check(r2.stale && r2.fiveHour && quotaCalls.length === 0 && softCalls.length === 0 && JSON.stringify(poolState) === JSON.stringify(oldNetworkPoolState), "网络失败 → stale 保留旧值、不触发任何限制", JSON.stringify({ quotaCalls, softCalls, poolState }));
   check(r2.updatedAt === prevUpdatedAt, "stale 保留上次成功 updatedAt");
 
   globalThis.fetch = async () => ({ ok: false, status: 401 });

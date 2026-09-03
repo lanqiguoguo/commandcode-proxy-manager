@@ -1,6 +1,6 @@
-// ── 端到端测试：起 mock 上游 (3051) + manager (3088, EMBED_UPSTREAM=0)，
+// ── 端到端测试：external manager + hosted manager/upstream。
 // 覆盖鉴权/主备切换/同Key重试/退避持久化/额度感知/统计/管理 API/流式/断连。
-// KNOWN-ISSUE 用例如实断言当前缺陷行为，修复对应项后应翻正（见 docs/CODE_REVIEW_2026-09-01.md）。
+// 初始化并发和版本刷新由上游原始版本负责；本仓库只负责进程托管和网关行为。
 import http from "http";
 import net from "net";
 import { performance } from "perf_hooks";
@@ -144,16 +144,11 @@ async function allocatePorts() {
   return ports;
 }
 
-let pass = 0, fail = 0, known = 0;
+let pass = 0, fail = 0;
 const failures = [];
 const sleep = (ms) => new Promise((r) => trackedTimeout(r, ms));
 function ok(name, extra) { pass++; console.log(`  ✅ ${name}${extra ? " — " + extra : ""}`); }
 function bad(name, detail) { fail++; failures.push({ name, detail }); console.log(`  ❌ ${name}\n     ${detail}`); }
-// 当前缺陷行为如实断言；修复后应改为断言正确行为
-function knownIssue(cond, name, detail) {
-  if (cond) { known++; console.log(`  ⚠️  KNOWN-ISSUE ${name}`); }
-  else bad(name + "（缺陷行为未复现，请更新用例）", detail);
-}
 
 function http1(url, method, headers, body, timeoutMs = HTTP1_TIMEOUT_MS) {
   return new Promise((resP, rejP) => {
@@ -240,11 +235,99 @@ const historyForModel = async (model, path = "/admin/api/history?pageSize=500") 
   return result.items.filter((event) => event.model === model);
 };
 
-async function waitUp(url, timeout = 20000, child) {
+async function waitUp(url, timeout = 20000, child, predicate = (response) => response.status < 500) {
   const t0 = performance.now();
-  while (performance.now() - t0 < timeout) { try { const r = await http1(url, "GET", {}); if (r.status < 500) return true; } catch {} await sleep(150); }
+  while (performance.now() - t0 < timeout) {
+    if (child && (child.exitCode !== null || child.signalCode)) throw new Error(`${url} 对应进程提前退出`);
+    try {
+      const r = await http1(url, "GET", {});
+      if (predicate(r)) return true;
+    } catch {}
+    await sleep(150);
+  }
   if (child && (child.exitCode !== null || child.signalCode)) throw new Error(`${url} 对应进程提前退出`);
   return false;
+}
+
+function directChildPids(pid) {
+  if (!Number.isInteger(pid)) return [];
+  try {
+    const text = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8").trim();
+    return text ? text.split(/\s+/).filter(Boolean).map(Number) : [];
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw new Error(`无法检查进程 ${pid} 的直接子进程：${error.message}`);
+  }
+}
+
+async function waitForDirectChild(pid, label, timeoutMs = 3000) {
+  const deadline = performance.now() + timeoutMs;
+  let last = [];
+  while (performance.now() < deadline) {
+    last = directChildPids(pid);
+    if (last.length) return last[0];
+    await sleep(25);
+  }
+  throw new Error(`${label} 在 ${timeoutMs}ms 内没有直接子进程：${last.join(",") || "none"}`);
+}
+
+async function assertPidGone(pid, label, timeoutMs = 2000) {
+  if (!Number.isInteger(pid)) return;
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    try {
+      readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    await sleep(25);
+  }
+  throw new Error(`${label} 进程仍存在：${pid}`);
+}
+
+function listenAt(port) {
+  return new Promise((resolveP, rejectP) => {
+    const server = net.createServer((socket) => socket.destroy());
+    const onError = (error) => {
+      server.removeListener("listening", onListening);
+      rejectP(error);
+    };
+    const onListening = () => {
+      server.removeListener("error", onError);
+      resolveP(server);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen({ host: HOST, port });
+  });
+}
+
+function closeNetServer(server) {
+  if (!server) return Promise.resolve();
+  return new Promise((resolveP, rejectP) => {
+    server.close((error) => error ? rejectP(error) : resolveP());
+  });
+}
+
+function waitForChildExit(child, timeoutMs, label) {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return Promise.resolve({ code: child?.exitCode ?? null, signal: child?.signalCode ?? null });
+  }
+  return new Promise((resolveP, rejectP) => {
+    let timer;
+    const finish = (fn, value) => {
+      clearTrackedTimeout(timer);
+      child.removeListener("close", onClose);
+      child.removeListener("error", onError);
+      fn(value);
+    };
+    const onClose = (code, signal) => finish(resolveP, { code, signal });
+    const onError = (error) => finish(rejectP, error);
+    child.once("close", onClose);
+    child.once("error", onError);
+    timer = trackedTimeout(() => finish(rejectP, new Error(`${label} 在 ${timeoutMs}ms 内未退出`)), timeoutMs);
+  });
 }
 
 let mgr;
@@ -456,6 +539,10 @@ async function main() {
     mockProc.on("exit", (code, sig) => { if (!cleanupStarted) console.error("mock died code=" + code + " sig=" + sig); });
     if (!await waitUp(UP + "/health", 20000, mockProc)) throw new Error("mock not up");
     await startMgr();
+    const externalChildren = directChildPids(mgr.pid);
+    externalChildren.length === 0
+      ? ok("external manager 不创建 upstream 子进程")
+      : bad("external manager 子进程边界", JSON.stringify(externalChildren));
 
   // ── T1 鉴权 ──
   console.log("\n=== T1 auth ===");
@@ -1106,7 +1193,7 @@ async function main() {
     : bad("badusage 净化", JSON.stringify(ev));
   !r.body.includes("onerror") && !r.body.includes("<img") ? ok("history 响应体无原始脏串残留") : bad("badusage 泄漏", r.body.slice(0, 200));
 
-  // ── T10 客户端断连（KNOWN: P2-1）──
+  // ── T10 客户端断连 ──
   console.log("\n=== T10 client disconnect ===");
   await restartClean();
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "slowsse" }] });
@@ -1666,19 +1753,45 @@ async function main() {
     ? ok("重启后 history/logs API 不暴露已清除脏数据")
     : bad("F10 API 脏数据", JSON.stringify({ history: f10History.find((entry) => entry.model === "f10-expired"), logs: f10LogsApi.find((entry) => entry.msg.includes("f10-expired")) }));
 
-  // ── T23 上游 proxy.mjs 日志捕获（嵌入模式）──
-  console.log("\n=== T23 proxy log capture ===");
+  // ── T23 hosted supervisor：raw upstream readiness/logs/reaping ──
+  console.log("\n=== T23 hosted upstream supervision ===");
   await stopMgr();
-  // 独立起嵌入模式进程并捕获 stdout：验证 ①docker logs 通道原样透传 ②proxy 行进日志环/落盘
+  // manager 通过 supervisor 启动原始 upstream；父进程 stdout/stderr 是唯一日志入口。
   const embProc = spawnNode([resolve(ROOT, "src/server.mjs")], {
     ...process.env, DATA_DIR: DATA, PORT: String(TEST_PORTS.embedded), HOST,
     UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.embeddedUpstream), EMBED_UPSTREAM: "1",
     ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP
-  }); // 嵌入上游使用独立动态端口；quota 探测仍指 mock
+  });
+  let embStdout = "";
+  let embStderr = "";
+  let upstreamPid = null;
+  embProc.stdout.on("data", (c) => { embStdout += c; });
+  embProc.stderr.on("data", (c) => { embStderr += c; });
   try {
-    let embTxt = "";
-    embProc.stdout.on("data", (c) => { embTxt += c; });
-    embProc.stderr.on("data", (c) => { embTxt += c; });
+    upstreamPid = await waitForDirectChild(embProc.pid, "hosted raw upstream child");
+    const rawCommand = readFileSync(`/proc/${upstreamPid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    const rawCwd = realpathSync(`/proc/${upstreamPid}/cwd`);
+    rawCommand.some((part) => part === "proxy.mjs" || part.endsWith("/proxy.mjs")) && rawCwd === resolve(ROOT, "upstream")
+      ? ok("hosted supervisor 启动 upstream/proxy.mjs 原始入口", `${rawCommand.join(" ")} cwd=${rawCwd}`)
+      : bad("hosted raw upstream 入口", JSON.stringify({ command: rawCommand, cwd: rawCwd }));
+    const rawReady = await waitUp(
+      testUrl(TEST_PORTS.embeddedUpstream) + "/health",
+      20000,
+      embProc,
+      (response) => response.status === 200 && response.body === "OK",
+    );
+    rawReady
+      ? ok("hosted supervisor 等待真实 upstream /health=200 OK")
+      : bad("hosted upstream readiness", "raw upstream /health 未返回 200 OK");
+    const managerReady = await waitUp(
+      testUrl(TEST_PORTS.embedded) + "/health",
+      20000,
+      embProc,
+      (response) => response.status === 200 && response.body === "OK",
+    );
+    managerReady
+      ? ok("hosted manager 在 upstream ready 后开放 /health")
+      : bad("hosted manager readiness", "manager /health 未返回 200 OK");
     let logTxt = "";
     for (let i = 0; i < 80; i++) {
       try {
@@ -1691,15 +1804,39 @@ async function main() {
     const plogs = Array.isArray(proxyPayload.logs) ? proxyPayload.logs : [];
     const pTxt = JSON.stringify(plogs);
     plogs.length >= 1 && plogs.some((l) => l.msg.includes("CC Proxy started") && l.src === "proxy")
-      ? ok("T23a 上游启动日志入日志页（src=proxy，含捕获前于挂钩的启动行）", plogs.length + " 条") : bad("T23a", pTxt.slice(0, 250));
-    embTxt.includes("CC Proxy started") && embTxt.includes("[manager] CC Proxy Manager started")
-      ? ok("T23b stdout 原样透传不受捕获影响（docker logs 通道完好）") : bad("T23b", embTxt.slice(0, 250));
+      ? ok("T23a 父进程捕获的 upstream 启动日志进入日志页（src=proxy）", plogs.length + " 条") : bad("T23a", pTxt.slice(0, 250));
+    embStdout.includes("CC Proxy started") && embStdout.includes("[manager] CC Proxy Manager started")
+      ? ok("T23b 父进程 stdout 转发 upstream/manager 日志") : bad("T23b stdout", embStdout.slice(0, 250));
     const diskHas = existsSync(resolve(DATA, "events.jsonl")) && readFileSync(resolve(DATA, "events.jsonl"), "utf-8").includes("\"src\":\"proxy\"");
     diskHas ? ok("T23c proxy 行已落盘 events.jsonl") : bad("T23c", "file missing/no proxy lines");
     // API 层 src 过滤 + level 字段存在
     plogs.every((l) => ["info", "warn", "error"].includes(l.level)) ? ok("T23d level 字段规范化") : bad("T23d", pTxt.slice(0, 200));
   } finally {
     await stopChild(embProc, "embedded manager");
+    await assertPidGone(upstreamPid, "hosted upstream after manager exit");
+  }
+
+  // raw upstream 正常日志走 stdout；端口冲突时的真实诊断走 stderr，均应由父进程收到。
+  let conflictBlocker;
+  let conflictProc;
+  try {
+    conflictBlocker = await listenAt(TEST_PORTS.embeddedUpstream);
+    let conflictStdout = "";
+    let conflictStderr = "";
+    conflictProc = spawnNode([resolve(ROOT, "src/server.mjs")], {
+      ...process.env, DATA_DIR: DATA, PORT: String(TEST_PORTS.embedded), HOST,
+      UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.embeddedUpstream), EMBED_UPSTREAM: "1",
+      ADMIN_TOKEN: ADMIN, CLIENT_TOKEN: CLIENT, CC_QUOTA_BASE: UP
+    });
+    conflictProc.stdout.on("data", (c) => { conflictStdout += c; });
+    conflictProc.stderr.on("data", (c) => { conflictStderr += c; });
+    const conflictExit = await waitForChildExit(conflictProc, 10000, "hosted upstream conflict manager");
+    conflictExit.code !== 0 && conflictStderr.includes("EADDRINUSE")
+      ? ok("T23e 父进程 stderr 转发 raw upstream 端口冲突诊断")
+      : bad("T23e stderr 转发", JSON.stringify({ exit: conflictExit, stdout: conflictStdout.slice(0, 250), stderr: conflictStderr.slice(0, 500) }));
+  } finally {
+    await stopChild(conflictProc, "hosted upstream conflict manager");
+    await closeNetServer(conflictBlocker);
   }
   await startMgr();
 
@@ -1752,7 +1889,7 @@ async function main() {
   }
 
   // ── 汇总 ──
-  console.log(`\n=== summary: ${pass} passed, ${fail} failed, ${known} known-issue ===`);
+  console.log(`\n=== summary: ${pass} passed, ${fail} failed ===`);
   if (failures.length) { console.log("Failures:"); for (const f of failures) console.log(" - " + f.name + ": " + f.detail); }
     process.exitCode = fail ? 1 : 0;
   } finally {

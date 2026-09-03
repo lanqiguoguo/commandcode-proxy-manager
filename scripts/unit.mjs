@@ -4,13 +4,14 @@
 //   stats 保留清理（回放/prune/retention clamp/权限）
 //   logs 持久化 + 上游 proxy 日志捕获（时序/去重/脱敏/src 过滤）
 //   state 防抖写盘 flush 语义（P2-4：立即落盘/幂等/清 timer/未调度 no-op）
-// 用法：node scripts/unit.mjs [quota|pool|stats|logs|state]   （缺省依次全部跑，每场景独立子进程）
-import { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
+//   durable 持久化提交/失败回滚语义（F04）
+// 用法：node scripts/unit.mjs [quota|pool|stats|logs|state|durable]   （缺省依次全部跑，每场景独立子进程）
+import fs, { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const SC = process.argv[2];
-const SCENARIOS = ["quota", "pool", "stats", "logs", "tokens", "state"];
+const SCENARIOS = ["quota", "pool", "stats", "logs", "tokens", "state", "durable"];
 
 if (SC && !SCENARIOS.includes(SC)) {
   console.error(`未知 unit 场景：${SC}。可选值：${SCENARIOS.join(", ")}`);
@@ -478,6 +479,186 @@ if (SC === "state") {
   flushAllPending();
   const saved = readJson("t5.json", null);
   check(saved && saved.backoff === 43, "防抖窗口内 flushAllPending 不丢待写数据（信号路径前提）", JSON.stringify(saved));
+}
+
+// ════ durable（F04 持久化提交边界）════
+if (SC === "durable") {
+  console.log("=== durable write 提交边界 ===");
+  process.env.ADMIN_TOKEN = "unit-admin-token-1234";
+  process.env.CLIENT_TOKEN = "unit-client-token-5678";
+  const { loadConfig, getConfig, saveConfig } = await import("../src/config.mjs");
+  const { writeJson, readJson, debouncedWriter, flushAllPending } = await import("../src/state.mjs");
+  const pool = await import("../src/keyPool.mjs");
+  const { getPersistenceStatus } = await import("../src/persistence.mjs");
+
+  loadConfig();
+  const configPath = DATA + "/config.json";
+  const readConfig = () => JSON.parse(readFileSync(configPath, "utf-8"));
+  const originalWrite = fs.writeFileSync;
+  const originalRename = fs.renameSync;
+  const failOn = (method, suffix, message) => {
+    if (method === "write") {
+      fs.writeFileSync = (...args) => String(args[0]).endsWith(suffix)
+        ? (() => { throw new Error(message); })()
+        : originalWrite(...args);
+    } else {
+      fs.renameSync = (...args) => String(args[0]).endsWith(suffix)
+        ? (() => { throw new Error(message); })()
+        : originalRename(...args);
+    }
+  };
+  const restoreFs = () => {
+    fs.writeFileSync = originalWrite;
+    fs.renameSync = originalRename;
+  };
+  const expectFailure = (fn) => {
+    try { fn(); return null; } catch (e) { return e; }
+  };
+
+  try {
+    check(writeJson("direct.json", { version: 1 }) === true, "writeJson 成功返回 true");
+    check(readJson("direct.json", null).version === 1, "writeJson 成功内容落盘");
+
+    failOn("write", "write-fail.json.tmp", "simulated write failure");
+    const writeFailure = expectFailure(() => writeJson("write-fail.json", { version: 2 }));
+    check(writeFailure && writeFailure.code === "PERSISTENCE_ERROR" && writeFailure.statusCode === 503,
+      "writeFileSync 失败抛出明确 503 持久化错误", String(writeFailure && writeFailure.message));
+    check(!fs.existsSync(DATA + "/write-fail.json") && !fs.existsSync(DATA + "/write-fail.json.tmp"),
+      "writeFileSync 失败不留下目标/临时文件");
+    restoreFs();
+    writeJson("write-fail.json", { version: 2 });
+
+    writeJson("rename-fail.json", { version: 1 });
+    failOn("rename", "rename-fail.json.tmp", "simulated rename failure");
+    const renameFailure = expectFailure(() => writeJson("rename-fail.json", { version: 2 }));
+    check(renameFailure && renameFailure.code === "PERSISTENCE_ERROR" && renameFailure.statusCode === 503,
+      "renameSync 失败抛出明确 503 持久化错误", String(renameFailure && renameFailure.message));
+    check(readJson("rename-fail.json", null).version === 1 && !fs.existsSync(DATA + "/rename-fail.json.tmp"),
+      "renameSync 失败保留旧磁盘内容并清理临时文件");
+    restoreFs();
+    writeJson("rename-fail.json", { version: 2 });
+
+    const diskBeforeConfig = readConfig();
+    const configCandidate = { ...getConfig(), clientToken: "unit-client-token-new" };
+    failOn("write", "config.json.tmp", "simulated config write failure");
+    const configWriteFailure = expectFailure(() => saveConfig(configCandidate));
+    check(configWriteFailure && configWriteFailure.statusCode === 503,
+      "saveConfig writeFileSync 失败返回持久化错误", String(configWriteFailure && configWriteFailure.message));
+    check(getConfig().clientToken === diskBeforeConfig.clientToken && readConfig().clientToken === diskBeforeConfig.clientToken,
+      "saveConfig 失败时内存与磁盘均保持旧配置");
+    restoreFs();
+    saveConfig(getConfig());
+
+    failOn("rename", "config.json.tmp", "simulated config rename failure");
+    const configRenameFailure = expectFailure(() => saveConfig(configCandidate));
+    check(configRenameFailure && configRenameFailure.statusCode === 503,
+      "saveConfig renameSync 失败返回持久化错误", String(configRenameFailure && configRenameFailure.message));
+    check(getConfig().clientToken === diskBeforeConfig.clientToken && readConfig().clientToken === diskBeforeConfig.clientToken && !fs.existsSync(configPath + ".tmp"),
+      "saveConfig rename 失败不切换内存且保留旧磁盘内容");
+    restoreFs();
+    saveConfig(getConfig());
+
+    pool.initKeyPool(getConfig().pool);
+    const first = pool.addKey({ alias: "first", key: "user_unit_first" });
+    const keysBeforeFailure = pool.listKeys();
+    const diskKeysBeforeFailure = JSON.parse(readFileSync(DATA + "/keys.json", "utf-8"));
+    failOn("write", "keys.json.tmp", "simulated keys write failure");
+    const addFailure = expectFailure(() => pool.addKey({ alias: "second", key: "user_unit_second" }));
+    check(addFailure && addFailure.statusCode === 503, "Key 添加失败返回持久化错误", String(addFailure && addFailure.message));
+    check(JSON.stringify(pool.listKeys()) === JSON.stringify(keysBeforeFailure) &&
+      JSON.stringify(JSON.parse(readFileSync(DATA + "/keys.json", "utf-8"))) === JSON.stringify(diskKeysBeforeFailure),
+      "Key 添加失败回滚内存和磁盘快照");
+    restoreFs();
+    writeJson("keys.json", diskKeysBeforeFailure);
+
+    failOn("rename", "keys.json.tmp", "simulated keys rename failure");
+    const updateFailure = expectFailure(() => pool.updateKey(first.id, { alias: "changed" }));
+    check(updateFailure && updateFailure.statusCode === 503, "Key 更新失败返回持久化错误", String(updateFailure && updateFailure.message));
+    check(pool.listKeys().find((k) => k.id === first.id).alias === "first" &&
+      JSON.parse(readFileSync(DATA + "/keys.json", "utf-8")).keys[0].alias === "first",
+      "Key 更新失败回滚内存和磁盘快照");
+    restoreFs();
+    writeJson("keys.json", diskKeysBeforeFailure);
+
+    const readStateHealth = () => (readJson("state.json", { keys: {} }).keys || {})[first.id] || {};
+
+    // Explicit health clears must commit immediately, including when the
+    // preceding health mutation is still inside the debounce window.
+    pool.markAuthError(first.id);
+    const clearAuthResult = pool.clearAuthError(first.id);
+    const authAfterClear = readStateHealth();
+    check(clearAuthResult && clearAuthResult.durable === true, "clear-auth 返回 durable=true");
+    check(authAfterClear.authError === false && authAfterClear.backoffUntilMs === 0,
+      "clear-auth 强制 flush 后 state.json 即时更新", JSON.stringify(authAfterClear));
+    await new Promise((resolveP) => setTimeout(resolveP, 1100));
+    check(readStateHealth().authError === false && readStateHealth().backoffUntilMs === 0,
+      "clear-auth 取消已有 timer 后不回写旧 health", JSON.stringify(readStateHealth()));
+
+    // A failed forced flush restores the clear operation and keeps the prior
+    // pending health snapshot queued for a later successful write.
+    pool.markAuthError(first.id);
+    const authBeforeWriteFailure = pool.getHealth(first.id);
+    failOn("write", "state.json.tmp", "simulated state write failure");
+    const clearAuthWriteFailure = expectFailure(() => pool.clearAuthError(first.id));
+    restoreFs();
+    check(clearAuthWriteFailure && clearAuthWriteFailure.code === "PERSISTENCE_ERROR" && clearAuthWriteFailure.statusCode === 503,
+      "clear-auth write 失败抛出 503 持久化错误", String(clearAuthWriteFailure && clearAuthWriteFailure.message));
+    check(JSON.stringify(pool.getHealth(first.id)) === JSON.stringify(authBeforeWriteFailure),
+      "clear-auth write 失败回滚内存 health", JSON.stringify(pool.getHealth(first.id)));
+    flushAllPending();
+    check(readStateHealth().authError === true && readStateHealth().backoffUntilMs > Date.now(),
+      "clear-auth write 失败后原 pending health 重新排队并可落盘", JSON.stringify(readStateHealth()));
+    pool.clearAuthError(first.id);
+
+    pool.recordTimeout(first.id);
+    flushAllPending();
+    const backoffBeforeRenameFailure = pool.getHealth(first.id);
+    failOn("rename", "state.json.tmp", "simulated state rename failure");
+    const clearBackoffRenameFailure = expectFailure(() => pool.clearBackoff(first.id));
+    restoreFs();
+    check(clearBackoffRenameFailure && clearBackoffRenameFailure.code === "PERSISTENCE_ERROR" && clearBackoffRenameFailure.statusCode === 503,
+      "clear-backoff rename 失败抛出 503 持久化错误", String(clearBackoffRenameFailure && clearBackoffRenameFailure.message));
+    check(JSON.stringify(pool.getHealth(first.id)) === JSON.stringify(backoffBeforeRenameFailure),
+      "clear-backoff rename 失败回滚内存 health", JSON.stringify(pool.getHealth(first.id)));
+    flushAllPending();
+    check(readStateHealth().failCount === backoffBeforeRenameFailure.failCount && readStateHealth().backoffUntilMs === backoffBeforeRenameFailure.backoffUntilMs,
+      "clear-backoff rename 失败后原 pending health 重新排队并可落盘", JSON.stringify(readStateHealth()));
+    const clearBackoffResult = pool.clearBackoff(first.id);
+    check(clearBackoffResult && clearBackoffResult.durable === true && readStateHealth().failCount === 0 && readStateHealth().backoffUntilMs === 0,
+      "clear-backoff 成功后 state.json 即时更新", JSON.stringify(readStateHealth()));
+
+    // The priority update keeps moveKey's success log, but a failed durable
+    // commit must not announce a reorder that was rolled back.
+    const logEvents = [];
+    pool.initKeyPool(getConfig().pool, { emitter: { emit: (type, event) => { if (type === "log") logEvents.push(event); } } });
+    const second = pool.addKey({ alias: "second", key: "user_unit_second" });
+    logEvents.length = 0;
+    pool.updateKey(first.id, { priority: 1 });
+    check(logEvents.some((event) => String(event.msg || "").includes("调整主备顺序")),
+      "priority update durable 成功后记录主备调整日志", JSON.stringify(logEvents));
+    const orderBeforePriorityFailure = pool.listKeys().map((key) => key.id);
+    logEvents.length = 0;
+    failOn("rename", "keys.json.tmp", "simulated priority rename failure");
+    const priorityFailure = expectFailure(() => pool.updateKey(first.id, { priority: 0 }));
+    restoreFs();
+    check(priorityFailure && priorityFailure.statusCode === 503, "priority durable 失败抛出 503", String(priorityFailure && priorityFailure.message));
+    check(JSON.stringify(pool.listKeys().map((key) => key.id)) === JSON.stringify(orderBeforePriorityFailure) &&
+      !logEvents.some((event) => String(event.msg || "").includes("调整主备顺序")),
+      "priority durable 失败回滚顺序且不记录成功日志", JSON.stringify({ order: pool.listKeys().map((key) => key.id), logs: logEvents }));
+    check(second && pool.getKeyRecord(second.id), "priority 日志回归保留 Key 记录");
+    writeJson("keys.json", { keys: pool.listKeys() });
+
+    const writer = debouncedWriter("async.json", () => ({ version: 3 }), 25);
+    const scheduleResult = writer();
+    check(scheduleResult && scheduleResult.scheduled === true && scheduleResult.durable === false,
+      "防抖 schedule 明确标记 scheduled 且未 durable");
+    check(!fs.existsSync(DATA + "/async.json"), "schedule 返回时尚未误报为已落盘");
+    await new Promise((resolveP) => setTimeout(resolveP, 60));
+    check(readJson("async.json", null).version === 3, "防抖 timer 最终真实落盘");
+    check(getPersistenceStatus().available === true, "成功写入恢复持久化健康状态");
+  } finally {
+    restoreFs();
+  }
 }
 
 console.log(`\n=== unit(${SC}) summary: ${pass} passed, ${fail} failed ===`);

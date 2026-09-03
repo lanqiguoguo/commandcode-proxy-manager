@@ -279,14 +279,14 @@ export async function handleAdmin(req, res, url) {
     }
 
     if (parts.length === 5 && parts[2] === "keys" && parts[4] === "clear-auth" && req.method === "POST") {
-      pool.clearAuthError(parts[3]);
-      sendJson(res, 200, { ok: true });
+      const result = pool.clearAuthError(parts[3]);
+      sendJson(res, 200, { ok: true, durable: result?.durable === true });
       return true;
     }
 
     if (parts.length === 5 && parts[2] === "keys" && parts[4] === "clear-backoff" && req.method === "POST") {
-      pool.clearBackoff(parts[3]);
-      sendJson(res, 200, { ok: true });
+      const result = pool.clearBackoff(parts[3]);
+      sendJson(res, 200, { ok: true, durable: result.durable === true });
       return true;
     }
 
@@ -323,9 +323,9 @@ export async function handleAdmin(req, res, url) {
       const body = await readJsonBody(req);
       const patch = sanitizePoolPatch(body || {});
       if (!Object.keys(patch).length) throw new Error("无有效配置项");
-      cfg.pool = { ...cfg.pool, ...patch };
+      const nextCfg = { ...cfg, pool: { ...cfg.pool, ...patch } };
+      saveConfig(nextCfg);
       pool.setPoolCfg(patch);
-      saveConfig();
       if (patch.quotaRefreshMs !== undefined) quota.setRefreshMs(patch.quotaRefreshMs);
       if (patch.historyRetentionDays !== undefined) {
         stats.setRetention(patch.historyRetentionDays);
@@ -337,15 +337,16 @@ export async function handleAdmin(req, res, url) {
 
     if (p === "/admin/api/security" && req.method === "POST") {
       const body = await readJsonBody(req);
+      const nextCfg = { ...cfg };
       if (body.clientToken !== undefined) {
-        cfg.clientToken = String(body.clientToken).slice(0, 128);
+        nextCfg.clientToken = String(body.clientToken).slice(0, 128);
       }
       if (body.adminToken !== undefined) {
         const t = String(body.adminToken).trim();
         if (t.length < 8) throw new Error("AdminToken 至少 8 位");
-        cfg.adminToken = t;
+        nextCfg.adminToken = t;
       }
-      saveConfig();
+      saveConfig(nextCfg);
       sendJson(res, 200, { ok: true });
       return true;
     }
@@ -392,7 +393,10 @@ export async function handleAdmin(req, res, url) {
     sendJson(res, 404, { error: { message: "Not found", type: "not_found" } });
     return true;
   } catch (e) {
-    sendJson(res, 400, { error: { message: e.message, type: "invalid_request_error" } });
+    const persistenceFailure = e.code === "PERSISTENCE_ERROR" || e.persistence === true;
+    const status = persistenceFailure ? 503 : 400;
+    const type = persistenceFailure ? "persistence_error" : "invalid_request_error";
+    sendJson(res, status, { error: { message: e.message, type } });
     return true;
   }
 }

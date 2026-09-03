@@ -1,8 +1,9 @@
 // ── 管理端配置加载（config.json 位于 DATA_DIR；基础设施 env 覆写磁盘，
 //    令牌 env 仅在磁盘无值时初始化填充——磁盘凭证优先，防改密后被 env 回滚） ─────
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync } from "fs";
+import fs from "fs";
 import { resolve } from "path";
 import crypto from "crypto";
+import { markPersistenceFailure, markPersistenceSuccess, persistenceError } from "./persistence.mjs";
 
 export const DATA_DIR = process.env.DATA_DIR
   ? resolve(process.env.DATA_DIR)
@@ -37,16 +38,36 @@ const DEFAULTS = {
 
 let cfg = null;
 
+function checkDataDirWritable() {
+  const probe = resolve(DATA_DIR, ".ccpm-write-check-" + process.pid + "-" + Date.now() + "-" + crypto.randomBytes(6).toString("hex"));
+  const tmp = probe + ".tmp";
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(tmp, "ok", { flag: "wx", mode: 0o600 });
+    fs.renameSync(tmp, probe);
+    fs.unlinkSync(probe);
+    markPersistenceSuccess("data-dir");
+    return true;
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    try { fs.unlinkSync(probe); } catch {}
+    const failure = persistenceError("[config] DATA_DIR is not writable", e);
+    markPersistenceFailure(failure, "data-dir");
+    console.error(failure.message);
+    return false;
+  }
+}
+
 export function loadConfig() {
-  mkdirSync(DATA_DIR, { recursive: true });
+  checkDataDirWritable();
   const path = resolve(DATA_DIR, "config.json");
   const data = JSON.parse(JSON.stringify(DEFAULTS));
   // P2-1：解析失败先把损坏文件备份为 config.json.corrupt-<ts> 再落默认值，
   // 防止结尾 saveConfig() 用默认/新生成凭证原子覆盖磁盘导致旧凭证永久丢失（锁死）。
   let configCorrupt = false;
-  if (existsSync(path)) {
+  if (fs.existsSync(path)) {
     try {
-      const user = JSON.parse(readFileSync(path, "utf-8"));
+      const user = JSON.parse(fs.readFileSync(path, "utf-8"));
       for (const k of Object.keys(user)) {
         if (k === "pool") Object.assign(data.pool, user.pool || {});
         else data[k] = user[k];
@@ -58,7 +79,7 @@ export function loadConfig() {
     if (configCorrupt) {
       const backup = path + ".corrupt-" + Date.now();
       try {
-        renameSync(path, backup);
+        fs.renameSync(path, backup);
         console.warn("[config] config.json 解析失败，已备份为 " + backup.split("/").pop() + "，本次以默认值启动");
       } catch (be) {
         // 备份失败也不能崩：继续用默认值启动，但明确警告凭证可能丢失
@@ -95,19 +116,34 @@ export function loadConfig() {
     console.log("============================================================");
   }
   cfg = data;
-  saveConfig();
+  try {
+    saveConfig();
+  } catch (e) {
+    // Keep the in-memory config available so the server can expose a degraded
+    // health response and reject mutating admin calls with 503.
+    console.error("[config] initial save unavailable:", e.message);
+  }
   return cfg;
 }
 
 export function getConfig() { return cfg; }
 
-export function saveConfig() {
-  if (!cfg) return;
+export function saveConfig(nextCfg = cfg) {
+  if (!nextCfg || typeof nextCfg !== "object") throw new Error("配置尚未加载");
+  const path = resolve(DATA_DIR, "config.json");
+  const tmp = path + ".tmp";
   try {
-    const path = resolve(DATA_DIR, "config.json");
-    writeFileSync(path + ".tmp", JSON.stringify(cfg, null, 2), { mode: 0o600 });
-    renameSync(path + ".tmp", path);
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(nextCfg, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, path);
+    cfg = nextCfg;
+    markPersistenceSuccess("config");
+    return true;
   } catch (e) {
-    console.error("[config] save failed:", e.message);
+    try { fs.unlinkSync(tmp); } catch {}
+    const failure = persistenceError("[config] save failed", e);
+    markPersistenceFailure(failure, "config");
+    console.error(failure.message);
+    throw failure;
   }
 }

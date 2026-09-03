@@ -48,7 +48,24 @@ function emitLog(msg) {
   if (emitter) emitter.emit("log", { ts: Date.now(), level: "info", msg });
 }
 
-function persistKeys() { writeJson("keys.json", { keys }); }
+function persistKeys() { return writeJson("keys.json", { keys }); }
+
+function snapshotKeys() { return keys.map((k) => ({ ...k })); }
+
+function commitHealthChange(id, mutate) {
+  const h = health.get(id);
+  if (!h) return { durable: true, changed: false };
+  const before = { ...h };
+  mutate(h);
+  try {
+    const result = persistState.flush({ force: true });
+    if (!result || result.durable !== true) throw new Error("健康状态未完成 durable flush");
+    return { durable: true, changed: JSON.stringify(before) !== JSON.stringify(h) };
+  } catch (e) {
+    Object.assign(h, before);
+    throw e;
+  }
+}
 
 export function getPoolCfg() { return { ...poolCfg }; }
 export function setPoolCfg(c) { poolCfg = { ...poolCfg, ...c }; }
@@ -75,8 +92,14 @@ export function addKey({ alias = "", key = "", note = "" }) {
     createdAt: Date.now(),
     priority: keys.length
   };
+  const before = snapshotKeys();
   keys.push(rec);
-  persistKeys();
+  try {
+    persistKeys();
+  } catch (e) {
+    keys = before;
+    throw e;
+  }
   health.set(rec.id, {
     backoffUntilMs: 0, failCount: 0, authError: false,
     quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false,
@@ -89,32 +112,65 @@ export function addKey({ alias = "", key = "", note = "" }) {
 export function updateKey(id, patch) {
   const rec = keys.find((k) => k.id === id);
   if (!rec) throw new Error("Key 不存在");
-  if (patch.alias !== undefined) rec.alias = String(patch.alias).slice(0, 64);
-  if (patch.note !== undefined) rec.note = String(patch.note).slice(0, 256);
-  if (patch.enabled !== undefined) rec.enabled = !!patch.enabled;
-  if (patch.priority !== undefined) moveKey(id, Number(patch.priority));
-  persistKeys();
+  const before = snapshotKeys();
+  let movedRecord = null;
+  let movedTargetIndex = null;
+  try {
+    if (patch.alias !== undefined) rec.alias = String(patch.alias).slice(0, 64);
+    if (patch.note !== undefined) rec.note = String(patch.note).slice(0, 256);
+    if (patch.enabled !== undefined) rec.enabled = !!patch.enabled;
+    if (patch.priority !== undefined) {
+      const i = keys.findIndex((k) => k.id === id);
+      const targetIndex = Math.max(0, Math.min(keys.length - 1, Number(patch.priority)));
+      [movedRecord] = keys.splice(i, 1);
+      keys.splice(targetIndex, 0, movedRecord);
+      keys.forEach((k, idx) => { k.priority = idx; });
+      movedTargetIndex = targetIndex;
+    }
+    persistKeys();
+  } catch (e) {
+    keys = before;
+    throw e;
+  }
+  if (movedRecord) {
+    emitLog("调整主备顺序: " + (movedRecord.alias || maskKey(movedRecord.key)) + " -> 第 " + (movedTargetIndex + 1) + " 位");
+  }
   return rec;
 }
 
 export function moveKey(id, targetIndex) {
   const i = keys.findIndex((k) => k.id === id);
   if (i < 0) throw new Error("Key 不存在");
-  targetIndex = Math.max(0, Math.min(keys.length - 1, targetIndex));
-  const [rec] = keys.splice(i, 1);
-  keys.splice(targetIndex, 0, rec);
-  keys.forEach((k, idx) => { k.priority = idx; });
-  persistKeys();
-  emitLog("调整主备顺序: " + (rec.alias || maskKey(rec.key)) + " -> 第 " + (targetIndex + 1) + " 位");
+  const before = snapshotKeys();
+  let movedRecord;
+  try {
+    targetIndex = Math.max(0, Math.min(keys.length - 1, targetIndex));
+    [movedRecord] = keys.splice(i, 1);
+    keys.splice(targetIndex, 0, movedRecord);
+    keys.forEach((k, idx) => { k.priority = idx; });
+    persistKeys();
+  } catch (e) {
+    keys = before;
+    throw e;
+  }
+  emitLog("调整主备顺序: " + (movedRecord.alias || maskKey(movedRecord.key)) + " -> 第 " + (targetIndex + 1) + " 位");
 }
 
 export function removeKey(id) {
   const i = keys.findIndex((k) => k.id === id);
   if (i < 0) throw new Error("Key 不存在");
+  const before = snapshotKeys();
+  const healthBefore = new Map([...health.entries()].map(([keyId, h]) => [keyId, { ...h }]));
   const [rec] = keys.splice(i, 1);
   keys.forEach((k, idx) => { k.priority = idx; });
   health.delete(id);
-  persistKeys();
+  try {
+    persistKeys();
+  } catch (e) {
+    keys = before;
+    health = healthBefore;
+    throw e;
+  }
   if (persistState) persistState();
   emitLog("删除 Key: " + maskKey(rec.key));
 }
@@ -165,12 +221,13 @@ export function markAuthError(id) {
 }
 
 export function clearAuthError(id) {
-  const h = health.get(id);
-  if (!h) return;
-  h.authError = false;
-  h.backoffUntilMs = 0;
-  persistState();
+  if (!health.has(id)) return;
+  const result = commitHealthChange(id, (h) => {
+    h.authError = false;
+    h.backoffUntilMs = 0;
+  });
   emitLog("Key " + id + " 认证异常已清除");
+  return result;
 }
 
 // 管理端手动清除 429/超时退避（H2）：只清 backoffUntilMs 与 failCount，
@@ -179,10 +236,12 @@ export function clearAuthError(id) {
 export function clearBackoff(id) {
   const h = health.get(id);
   if (!h) throw new Error("Key 不存在");
-  h.backoffUntilMs = 0;
-  h.failCount = 0;
-  persistState();
+  const result = commitHealthChange(id, (healthState) => {
+    healthState.backoffUntilMs = 0;
+    healthState.failCount = 0;
+  });
   emitLog("Key " + id + " 退避已手动清除");
+  return result;
 }
 
 export function setQuotaLimited(id, untilMs, reason) {

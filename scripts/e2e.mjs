@@ -129,7 +129,7 @@ function reservePort() {
   });
 }
 async function allocatePorts() {
-  const names = ["manager", "mock", "corrupt", "tokenKeep", "embedded", "embeddedUpstream"];
+  const names = ["manager", "mock", "corrupt", "tokenKeep", "readonly", "embedded", "embeddedUpstream"];
   const used = new Set();
   const ports = {};
   for (const name of names) {
@@ -651,9 +651,19 @@ async function main() {
   await mock("/__reset");
   r = await gw({ model: "m-fallback", messages: [] });
   r.status === 200 ? ok("authError Key 被跳过，流量走 keyB") : bad("authError 跳过", "status=" + r.status);
-  await admin("/admin/api/keys/" + kA.id + "/clear-auth", "POST");
+  const clearAuthResponse = await admin("/admin/api/keys/" + kA.id + "/clear-auth", "POST");
   ks = await keysList();
-  !ks.find((k) => k.alias === "keyA").health.authError ? ok("clear-auth 恢复") : bad("clear-auth", "");
+  const clearAuthKey = ks.find((k) => k.alias === "keyA");
+  const clearAuthState = JSON.parse(readFileSync(resolve(DATA, "state.json"), "utf-8")).keys[clearAuthKey.id] || {};
+  clearAuthResponse.status === 200 && JSON.parse(clearAuthResponse.body).durable === true && !clearAuthKey.health.authError
+    ? ok("clear-auth 恢复且响应声明 durable") : bad("clear-auth", JSON.stringify({ response: clearAuthResponse, health: clearAuthKey.health }));
+  clearAuthState.authError === false && clearAuthState.backoffUntilMs === 0
+    ? ok("clear-auth 成功后 state.json 即时更新") : bad("clear-auth state", JSON.stringify(clearAuthState));
+
+  const clearBackoffResponse = await admin("/admin/api/keys/" + kA.id + "/clear-backoff", "POST");
+  const clearBackoffState = JSON.parse(readFileSync(resolve(DATA, "state.json"), "utf-8")).keys[clearAuthKey.id] || {};
+  clearBackoffResponse.status === 200 && JSON.parse(clearBackoffResponse.body).durable === true && clearBackoffState.failCount === 0 && clearBackoffState.backoffUntilMs === 0
+    ? ok("clear-backoff 成功后 state.json 即时更新") : bad("clear-backoff state", JSON.stringify({ response: clearBackoffResponse, state: clearBackoffState }));
 
   // ── T7 零输出 → 同 Key 重试（决策 8）──
   console.log("\n=== T7 zero output ===");
@@ -937,6 +947,11 @@ async function main() {
   await admin("/admin/api/pool", "PUT", { strategy: "active-standby" });
   const cfgJ = JSON.parse(readFileSync(resolve(DATA, "config.json"), "utf-8"));
   cfgJ.pool.maxRetries === 3 && cfgJ.pool.strategy === "active-standby" ? ok("设置持久化 config.json") : bad("设置持久化", JSON.stringify(cfgJ.pool));
+  await restartClean();
+  r = await admin("/admin/api/pool");
+  const poolAfterRestart = parseJsonResponse(r, "T15 restart pool").poolCfg || {};
+  r.status === 200 && poolAfterRestart.maxRetries === 3 && poolAfterRestart.strategy === "active-standby"
+    ? ok("T15 重启后 pool 配置从磁盘恢复") : bad("T15 pool 重启", JSON.stringify({ status: r.status, pool: poolAfterRestart }));
 
   // ── T16 security：clientToken 修改即时生效 / AdminToken 回退 / 长度校验 ──
   console.log("\n=== T16 security ===");
@@ -951,6 +966,22 @@ async function main() {
   r.status === 401 ? ok("旧 clientToken 立即失效") : bad("旧 token", "status=" + r.status);
   r = await gw({ model: "m-x", messages: [] }, "new-cli-tok");
   r.status === 200 ? ok("新 clientToken 立即生效") : bad("新 token", "status=" + r.status);
+  await restartClean();
+  r = await gw({ model: "m-client-restart", messages: [] }, "new-cli-tok");
+  r.status === 200 ? ok("T16 clientToken 重启后仍有效（已从磁盘提交）") : bad("clientToken 重启", "status=" + r.status);
+  r = await gw({ model: "m-client-old", messages: [] }, CLIENT);
+  r.status === 401 ? ok("T16 重启后旧 clientToken 仍失效") : bad("旧 clientToken 重启", "status=" + r.status);
+  const ADMIN_F04 = "e2e-f04-admin-token-9x";
+  r = await admin("/admin/api/security", "POST", { adminToken: ADMIN_F04 });
+  r.status === 200 ? ok("T16 AdminToken 更新返回 200") : bad("AdminToken 更新", "status=" + r.status);
+  await restartClean();
+  r = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: ADMIN_F04 }));
+  r.status === 200 ? ok("T16 AdminToken 重启后新令牌有效") : bad("AdminToken 重启", "status=" + r.status);
+  r = await http1(MG + "/admin/api/login", "POST", { "Content-Type": "application/json" }, JSON.stringify({ token: ADMIN }));
+  r.status === 401 ? ok("T16 AdminToken 重启后旧令牌失效") : bad("旧 AdminToken 重启", "status=" + r.status);
+  r = await http1(MG + "/admin/api/security", "POST", { "X-Admin-Token": ADMIN_F04, "Content-Type": "application/json" }, JSON.stringify({ adminToken: ADMIN }));
+  r.status === 200 ? ok("T16 恢复测试 AdminToken") : bad("恢复 AdminToken", "status=" + r.status);
+  await restartClean();
   await admin("/admin/api/security", "POST", { clientToken: CLIENT });
 
   // ── T17 管理 API 鉴权隔离 ──
@@ -1281,6 +1312,54 @@ async function main() {
     await stopChild(embProc, "embedded manager");
   }
   await startMgr();
+
+  // ── T24 F04 只读数据目录：服务明确降级，管理写入不得假成功 ──
+  console.log("\n=== T24 durable persistence unavailable ===");
+  const readOnlyUrl = testUrl(TEST_PORTS.readonly);
+  const readOnlyAdmin = "e2e-readonly-admin-1234";
+  const readOnlyProc = spawnNode([resolve(ROOT, "src/server.mjs")], {
+    ...process.env, DATA_DIR: "/proc", PORT: String(TEST_PORTS.readonly), HOST,
+    UPSTREAM_HOST: HOST, UPSTREAM_PORT: String(TEST_PORTS.mock), EMBED_UPSTREAM: "0",
+    ADMIN_TOKEN: readOnlyAdmin, CLIENT_TOKEN: "e2e-readonly-client-1234", CC_QUOTA_BASE: UP
+  });
+  try {
+    let readOnlyHealth = null;
+    for (let i = 0; i < 80; i++) {
+      try {
+        const rr = await http1(readOnlyUrl + "/health", "GET", {});
+        if (rr.status === 503) { readOnlyHealth = rr; break; }
+      } catch {}
+      await sleep(100);
+    }
+    const healthPayload = readOnlyHealth ? parseJsonResponse(readOnlyHealth, "T24 health") : null;
+    readOnlyHealth && healthPayload && healthPayload.ok === false && healthPayload.persistence && healthPayload.persistence.available === false
+      ? ok("T24 只读 DATA_DIR health=503 且明确 persistence unavailable")
+      : bad("T24 只读 health", JSON.stringify({ response: readOnlyHealth, payload: healthPayload }));
+
+    const readOnlyHeaders = { "X-Admin-Token": readOnlyAdmin, "Content-Type": "application/json" };
+    r = await http1(readOnlyUrl + "/admin/api/keys", "POST", readOnlyHeaders, JSON.stringify({ alias: "readonly", key: "user_readonly" }));
+    let roKeys = null;
+    try { roKeys = parseJsonResponse(r, "T24 keys"); } catch {}
+    r.status === 503 && roKeys && roKeys.error && roKeys.error.type === "persistence_error"
+      ? ok("T24 Key 写入失败返回 503 persistence_error")
+      : bad("T24 Key 写入", JSON.stringify({ status: r.status, body: r.body }));
+
+    r = await http1(readOnlyUrl + "/admin/api/pool", "PUT", readOnlyHeaders, JSON.stringify({ maxRetries: 4 }));
+    let roPool = null;
+    try { roPool = parseJsonResponse(r, "T24 pool"); } catch {}
+    r.status === 503 && roPool && roPool.error && roPool.error.type === "persistence_error"
+      ? ok("T24 pool 写入失败返回 503 persistence_error")
+      : bad("T24 pool 写入", JSON.stringify({ status: r.status, body: r.body }));
+
+    r = await http1(readOnlyUrl + "/admin/api/security", "POST", readOnlyHeaders, JSON.stringify({ clientToken: "readonly-new" }));
+    let roSecurity = null;
+    try { roSecurity = parseJsonResponse(r, "T24 security"); } catch {}
+    r.status === 503 && roSecurity && roSecurity.error && roSecurity.error.type === "persistence_error"
+      ? ok("T24 token 写入失败返回 503 persistence_error")
+      : bad("T24 token 写入", JSON.stringify({ status: r.status, body: r.body }));
+  } finally {
+    await stopChild(readOnlyProc, "read-only manager");
+  }
 
   // ── 汇总 ──
   console.log(`\n=== summary: ${pass} passed, ${fail} failed, ${known} known-issue ===`);

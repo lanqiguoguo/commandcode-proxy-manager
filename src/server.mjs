@@ -12,6 +12,7 @@ import { initLogs, attachConsoleCapture } from "./logs.mjs";
 import { handleGateway } from "./gateway.mjs";
 import { initAdminApi, handleAdmin, isAdminRequestAuthed } from "./adminApi.mjs";
 import { flushAllPending } from "./state.mjs";
+import { getPersistenceStatus } from "./persistence.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -102,6 +103,19 @@ const server = http.createServer(async (req, res) => {
         });
         ok = r.ok;
       } catch {}
+      const persistence = getPersistenceStatus();
+      if (!persistence.available) {
+        res.writeHead(503, {
+          "Content-Type": "application/json",
+          "X-Persistence-Status": "unavailable"
+        });
+        res.end(JSON.stringify({
+          ok: false,
+          upstream: ok,
+          persistence: { available: false, error: persistence.error }
+        }));
+        return;
+      }
       res.writeHead(ok ? 200 : 502, { "Content-Type": "text/plain" });
       res.end(ok ? "OK" : "UPSTREAM_DOWN");
       return;

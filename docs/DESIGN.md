@@ -1,313 +1,417 @@
-# commandcode-proxy-manager —— 独立多 Key 管理项目（上游 commandcode-proxy 打包进 Docker 镜像）
+# commandcode-proxy-manager 设计
 
-> 上游项目：[MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)（master, f7b81af，单文件零依赖 Node 反代）
-> 版本：v3.1（10 项决策，本仓库已按此实施）
+本文记录当前实现的边界和运行契约。项目把原始 `commandcode-proxy` 文件 vendored 到
+`upstream/`，用 manager 提供多 Key 管理能力；两部分通过 HTTP 和进程边界协作。
 
-## 0. 决策记录（需求方已确认）
+## 1. 目标和边界
 
-| # | 决策 | 落实位置 |
-|---|---|---|
-| 1 | **clientToken 必须开启**；未配置时回退使用 **AdminToken** 作为客户端访问令牌 | §4.2、§6 设置 |
-| 2 | **退避结合 5h/每周/美元额度**：额度接近上限/耗尽时提前限制该 Key 出流量（额度感知退避） | §5.2 |
-| 3 | 上游采用 **vendored 方案**（同步进仓库，随镜像打包，构建期零网络） | §7.1 |
-| 4 | **上游发布正式版（v* tag）自动触发**重新同步并发布镜像；说明 repository_dispatch 的现实约束与等效方案 | §7.2 |
-| 5 | **主备模式**规避多 Key 轮换风控：主 Key 额度用完/退避才切换备用 Key，任一时刻单一活跃 Key | §5.1 |
-| 6 | **退避状态/用量统计重启不清零**：持久化到 /data；统计按 5h/每周/每月窗口 | §5.3 |
-| 7 | **每 Key 历史记录展示**（请求明细/失败/用量，可筛选） | §5.4、§6 历史页 |
-| 8 | **429/402/零输出先同 Key 多试几次**，确属持续限流才退避/切换，避免瞬时异常误判 | §5.2-A |
-| 9 | **历史记录默认保留 7 天**，可配置 1 天～1 月 | §5.3、§6 设置 |
-| 10 | **每天轮询上游正式版**即可（替代高频轮询） | §7.2 |
+manager 的职责是：
 
----
+- 提供 `/v1/chat/completions`、`/v1/messages`、`/v1/models`、`/health` 和管理面；
+- 校验客户端令牌，选择池内 Key，并在响应头或 body 尚未向客户端输出前执行有界重试；
+- 管理 429/402/零输出/超时退避、额度限制、统计和持久化；
+- 在托管模式中启动、等待、监控和停止 raw upstream 子进程。
 
-## 1. 为什么采用“独立项目 + 镜像打包上游”
+raw upstream 的职责是：
 
-| 方案 | 说明 | 结论 |
-|---|---|---|
-| A. 直接改上游 proxy.mjs | 在 2056 行单文件里加 Key 池/退避/管理 API/前端托管 | 破坏上游“单文件、零依赖、随上游走”的哲学；每次上游更新都要合代码，维护成本高 |
-| **B. 独立管理项目，镜像内打包上游（已采用）** | 管理项目 = 网关（主备 Key + 429/额度退避）+ 额度采集 + 管理 API + 前端；上游 proxy.mjs 原样作为内部组件被同进程加载，**零改动、零 fork** | 上游更新只需重新同步打包发镜像；管理逻辑与上游完全解耦；镜像单进程、单容器，部署简单 |
+- 将 OpenAI/Anthropic 请求转换为 Command Code API 请求并转换响应；
+- 维护原始版本的初始化并发、指纹、会话和版本刷新行为；
+- 处理其自身的请求体上限、模型列表、超时和原始 API 日志。
 
-**已验证的关键前提**：上游 proxy.mjs 无 process.exit、无磁盘写入（只读 config.json）、顶层仅 server.listen()（L2045）+ 一个 unhandledRejection 监听——因此管理进程可 `await import("./upstream/proxy.mjs")` **同进程嵌入**，天然共享生命周期与信号处理，无需 supervisord。
+manager 不把这些上游行为复制到自己的状态机，也不在同步时改写
+`upstream/proxy.mjs`。
 
----
+## 2. 代码和发布物
 
-## 2. 上游项目现状要点（与需求相关）
-
-| 能力 | 位置 | 与本项目的关系 |
-|---|---|---|
-| 鉴权 = 每请求 header 透传 Key | getApiKey() L809 | 管理网关替客户端注入池内 Key，直接复用 |
-| 429 原样转发给客户端（带 Retry-After），代理自身不重试 | mapCcError() L716 | 管理网关负责拦截 429 并换 Key 重试 |
-| 会话/指纹已按 Key 隔离（per-key fingerprint + 12h session） | sessionStore/keyStateStore L170-294 | 换 Key 无需重做协议握手；主备回切 12h 内零成本 |
-| 流式延迟写 200 头（started 标志） | L944 | 零输出/限流时上游返回**非 200 JSON** 而非半截流，管理网关可在“未写头前”安全换 Key 重试 |
-| 零输出防护（outputTokens=0 → 429） | L1005/1151 等 | 零输出 429 也作为“退避/切换”信号 |
-| 动态模型列表 /provider/v1/models | fetchModels() L1943 | 网关 /v1/models 直接透传上游即可 |
-| 日志隐私（不含 Key 明文） | log() L156 | 管理侧沿用同一原则 |
-
----
-
-## 3. 关键情报：Command Code 官方额度 API（已实测存活）
-
-管理项目直接以池内 Key 探测（仅需 `Authorization: Bearer <user_key>` 头，参照 [opencodex quota 实现](https://github.com/lidge-jun/opencodex/commit/e6354c2090e7c35af0663529af0b7ea69ce12e6c)）：
-
-| 端点 | 用途 | 响应要点 |
-|---|---|---|
-| GET /alpha/whoami | 组织信息 | { org: { id } }（团队订阅需 orgId 作用域） |
-| GET /alpha/billing/credits?orgId=… | 滚动窗口 + 信用池 | data.credits: { monthlyCredits, purchasedCredits, freeCredits }；data.windowLimits: { fiveHour: {cap,used,resetAt}, weekly: {cap,used,resetAt}, exceeded, limited } |
-| GET /alpha/billing/subscriptions?orgId=… | 订阅周期 | data: { currentPeriodStart, currentPeriodEnd, planId } |
-| GET /alpha/usage/summary?orgId=…&since=<periodStart> | 周期花费 | data: { totalCost | totalMonthlyCredits } |
-
-**计算规则（沿用 opencodex 归一化，避免踩坑）**：
-
-- fiveHourPercent = used/cap*100；weeklyPercent 同理；缺 cap/used 则不展示。
-- creditsUsd：remaining = Σmax(0, monthly+purchased+free)；used = totalCost；limit = used+remaining；percent = used/limit*100。
-- 陷阱 1：无 currentPeriodStart 时不展示 creditsUsd（裸 usage/summary 是终身累计）。
-- 陷阱 2：存在可滚动 purchasedCredits 时不展示订阅到期时间。
-- 陷阱 3：区分“字段缺失”与“值为 0”——全 0 也要显示 remaining=0。
-- 端点非文档化，采集必须软失败：失败保留上次成功值并标记 stale，绝不阻塞推理主链路。
-
----
-
-## 4. 新项目架构（独立仓库 + 单容器单进程）
-
-### 4.1 仓库结构（新仓库：commandcode-proxy-manager）
-
-```
+```text
 commandcode-proxy-manager/
-├── package.json            # start / dev / sync:upstream / docker:build
-├── src/
-│   ├── server.mjs          # 入口：设置上游 env → import 上游 → 启动管理 HTTP 服务
-│   ├── gateway.mjs         # /v1/chat/completions · /v1/messages · /v1/models 透传 + 主备切换/重试
-│   ├── keyPool.mjs         # Key 池：keys.json 持久化、主备顺序、退避状态机（含额度感知）
-│   ├── quota.mjs           # 官方额度探测（whoami/billing/usage）+ TTL 缓存 + 定时刷新
-│   ├── stats.mjs           # 用量统计：stats.jsonl 追加日志 + 5h/周/月窗口聚合 + 历史查询
-│   ├── state.mjs           # 持久化：keys.json / state.json / quota-cache.json 原子读写
-│   ├── adminApi.mjs        # 管理 REST API + SSE 事件流
-│   └── config.mjs          # 管理端配置（config.json + 环境变量）
-├── web/                    # 零构建 SPA：index.html · app.mjs · style.css
-├── upstream/               # 上游 vendored 副本（sync 脚本维护，随仓库提交）
-│   └── proxy.mjs / config.json / package.json
-├── scripts/
-│   └── sync-upstream.sh    # 拉上游 master → 拷贝到 upstream/ → 记录 tag+commit 到 UPSTREAM_VERSION
-├── UPSTREAM_VERSION        # 当前捆绑的上游 tag + commit
-├── Dockerfile              # 构建期零网络，最终 node:22-alpine 单进程
-├── docker-compose.yml      # 端口 + /data 卷（全部持久化数据）
-└── README.md
+├── src/server.mjs             manager 入口、托管模式 bootstrap 和信号处理
+├── src/upstreamProcess.mjs    raw upstream spawn、health、日志和停止控制
+├── src/serverLifecycle.mjs    manager 监听、排空和强制关闭
+├── src/gateway.mjs            鉴权后转发、流式校验、重试和统计
+├── src/config.mjs             manager config.json 和基础设施环境变量
+├── src/keyPool.mjs            Key 顺序、退避、额度限制和健康状态
+├── src/quota.mjs              whoami/billing/usage 额度探测
+├── src/adminApi.mjs           管理 REST API、SSE 和安全 cookie
+├── src/logs.mjs               manager/raw upstream 日志捕获和持久化
+├── web/                       零构建管理界面
+├── upstream/                  原始 vendored 文件
+├── scripts/sync-upstream.sh   同步和逐字节校验
+├── Dockerfile                 manager 容器入口
+└── docker-compose.yml         manager 端口和 /data 卷
 ```
 
-### 4.2 运行时拓扑与鉴权（单容器、单 Node 进程）
+`UPSTREAM_VERSION` 记录当前来源版本。镜像构建时复制 raw upstream 文件，构建期不需要
+访问上游网络。
 
-```
-                    ┌────────────── container (node:22-alpine, 单进程) ──────────────┐
- OpenAI SDK ─────► │  管理网关 :3080 (EXPOSE)                                       │
- Anthropic SDK ──► │   /v1/chat/completions · /v1/messages · /v1/models · /health   │
- Browser ────────► │   /admin (SPA) · /admin/api/* (REST + SSE)                     │
-                   │        │                                                       │
-                   │        ▼ http://127.0.0.1:3050（内部端口，不对外）              │
-                   │  上游 proxy.mjs（动态 import 嵌入，零改动）                     │
-                   │        │ Bearer <池内 Key>                                     │
-                   │        ▼                                                     │
-                   │   api.commandcode.ai  /alpha/generate（推理主链路）              │
-                   │   api.commandcode.ai  /alpha/whoami·billing·usage（额度探测）    │
-                   └────────────────────────────────────────────────────────────────┘
-```
+## 3. 运行时拓扑
 
-1. **入口 server.mjs**：先 `process.env.PORT=3050; process.env.HOST=127.0.0.1`，再 `await import("./upstream/proxy.mjs")` 启动上游（内部端口仅本容器可达），随后启动管理 HTTP 服务（公共端口 3080，env 可改）。单进程 → 信号/日志/健康检查统一。
-2. **网关零协议转换**：管理网关只做“鉴权 + 选 Key + 转发 + 退避/重试 + 透传”，OpenAI/Anthropic 协议转换、指纹、会话全部交给上游完成，**上游零改动、零 fork**。
-3. **客户端鉴权（决策 1）**：/v1/* 一律要求 `Authorization: Bearer <token>`——token 取值优先级：`clientToken`（必须配置）→ 未配置时回退 `AdminToken`。网关校验通过后**剥离客户端 token**，替换为池内 Key 再转发上游，客户端永远接触不到 user_ Key。管理端 /admin/api/* 仍只认 AdminToken。
-4. **持久化（决策 6）**：/data 卷存放 keys.json、state.json（退避/健康）、quota-cache.json（额度快照）、stats.jsonl（请求历史，见 §5.3），重启全部保留。
-
----
-
-## 5. 核心机制设计
-
-### 5.1 主备 Key 池（决策 5，替代轮询式轮换）
-
-- **排序**：keys.json 中维护显式优先级列表（前端可拖拽排序），第 1 位 = 主 Key，其余按序为备 Key。
-- **选 Key 规则**：总是选择“优先级最高且可用”的 Key；任一时刻对外只呈现**单一活跃 Key**（单账号特征，规避多账号并发风控）。
-- **切换触发**（满足其一即降级到下一备 Key）：
-  1. 主 Key 触发 429/402/零输出 → 进入退避（§5.2）；
-  2. 主 Key 额度窗口触达硬阈值（5h ≥90% / 周 ≥90% / 美元 remaining ≤0，阈值可配，§5.2）；
-  3. 主 Key 认证失败（401/403）→ 标记异常，停止自动切换（需人工处理）。
-- **回切**：主 Key 退避到期或额度窗口重置（resetAt）后自动恢复主位；回切 12h 内复用上游已缓存的会话/指纹，零协议成本。
-- **切换冷却**：failoverCooldownMs（默认 10min）内不重复切换（防止抖动）；前端展示每 Key 切换/回切次数与时间。
-- 保留 round-robin / least-usage 作为可选策略（高级设置），默认主备。
-
-### 5.2 429 退避 + 额度感知限制（决策 2）
-
-```
-                     ┌──────────┐   429/402/零输出/超时        ┌──────────────┐
-   成功/窗口重置 ────►│  healthy  │ ──────────────────────────► │  backing_off  │
-                     └──────────┘                              └──────────────┘
-                        ▲                                            │
-                        │              退避到期 / 额度窗口 resetAt       │
-                        └────────────────────────────────────────────┘
-                    额度硬阈值触发时直接进入 quota_limited（视同退避至 resetAt）
+```text
+                         container
+┌────────────────────────────────────────────────────────────────┐
+│  manager: node src/server.mjs                                  │
+│  HOST:PORT                                                     │
+│      │                                                         │
+│      │ HTTP: /v1/*、/admin、/health                            │
+│      ▼                                                         │
+│  raw upstream: process.execPath proxy.mjs                      │
+│  cwd=upstream, HOST=127.0.0.1, PORT=UPSTREAM_PORT              │
+│      │                                                         │
+│      ▼                                                         │
+│  api.commandcode.ai                                             │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-**A. 429/超时退避**：
+这是单容器内的两个独立进程。`3050` 是默认的 raw upstream 内部端口，Dockerfile 和
+Compose 都不会把它映射到宿主机；公共入口是 manager 的 `PORT`，默认 `3080`。
 
-- 退避时长：优先上游 Retry-After（429 默认 30s / 零输出 10s / 超时 5s），否则 min(backoffMaxMs, backoffBaseMs × 2^failCount) 指数退避 + ±20% 抖动。
-- **同 Key 重试（决策 8）**：RATE_LIMIT 先同 Key 重试，最多 sameKeyRetryCount 次（默认 2，可配）：
-  - 零输出（retry_after=10）：直接同 Key 重试（多为瞬时异常）；
-  - 429/402：仅当上游 Retry-After ≤ sameKeyRetryMaxWaitMs（默认 5s）时同 Key 重试，否则判定为真实限流 → 直接退避切换；
-  - 重试间隔 = min(Retry-After, sameKeyRetryDelayMs 默认 2s)；连续失败超出阈值才进入退避并切换备 Key。
-- 失败分类：RATE_LIMIT → 同 Key 重试（见上）→ 仍失败则退避 + 切换；TIMEOUT（30s/90s 空闲超时）→ 默认切换（可配）；AUTH（401/403）→ 不重试不切换，标记异常；UPSTREAM（5xx）→ 可选同 Key 重试一次。
-- 总尝试上限：单请求最多 maxRetries 次（含同 Key 重试与换 Key），超出后按最后错误返回客户端。
-- 重试窗口：仅“上游 body 未输出前”（fetch 返回非 200 JSON 时）允许换 Key；200 流一旦开始只透传。
+### 3.1 托管模式
 
-**B. 额度感知限制（在 429 之前就主动限制）**：
+当 `EMBED_UPSTREAM` 未设置或为 `1` 时，`src/server.mjs`：
 
-- 每 Key 维护额度状态（来自 §3 探测，非 stale 时生效）：
-  - fiveHourPercent ≥ fiveHourHardStop（默认 90%）→ 状态 quota_limited，**跳过选择**直至该窗口 resetAt；
-  - weeklyPercent ≥ weeklyHardStop（默认 90%）→ 同上，直至周窗口 resetAt；
-  - creditsUsd：remaining ≤ 0（或 percent ≥ 100%）→ 视同额度耗尽，直至订阅周期结束；
-  - 软限制档（≥80%，可配）：该 Key 保留但优先级降到备位之后（“额度将尽”提示）。
-- 探测数据 stale 时**不启用**额度限制（避免误伤），仅展示。
-- 主备模式下：主 Key 因额度耗尽切备 → 备 Key 耗尽再切下一备 → 全部耗尽返回 429 + Retry-After=min(各 Key 剩余退避/窗口时间)。
+1. 加载 manager 配置，并保留磁盘中的上游地址配置；
+2. 在 raw upstream 子进程启动前安装 stdout/stderr 捕获和 manager 日志链路；
+3. 调用 `startUpstream({ command: process.execPath, args: ["proxy.mjs"], cwd: "upstream" })`；
+4. supervisor 强制向子进程传入 `HOST=127.0.0.1` 和 `PORT=cfg.upstreamPort`；
+5. 轮询 `http://127.0.0.1:cfg.upstreamPort/health`，收到 2xx 后才监听 manager 的 `cfg.host:cfg.port`。
 
-### 5.3 用量统计与持久化（决策 6：重启不清零）
+托管模式下，manager 的运行时上游主机始终是 `127.0.0.1`。即使 `config.json` 或
+`UPSTREAM_HOST` 有其它值，也不会让本地 raw upstream 绑定非 loopback 地址；保存配置时
+保留原磁盘值，避免运行时地址覆盖持久化配置。
 
-**数据文件（全部在 /data 卷）**：
+### 3.2 外置模式
 
+当 `EMBED_UPSTREAM=0` 时：
+
+- manager 不调用 raw upstream supervisor，也不创建任何上游子进程；
+- manager/gateway 使用 `UPSTREAM_HOST:UPSTREAM_PORT`；
+- manager 可以在外置服务尚未可达时监听；
+- `/health` 会探测外置服务，外置不可达时返回 502 `UPSTREAM_DOWN`；
+- 不存在 manager 对外置进程的停止、回收或 unexpected exit 处理。
+
+代码按“只有字符串 `0` 表示外置”判断，因此生产部署应明确使用 `1` 或 `0`，不要依赖
+其它值表达模式。
+
+## 4. 进程生命周期契约
+
+### 4.1 启动成功路径
+
+```text
+加载配置和持久化状态
+        │
+        ├─ 外置模式 ───────────────► manager listen
+        │
+        └─ 托管模式
+             │ spawn raw upstream
+             ▼
+        raw GET /health = 2xx
+             │
+             ▼
+        manager listen
 ```
-/data/keys.json          # Key 池（含主备顺序、启用状态）——已设计
-/data/state.json         # 每 Key 退避/健康状态：backoffUntilMs、failCount、quota_limited、
-                         #   切换统计（failover 次数/时间）、认证异常标记；变更后 1s 防抖落盘
-/data/quota-cache.json   # 每 Key 最近成功额度快照（含 fetchedAt），重启避免探测风暴，仍按 TTL 刷新
-/data/stats.jsonl        # 请求事件追加日志（每请求一行 JSON），启动回放最近 31 天重建统计
-```
 
-**事件行字段**：{ ts, keyId, model, stream, ok, status, errorKind, inputTokens, outputTokens, cachedTokens, latencyMs, retries }。
+raw `/health` 的原始响应是 `200 text/plain OK`。manager 只有在托管 ready 后才对外监听，
+所以托管启动窗口不会出现一个已经开放但还没有本地上游的公共入口。
 
-**窗口统计（内存聚合 + 事件回放）**：
+### 4.2 启动失败
 
-- 官方窗口（展示口径）：5h/weekly 以 CC resetAt 对齐，月度 = 订阅周期（currentPeriodStart/End）；
-- 实测用量窗口（统计口径）：滚动 5 小时 / 7 天 / 30 天 的请求数、token、失败数——与 CC 限制粒度一致，重启后由 stats.jsonl 回放重建；
-- **保留策略（决策 9）**：historyRetentionDays 默认 **7 天**（可选 **1～31 天**）；启动时 + 每日定时清理过期事件；过期明细可选聚合为日汇总行，供长期趋势图使用并控制文件体积。
+`CC_UPSTREAM_STARTUP_TIMEOUT_MS` 默认 `10000` 毫秒，允许范围为 `0..120000`。在超时前，
+supervisor 以有界请求和间隔轮询 `/health`；健康检查失败会被记录，不能无限等待。
 
-### 5.4 每 Key 历史记录（决策 7）
+以下任一情况都会走失败清理并以退出码 `1` 结束：
 
-- 数据源：stats.jsonl（天然是完整历史）。
-- 管理 API：`GET /admin/api/history?keyId=&from=&to=&status=&errorKind=&page=&pageSize=` → { items, total, page }（明细按 historyRetentionDays 保留，默认 7 天）。
-- 展示：历史记录页——按 Key/时间/状态筛选表格（时间、Key 别名、模型、流式、状态、errorKind、input/output/cached tokens、延迟、重试次数），附失败率与 token 迷你趋势图；支持导出 CSV。
-
----
-
-## 6. 管理前端设计（web/，零构建 SPA，由管理网关在 /admin 托管）
-
-| 页面 | 功能 |
+| 情况 | 行为 |
 |---|---|
-| 登录 | AdminToken 登录；首次启动无 AdminToken 时引导设置（或环境变量注入） |
-| 总览看板 | 池状态卡片（活跃 Key/退避中/额度受限/今日 token/今日请求/429 率/切换次数）+ **每 Key 卡片**：别名+掩码+健康徽章（健康/退避中/额度受限/认证异常/数据过期）、**5h/每周/美元额度富余度进度条**（颜色分级 + 重置倒计时）、实测用量窗口、主备序号、操作（立即刷新/启用停用/删除/设为主 Key） |
-| Key 管理 | 优先级拖拽排序（主备顺序）、新增/编辑抽屉（别名/Key 明文/备注/启用）、批量粘贴导入、有效性即时验证（调 whoami） |
-| 历史记录 | §5.4 表格 + 筛选 + 迷你图 + CSV 导出 |
-| 设置 | clientToken（必填提示，未配置回退 AdminToken）、AdminToken 修改、池策略（默认主备）、maxRetries、**同 Key 重试次数**、退避基数/上限、切换冷却、额度硬阈值（5h/周/美元）、零输出是否计入 429、**历史保留天数（1–31，默认 7）**、额度刷新间隔、QPS 上限（可选） |
-| 日志 | 内存环形缓冲 2000 条 + SSE 实时追加 + 按 Key 过滤；日志永不含 Key 明文 |
+| raw upstream 端口已占用 | raw 子进程监听失败；manager 启动失败并回收子进程 |
+| raw upstream 立即退出或未 ready | `ready` 拒绝；manager 输出退出状态和最近诊断并退出 |
+| raw `/health` 在启动超时内未返回 2xx | 发送停止请求、回收 raw 子进程、manager 退出 |
+| manager 公共端口已占用 | manager 监听失败；已 ready 的 raw 子进程也会被停止 |
+| 配置或初始化导致 manager 无法启动 | 输出错误；不会把未完成的托管流程留在后台 |
 
-**管理 API 契约（/admin/api/*，除 login 外均需 X-Admin-Token）**：
+诊断包含启动命令、工作目录、端口、退出码或信号，以及有界的最近 stdout/stderr 行。
 
-```
-GET    /admin/api/keys                     → { keys: [{ id, alias, maskedKey, enabled, note, priority,
-                                                health:{status,backoffUntilMs?,failCount,failoverCount?},
-                                                quota:{fiveHour?,weekly?,creditsUsd?,updatedAt,stale}|null,
-                                                usage:{requests5h,requests7d,requests30d,tokens…,errors…} }] }
-POST   /admin/api/keys                     { alias, key, note? }       → 201 { id, maskedKey }
-PUT    /admin/api/keys/:id                 { alias?, enabled?, note?, priority? } → 200
-DELETE /admin/api/keys/:id                                           → 204
-POST   /admin/api/keys/:id/refresh-quota                              → 200 { quota }
-POST   /admin/api/keys/:id/test            验证 Key 有效性             → 200 { ok, status? }
-GET    /admin/api/history                  ?keyId&from&to&status&errorKind&page&pageSize → { items,total }  # 明细保留 historyRetentionDays（默认 7 天）
-GET    /admin/api/pool                     → { poolCfg, stats }
-PUT    /admin/api/pool                     → 200
-POST   /admin/api/login                    { token }                 → 200 { ok }
-GET    /admin/api/events                   SSE：quota/health/usage/切换事件推送
-```
+### 4.3 正常关闭
 
----
+manager 作为容器 PID 1 接收 `SIGTERM`/`SIGINT`。`shutdown()` 是幂等的，重复信号只
+记录“已经关闭”并复用已有关闭流程。顺序如下：
 
-## 7. Docker 镜像与“上游发布 → 自动重发镜像”
+1. `serverLifecycle.close()` 调用 `server.close()`，停止接受新连接；
+2. 在 `CC_SHUTDOWN_GRACE_MS` 默认 `10000` 毫秒内等待活动请求和 socket 排空；
+3. 排空超时后销毁活动请求和连接，等待 `CC_SHUTDOWN_FORCE_WAIT_MS` 默认 `1000` 毫秒；
+4. 托管模式调用 raw supervisor 的 `stop()`；外置模式跳过此步；
+5. raw supervisor 先发送 `SIGTERM`，等待 `CC_UPSTREAM_SHUTDOWN_TIMEOUT_MS` 默认 `5000` 毫秒；
+6. raw 仍存活时发送 `SIGKILL`，再完成有界强制回收。
 
-### 7.1 Dockerfile（决策 3：vendored，构建期零网络依赖）
+manager 排空两个变量的有效范围为 `100..120000` 毫秒；raw 启动和停止变量的有效范围为
+`0..120000` 毫秒。正常信号关闭退出码为 `0`；关闭清理失败时改为 `1`。
 
-```dockerfile
-FROM node:22-alpine
-WORKDIR /app
-COPY package.json ./
-COPY src/ ./src/
-COPY web/ ./web/
-COPY upstream/ ./upstream/     # 上游零改动随镜像打包（vendored）
-COPY UPSTREAM_VERSION ./
-EXPOSE 3080
-VOLUME /data                  # keys.json / state.json / quota-cache.json / stats.jsonl
-CMD ["node", "src/server.mjs"]
-```
+### 4.4 运行期间 raw 异常退出
 
-### 7.2 上游正式版自动触发（决策 4：repository_dispatch 的现实约束与方案）
+raw 子进程已经运行后，如果没有 manager 主动停止而退出，supervisor 只通知一次
+`onUnexpectedExit`。manager 打印退出诊断，停止接收新请求、排空现有请求，然后以退出码
+`1` 退出。这样容器编排可以根据非零状态重启整个服务，并且不会留下 manager 继续对外
+提供不可用的入口。
 
-**约束说明**：GitHub `repository_dispatch` 事件需要**外部方向本仓库** POST `/repos/<owner>/<repo>/dispatches`（需本仓库令牌）。上游仓库不受我们控制、无法为其配置 webhook，因此“上游发布 → 直接 dispatch 到本仓库”无法直接实现。
+## 5. 日志和健康检查
 
-**等效自动方案（采用）**：
+### 5.1 stdout/stderr 链路
 
-```yaml
-# .github/workflows/upstream-sync.yml
-on:
-  schedule:                 # 每天轮询上游正式版（决策 10，北京时间凌晨 4 点）
-    - cron: "0 4 * * *"
-  workflow_dispatch: {}     # 手动立即同步
-  repository_dispatch:      # 预留：未来如有外部事件源（webhook 中转等）可直接触发
-    types: [upstream-release]
-jobs:
-  sync-and-publish:
-    steps:
-      - 读取 UPSTREAM_VERSION（当前捆绑的上游 tag）
-      - GET api.github.com/repos/MAXeaglet/commandcode-proxy/releases/latest
-      - 若 tag 更新 → 运行 scripts/sync-upstream.sh → 提交 upstream/ + UPSTREAM_VERSION
-      - docker buildx → 推送 ghcr.io/<org>/commandcode-proxy-manager:latest
-        # 双 tag：latest + <上游tag>，便于按上游版本精确回滚
-```
+`src/server.mjs` 在托管 child 启动前调用日志捕获。`upstreamProcess.mjs`：
 
-### 7.3 上游更新流程（本地手动/CI 同源）
+- 分别读取 raw child 的 stdout 和 stderr；
+- 按 UTF-8 行边界转发，保留未完成的尾行；
+- 将 stdout 写入 manager stdout，将 stderr 写入 manager stderr；
+- 保存有界的最近诊断，异常信息不会无限增长。
+
+`src/logs.mjs` 捕获 manager 的 console 输出，也识别 raw upstream 的时间戳日志并标记
+`src=proxy`。运行时可用：
 
 ```bash
-npm run sync:upstream   # 拉上游最新正式版 tag 对应代码 → 拷贝 proxy.mjs/config.json/package.json
-                        # → 写入 UPSTREAM_VERSION=<tag>@<commit> → 打印 diff 摘要
-git add upstream UPSTREAM_VERSION && git commit -m "chore: sync upstream @ <tag>"
-git push                # 或等 cron 自动完成；push 后镜像自动发布
+docker logs -f cc-proxy-manager
 ```
 
----
+管理员也可以通过带 `X-Admin-Token` 的
+`GET /admin/api/logs?src=proxy` 查看 raw upstream 日志，或在 `/admin` 日志页查看。
+`events.jsonl` 保存受保留策略约束的系统日志。
 
-## 8. 实施路线图
+### 5.2 `/health` 语义
 
-| 阶段 | 内容 | 验收标准 |
+| 条件 | manager 响应 |
+|---|---|
+| 持久化可用且上游 2xx | `200 text/plain OK` |
+| 持久化可用但上游不可达或非 2xx | `502 text/plain UPSTREAM_DOWN` |
+| DATA_DIR 不可用 | `503 application/json`，包含 `persistence.available=false` |
+
+托管模式中，manager `/health` 在 raw ready 前不会对外可请求；外置模式中，manager 可以
+先监听，直到外置服务可达前保持 `UPSTREAM_DOWN`。
+
+## 6. 请求路径和职责划分
+
+1. manager 对 `/v1/*` 校验 `CLIENT_TOKEN`；未设置时回退 `ADMIN_TOKEN`。
+2. manager 从 Key 池选择当前可用 Key，不把客户端令牌传给上游。
+3. gateway 按当前运行配置构造 `http://UPSTREAM_HOST:UPSTREAM_PORT`，托管模式实际为 loopback。
+4. raw upstream 从请求头取得池内 Key，负责协议转换、初始化请求、指纹、会话和 Command Code API 调用。
+5. 对未开始输出的非 2xx 或完整无输出响应，manager 可按池配置执行同 Key 重试或切换 Key；流式响应开始后不切换 Key。
+6. manager 记录外部请求、状态、错误类别、token 和延迟；Key 健康和额度状态写入 `/data`。
+
+raw upstream 当前原始行为包括：每个 API Key 的 fingerprint/session 状态、初始化预请求、
+流式和非流式空闲超时、请求体大小限制，以及自身的版本刷新定时器。这些行为不属于
+manager 配置表中的功能开关。
+
+## 7. Key 池、额度和持久化
+
+### 7.1 Key 池
+
+- 默认策略为 `active-standby`：最高优先级的可用 Key 为主 Key，其余为备用。
+- 429、402、零输出和可切换超时会触发有界同 Key 重试、退避和必要的切换。
+- 401/403 标记认证异常，不通过自动切换掩盖凭证问题。
+- 流式内容开始后只透传当前尝试，不能为了换 Key 重放已经发送的内容。
+- 管理界面可以配置 `round-robin` 和 `least-usage`，以及重试、退避、额度阈值和历史保留。
+
+### 7.2 额度探测
+
+`src/quota.mjs` 使用 `CC_QUOTA_BASE` 探测：
+
+- `/alpha/whoami`；
+- `/alpha/billing/credits`；
+- `/alpha/billing/subscriptions`；
+- `/alpha/usage/summary`。
+
+探测经过串行队列和 Key 间隔，失败保留最近成功快照并标记 `stale`。stale 数据不启用
+额度限制，避免一次网络故障误伤推理请求。成功数据可按 5 小时、每周和美元额度阈值
+进入 `quota_limited`。
+
+### 7.3 文件
+
+| 文件 | 用途 |
+|---|---|
+| `config.json` | 端口、地址、令牌和 pool 配置 |
+| `keys.json` | Key 明文、别名、启用状态、优先级，权限 600 |
+| `state.json` | 退避、健康、认证异常、额度限制和切换状态 |
+| `quota-cache.json` | 最近额度报告和更新时间 |
+| `stats.jsonl` | 请求事件，支持历史查询和窗口统计 |
+| `events.jsonl` | manager/raw upstream 系统日志，受保留天数和容量约束 |
+
+历史明细默认保留 7 天，可在管理界面调整为 1 到 31 天。文件采用受限大小、原子写入
+或追加和启动回放策略，持久化失败会反映到 `/health` 和管理 API。
+
+## 8. 配置参考
+
+### 8.1 manager 变量
+
+| 变量 | 默认值 | 生效范围 |
 |---|---|---|
-| P0 骨架 | 新仓库脚手架 + sync-upstream 脚本 + 上游嵌入（import）+ 单 Key 透传网关 + clientToken/AdminToken 回退鉴权 + Dockerfile/docker-compose | docker run 后带 token 请求 /v1/chat/completions 可用，无 token 401，/admin 返回页面 |
-| P1 主备池 + 退避 | keyPool 主备顺序 + 429 同 Key 重试/额度感知退避 + state.json 持久化 + /admin/api/keys CRUD | 瞬时 429/零输出同 Key 重试成功则不切换；持续受限自动切备 Key；重启后退避状态保留；全部受限时按 Retry-After 返回 |
-| P2 额度/用量/历史 | quota.mjs 四端点探测 + quota-cache.json + stats.jsonl + 窗口统计 + 历史 API + 保留策略（默认 7 天，可配 1–31） | /admin/api/keys 含富余度；/admin/api/history 可查明细；重启后统计不丢；过期历史自动清理 |
-| P3 前端 | 登录/看板/Key 管理/历史记录/设置/日志 | 浏览器完成全流程操作（含主备排序、额度进度条、历史筛选） |
-| P4 发布 | upstream-sync.yml（**每日 cron** + dispatch 预留）+ 镜像双 tag 发布 + 文档 + 压测 | 上游发正式版后次日自动出镜像；手动 workflow_dispatch 可用 |
+| `DATA_DIR` | `./data`，容器为 `/data` | manager 持久化目录 |
+| `PORT` | `3080` | manager 监听端口 |
+| `HOST` | `0.0.0.0` | manager 监听地址 |
+| `UPSTREAM_HOST` | `127.0.0.1` | 外置模式目标；托管运行时强制 loopback |
+| `UPSTREAM_PORT` | `3050` | 外置目标或托管 child 端口 |
+| `EMBED_UPSTREAM` | 未设置时托管 | `0` 外置，`1` 托管 |
+| `CC_UPSTREAM_STARTUP_TIMEOUT_MS` | `10000` | 托管 ready 超时，`0..120000` 毫秒 |
+| `CC_UPSTREAM_SHUTDOWN_TIMEOUT_MS` | `5000` | raw `SIGTERM` 等待，`0..120000` 毫秒 |
+| `CC_SHUTDOWN_GRACE_MS` | `10000` | manager 排空等待，`100..120000` 毫秒 |
+| `CC_SHUTDOWN_FORCE_WAIT_MS` | `1000` | manager 强制关闭后的等待，`100..120000` 毫秒 |
+| `ADMIN_TOKEN` | 首次自动生成 | 管理鉴权；磁盘已有值时优先 |
+| `CLIENT_TOKEN` | 空，回退 `ADMIN_TOKEN` | `/v1/*` 鉴权；磁盘已有值时优先 |
+| `CC_QUOTA_BASE` | `https://api.commandcode.ai` | manager 额度 API 基址 |
+| `SECURE_COOKIES` | 空 | `1`/`true` 时为 SSE cookie 添加 `Secure` |
 
-关键落点对照（管理侧新代码，上游零改动）：gateway 转发用 fetch 直连 http://127.0.0.1:3050；429 判定依赖上游非 200 JSON 响应（上游 L1005/1151 零输出 429、L716 映射 429）——无需感知上游内部实现细节。
+### 8.2 raw upstream 变量
 
----
+`upstream/proxy.mjs` 明确读取下列变量。托管模式由 supervisor 从 manager 环境的允许
+列表传入；外置模式由外置服务自行配置：
 
-## 9. 风险与注意事项
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `CC_API_BASE` | `https://api.commandcode.ai` | raw upstream 的 Command Code API 基址 |
+| `PROJECT_SLUG` | `cc-proxy` | raw upstream 配置中的项目 slug |
+| `LOG_FILE` | 空 | raw upstream 可选的文件日志路径 |
+| `CC_USE_PROVIDER_MODELS` | `true` | raw upstream provider model 列表开关，字符串 `false` 时关闭 |
+| `CC_MAX_BODY_MB` | `100` | raw upstream 请求体上限，正整数 MB |
 
-1. **风控（决策 5 的边界）**：主备模式把并发多账号特征降为“单一活跃账号 + 低频切换”，显著降低风控概率，但不能 100% 消除——切换瞬间指纹/会话变化不可避免（上游按 Key 绑定指纹，会话缓存 12h）；建议前端展示切换统计，控制 failoverCooldownMs，并保持与正常 CLI 使用频率一致。
-2. **重试语义边界**：仅“上游 body 未输出前”换 Key；流式开始后绝不重试；401/403 不切换不重试（避免放大风控特征）。
-3. **额度端点非文档化**：字段随官方 CLI 漂移 → 采集软失败 + stale 展示；**stale 时禁用额度感知限制**，避免误伤。
-4. **密钥安全**：/data 卷文件权限 600；API 只回显掩码；日志脱敏；/v1/* 强制 clientToken（回退 AdminToken）防止池 Key 被匿名盗用；客户端 token 绝不下发上游。
-5. **上游嵌入耦合**：import 方案要求上游“无 process.exit / 无全局冲突”，已核验通过；若上游未来破坏此前提，退路是容器内双进程（entrypoint 启上游 + 管理），架构不变。
-6. **持久化一致性**：stats.jsonl 追加写 + 防抖写 state.json；崩溃最多丢最近 1s 状态与少量统计，可接受；定期压缩日志控制体积。
-7. **版本可溯性**：UPSTREAM_VERSION（tag@commit）随仓库提交；镜像双 tag（latest + 上游 tag）精确回滚。
-8. **同 Key 重试必须有界**：sameKeyRetryCount 默认 2、间隔 ≤2s、Retry-After >5s 不等待直接切换——防止瞬时重试放大限流或拖慢响应；重试次数计入前端 429 率统计。
+raw child 的 `HOST`、`PORT` 不是用户可任意注入的值，而是 manager 为本地进程设置的
+`127.0.0.1` 和 `UPSTREAM_PORT`。`CC_QUOTA_BASE` 只控制 manager 额度探测。
 
----
+## 9. 管理 API 面
 
-## 10. 结论
+除登录和退出登录外，管理 API 需要 `X-Admin-Token`。当前主要面如下：
 
-- 采用**独立管理项目**：主备 Key 池（规避风控）+ 429/额度感知退避 + 额度采集 + 持久化统计 + 历史记录 + 零构建前端，全部新代码与上游解耦；
-- 上游**零改动** vendored 随镜像打包（同进程 import，已核验可行）；
-- 上游发布正式版 → CI cron 轮询自动同步并发镜像（repository_dispatch 预留）；
-- 退避/用量持久化，按 5h/周/月窗口统计，重启不清零；
-- 已按 P0→P4 实施完成（见 README 与 src/ 实现）。
+| 路径 | 作用 |
+|---|---|
+| `POST /admin/api/login` | 校验 AdminToken，并下发 SSE 专用 HttpOnly cookie |
+| `GET/POST/PUT/DELETE /admin/api/keys` | 查询和维护 Key 池 |
+| `POST /admin/api/keys/:id/refresh-quota` | 刷新指定 Key 额度 |
+| `POST /admin/api/keys/:id/test` | 测试指定 Key |
+| `GET /admin/api/history` | 分页查询请求历史 |
+| `GET/PUT /admin/api/pool` | 查询或修改池配置 |
+| `POST /admin/api/security` | 修改 client/admin token |
+| `GET /admin/api/logs` | 查询持久化 manager/raw 日志，可按 `src=proxy` 过滤 |
+| `GET /admin/api/events` | SSE 推送 quota、stats 和 log 事件 |
+
+`SECURE_COOKIES=1` 或 `true` 只应在 HTTPS 反向代理后使用。默认明文 HTTP 部署不设置
+`Secure`，否则浏览器不会回传 SSE cookie。
+
+## 10. 容器和部署
+
+Dockerfile 的入口是 `node src/server.mjs`。镜像包含 `src/`、`web/`、`upstream/` 和
+`UPSTREAM_VERSION`，使用 `/data` 保存运行数据。manager 是容器入口进程，因此负责接收
+容器信号并按第 4.3 节顺序关闭。
+
+当前 Compose 部署只有 manager 服务：
+
+```yaml
+ports:
+  - "${PORT:-3080}:${PORT:-3080}"
+volumes:
+  - ccpm-data:/data
+```
+
+托管部署只映射 manager 端口。外置部署可以把 `EMBED_UPSTREAM=0`、`UPSTREAM_HOST` 和
+`UPSTREAM_PORT` 传给 manager，但也不应因此发布容器内部的 `3050`。
+
+## 11. 同步和发布
+
+同步脚本的责任只有三件事：获取来源、复制原始文件、记录来源版本并做一致性检查。
+同步后必须核对：
+
+- `upstream/proxy.mjs` 与来源的 `proxy.mjs` 逐字节一致；
+- `upstream/config.json` 与来源的 `config.json` 逐字节一致；
+- `upstream/package.json` 与来源的 `package.json` 逐字节一致；
+- `UPSTREAM_VERSION` 能追溯到上游 tag/commit。
+
+维护者使用：
+
+```bash
+npm run sync:upstream
+bash scripts/test-sync-upstream.sh
+```
+
+上游更新后先审阅 diff，再提交上游文件和版本记录。发布前必须执行 raw supervisor、
+server lifecycle、完整测试和容器 smoke；Docker daemon 不可用时，container smoke 只能
+记录为未执行。
+
+## 12. 开发和验证
+
+```bash
+npm start
+npm run dev
+node scripts/test-upstream-process.mjs
+node scripts/test-server-lifecycle.mjs
+npm test
+docker build -t ccpm-container-smoke:local .
+bash scripts/container-smoke.sh ccpm-container-smoke:local
+```
+
+`npm run dev` 的 watch 入口是 manager；它不会因为 `upstream/proxy.mjs` 改动而自动重启
+raw child。修改 `upstream/` 后手动停止并重新运行 manager，或单独运行 raw upstream 并
+使用外置模式。
+
+维护者还应执行静态门禁，命中任何结果都不能发布：
+
+```bash
+if rg -n \
+  -e 'patch-upstream' \
+  -e 'CCPM_.*PATCH_V1' \
+  -e 'import\(.*upstream/proxy\.mjs' \
+  scripts src upstream; then
+  exit 1
+fi
+```
+
+最后运行 `git diff --check`，并确认工作区没有修改 `docs/CODE_REVIEW_2026-09-03.md`、
+计划文档或代码文件。
+
+## 13. 故障排查和可观测性
+
+### raw upstream port occupied
+
+托管模式中，raw child 需要绑定 loopback 的 `UPSTREAM_PORT`。如果端口已被占用，查看
+manager 日志中的 listen 错误和最近 raw stderr，释放占用后重启。manager 会以退出码 `1`
+结束并回收已创建的 child。
+
+### startup timeout
+
+确认 raw child 能读取 `upstream/config.json`、能启动 HTTP listener，并且它的 `/health`
+能在 `CC_UPSTREAM_STARTUP_TIMEOUT_MS` 内返回 2xx。检查：
+
+```bash
+docker logs cc-proxy-manager
+curl -i http://127.0.0.1:3080/health
+```
+
+托管模式在 ready 前不会开放 manager 公共端口；需要更多启动时间时只在允许范围内调高
+启动超时。
+
+### upstream crash 或非零退出
+
+检查 raw stdout/stderr 中最后的异常和 manager 的 `upstream exited unexpectedly` 记录。
+运行期间 raw 意外退出会让 manager 排空并退出码 `1`，避免继续接受不可用请求。启动阶段
+提前退出则直接按启动失败处理。
+
+### external upstream unreachable
+
+确认 `EMBED_UPSTREAM=0`，并从 manager 容器网络验证 `UPSTREAM_HOST:UPSTREAM_PORT`。外置
+模式不会创建本地 child；manager 可以监听，但 `/health` 将返回 `502 UPSTREAM_DOWN`，网关
+请求会记录上游连接错误。
+
+### 日志和内部健康检查
+
+raw 日志通过 manager stdout/stderr 原样转发，因此优先使用：
+
+```bash
+docker logs -f cc-proxy-manager
+```
+
+管理员可以通过 `GET /admin/api/logs?src=proxy` 筛选 raw 日志，并通过 manager
+`/health` 判断持久化和上游的组合状态。不要把 `3050` 发布到宿主机；托管模式只需检查
+manager 的公共 `PORT`，容器内的 loopback 端口由 manager supervisor 管理。
+
+## 14. 不变量
+
+1. `EMBED_UPSTREAM=0` 时没有本地 raw upstream 子进程。
+2. 托管模式的 manager 监听发生在 raw `/health` ready 之后。
+3. raw child 只绑定 `127.0.0.1:UPSTREAM_PORT`，不通过 Compose 或 Dockerfile 发布。
+4. manager 关闭时先停止接收和排空，再停止托管 raw child。
+5. raw child 意外退出后 manager 以非零状态退出，不能留下孤儿 child。
+6. 同步后原始上游文件逐字节一致，manager 功能只位于 `src/` 和管理边界。
+7. 初始化并发、指纹、会话和版本刷新以 raw upstream 当前原始行为为准。

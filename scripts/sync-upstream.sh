@@ -251,21 +251,8 @@ for name in proxy.mjs config.json package.json; do
   require_regular_file "$STAGE/$name" "暂存 $name"
 done
 
-# 上游只监听 127.0.0.1（由管理网关内部转发），避免内部端口暴露。
-if ! sed -i 's/"host": "0.0.0.0"/"host": "127.0.0.1"/' "$STAGE/config.json"; then
-  die "无法改写暂存 config.json"
-fi
-if ! node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$STAGE/proxy.mjs"; then
-  die "无法对暂存 proxy.mjs 应用稳定的生命周期补丁（upstream/ 未改动）"
-fi
-if ! node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$STAGE/proxy.mjs"; then
-  die "无法对暂存 proxy.mjs 应用稳定的初始化补丁（upstream/ 未改动）"
-fi
-if ! node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$STAGE/proxy.mjs"; then
-  die "无法对暂存 proxy.mjs 应用稳定的版本补丁（upstream/ 未改动）"
-fi
 if ! node --input-type=module --check < "$STAGE/proxy.mjs"; then
-  die "vendored proxy.mjs 语法校验失败，放弃本次同步（upstream/ 未改动）"
+  die "上游 proxy.mjs 语法校验失败，放弃本次同步（upstream/ 未改动）"
 fi
 
 # 版本文件与其目标在同一目录，保证后续 rename 是单文件原子替换；先准备好

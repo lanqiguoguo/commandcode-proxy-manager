@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# sync-upstream.sh 的本地 fixture 测试（不触碰真实上游）。
-# 在 /tmp 构造 file:// 上游 git 仓库和 HTTP release API，验证：
-#   1) release 的 HTTP 状态、JSON、tag 格式和 tag -> commit 关系独立校验；
-#   2) 只有明确的无 release 响应才回退 master；
-#   3) symlink/目录输入、API 错误、畸形 JSON 和同步中断都保持旧目标不变；
-#   4) 目录级交换和 UPSTREAM_VERSION rename 失败时可 rollback。
+# Local fixture tests for sync-upstream.sh. No real upstream or registry is used.
+# The fixture proves that synchronization preserves release bytes and protects
+# the installed directory until every stage check has passed.
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,170 +21,226 @@ trap cleanup EXIT INT TERM
 
 PASS=0
 fail() { echo "FAIL: $*" >&2; exit 1; }
-ok()   { echo "ok: $*"; PASS=$((PASS + 1)); }
+ok() { echo "ok: $*"; PASS=$((PASS + 1)); }
 
-# ---------- 构造上游 fixture 仓库 ----------
+assert_static_contract() {
+  local sync="$ROOT_DIR/scripts/sync-upstream.sh"
+  local old_name='patch'
+  old_name+='-'
+  old_name+='upstream'
+  local marker_re='CCPM_'
+  marker_re+='.*'
+  marker_re+='PATCH_V1'
+
+  if grep -Fq "$old_name" "$sync"; then
+    fail "同步脚本仍引用旧源码改写脚本"
+  fi
+  if rg -n "$marker_re" "$ROOT_DIR/scripts" "$ROOT_DIR/upstream"; then
+    fail "scripts/upstream 仍含本地补丁标记"
+  fi
+  if rg -n 'sed[[:space:]]+-i.*config\.json|config\.json.*sed[[:space:]]+-i' "$sync"; then
+    fail "同步脚本仍对上游 config.json 做 sed 重写"
+  fi
+  for suffix in lifecycle initialization version; do
+    local candidate='patch'
+    candidate+='-'
+    candidate+='upstream'
+    candidate+='-'
+    candidate+="$suffix"
+    candidate+=".mjs"
+    [[ ! -e "$ROOT_DIR/scripts/$candidate" ]] || fail "旧脚本仍存在：$candidate"
+  done
+
+  ok "静态门禁：无旧源码改写引用、标记、sed 重写或旧脚本"
+}
+
+assert_clean_output() {
+  local output=$1
+  if printf '%s\n' "$output" | grep -Eiq 'patch|CCPM_'; then
+    printf '%s\n' "$output" >&2
+    fail "同步输出含源码补丁信息"
+  fi
+}
+
+assert_same_target() {
+  local label=$1
+  local snapshot="$T/snapshot-$label"
+  for name in proxy.mjs config.json package.json; do
+    cmp -- "$snapshot/upstream/$name" "$FAKE/upstream/$name" || fail "$label 修改了 upstream/$name"
+  done
+  cmp -- "$snapshot/UPSTREAM_VERSION" "$FAKE/UPSTREAM_VERSION" || fail "$label 修改了 UPSTREAM_VERSION"
+}
+
+snapshot_target() {
+  local label=$1
+  local snapshot="$T/snapshot-$label"
+  rm -rf -- "$snapshot"
+  mkdir -p "$snapshot"
+  cp -p "$FAKE/UPSTREAM_VERSION" "$snapshot/UPSTREAM_VERSION"
+  mkdir -p "$snapshot/upstream"
+  for name in proxy.mjs config.json package.json; do
+    cp -p "$FAKE/upstream/$name" "$snapshot/upstream/$name"
+  done
+}
+
+assert_expected_target() {
+  local label=$1
+  local expected_dir=$2
+  for name in proxy.mjs config.json package.json; do
+    cmp -- "$expected_dir/$name" "$FAKE/upstream/$name" || fail "$label 的 upstream/$name 与原始 fixture 不一致"
+  done
+}
+
+expect_failure() {
+  local label=$1
+  local route=$2
+  local expected_error=$3
+  local upstream_url=${4:-file://$UP}
+  local output="$T/$label.out"
+
+  snapshot_target "$label"
+  if run_sync_url "$upstream_url" "$API_BASE/$route" > "$output" 2>&1; then
+    sed -n '1,120p' "$output" >&2
+    fail "$label 应失败"
+  fi
+  assert_same_target "$label"
+  grep -Fq "$expected_error" "$output" || {
+    sed -n '1,120p' "$output" >&2
+    fail "$label 未报告 $expected_error"
+  }
+  ok "$label 失败且正式目录和版本标记不变"
+}
+
+assert_static_contract
+
+# ---------- Build a local Git upstream fixture ----------
 UP="$T/upstream-src"
 mkdir -p "$UP"
-cd "$UP"
-git init -q -b master .
-git config user.email fixture@test.local
-git config user.name fixture
+git init -q -b master "$UP"
+git -C "$UP" config user.email fixture@test.local
+git -C "$UP" config user.name fixture
+
 write_fixture_proxy() {
   local marker=$1
-  cat > proxy.mjs <<EOF
-import http from 'http';
+  cat > "$UP/proxy.mjs" <<EOF
+import http from "node:http";
 
-const CFG = { port: Number(process.env.PORT || 0), host: process.env.HOST || '127.0.0.1' };
-export const MARKER = "$marker";
-let CC_VERSION = '0.32.3';
-const CC_VERSION_FALLBACK = '0.32.3';
-const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000;
-const versionRegistryUrl = 'https://registry.npmjs.org/command-code/latest';
-void versionRegistryUrl;
-async function refreshCCVersion() {}
-refreshCCVersion();
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+const port = Number(process.env.PORT || 0);
+const host = process.env.HOST || "0.0.0.0";
+export const fixtureMarker = "$marker";
 
-function generateFingerprint() {
-  return { components: { platform: 'fixture', arch: 'x64' } };
-}
-
-// 请求体大小上限
-const MAX_BODY_SIZE = 100 * 1024 * 1024;
-
-const sessionStore = new Map();
-// 定期清理过期 session
-setInterval(() => {
-  for (const [key, entry] of sessionStore) {
-    if (Date.now() >= entry.expiresAt) {
-      sessionStore.delete(key);
-      keyStateStore.delete(key);
-    }
-  }
-}, 60 * 60 * 1000);
-function getSessionId() { return 'fixture'; }
-
-// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
-// 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map();
-
-function getOrCreateKeyState(apiKey) {
-  let state = keyStateStore.get(apiKey);
-  if (!state) {
-    state = {
-      fingerprint: generateFingerprint(),
-      nextInitAt: 0,
-    };
-    keyStateStore.set(apiKey, state);
-  }
-  return state;
-}
-
-// ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
-async function ensureInitialized(apiKey, signal) {
-  const state = getOrCreateKeyState(apiKey);
-  if (Date.now() < state.nextInitAt) return;
-  await Promise.all([
-    fetch('http://127.0.0.1/fingerprint', { signal }),
-    fetch('http://127.0.0.1/lifecycle', { signal }),
-  ]);
-  state.nextInitAt = Date.now() + 1;
-}
-
-// ── 模型列表 ───────────────────────────────────────
-const MODELS = [];
-
-async function fixtureOpenAi(req, res, apiKey) {
-  const abortController = new AbortController();
-  let aborted = false;
-  try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-  } catch {}
-}
-
-async function fixtureAnthropic(req, res, apiKey) {
-  const abortController = new AbortController();
-  let aborted = false;
-  try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-  } catch {}
-}
-
-function sendJSON(res, status, data) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(data));
-}
-
-const server = http.createServer(async (req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
+const server = http.createServer((request, response) => {
+  if (request.url === "/health") {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("OK");
     return;
   }
-  sendJSON(res, 200, { marker: MARKER });
+  response.writeHead(200, { "content-type": "text/plain" });
+  response.end(fixtureMarker);
 });
 
-server.listen(CFG.port, CFG.host, () => {
-  const address = server.address();
-  console.log('FIXTURE_READY ' + (typeof address === 'object' && address ? address.port : CFG.port));
-});
+server.listen(port, host);
 EOF
 }
+
+write_fixture_config() {
+  cat > "$UP/config.json" <<'EOF'
+{
+  "port": 3050,
+  "host": "0.0.0.0",
+  "apiKey": "",
+  "apiBase": "https://api.commandcode.ai",
+  "projectSlug": "cc-proxy",
+  "logFile": "",
+  "logLevel": "info"
+}
+EOF
+}
+
+write_fixture_package() {
+  cat > "$UP/package.json" <<'EOF'
+{
+  "name": "commandcode-proxy",
+  "version": "9.9.9",
+  "type": "module"
+}
+EOF
+}
+
+commit_fixture() {
+  git -C "$UP" add -A
+  git -C "$UP" commit -qm "$1"
+}
+
 write_fixture_proxy release-build
-printf '{\n  "host": "0.0.0.0",\n  "port": 3050\n}\n' > config.json
-printf '{\n  "name": "commandcode-proxy",\n  "version": "9.9.9"\n}\n' > package.json
-git add .
-git commit -qm "release content"
-git tag v9.9.9
+write_fixture_config
+write_fixture_package
+commit_fixture "release content"
+git -C "$UP" tag v9.9.9
+RELEASE_COMMIT=$(git -C "$UP" rev-parse 'v9.9.9^{commit}')
 
-# tag 之后再推 master-only commit，用于证明 release 路径不是 mutable master。
+EXPECTED_RELEASE="$T/expected-release"
+mkdir -p "$EXPECTED_RELEASE"
+for name in proxy.mjs config.json package.json; do
+  git -C "$UP" show "$RELEASE_COMMIT:$name" > "$EXPECTED_RELEASE/$name"
+done
+
 write_fixture_proxy master-build
-git commit -qam "master-only change"
+commit_fixture "master content"
 
-# Git tree 能表达的非普通输入包括 symlink 和目录；其它非普通文件仍由
-# sync-upstream.sh 的 regular-file 检查覆盖。
-SECRET="$T/outside-secret.txt"
-printf '%s\n' 'must-not-be-copied' > "$SECRET"
-rm proxy.mjs
-ln -s "$SECRET" proxy.mjs
-git add -A
-git commit -qm "symlink payload"
-git tag v9.9.10
-rm proxy.mjs
-write_fixture_proxy master-restored
-git commit -qam "restore regular proxy"
+printf '%s\n' 'export const = ;' > "$UP/proxy.mjs"
+commit_fixture "invalid syntax content"
+git -C "$UP" tag v9.9.10
 
-rm config.json
-mkdir config.json
-printf '%s\n' 'directory payload' > config.json/marker
-git add -A
-git commit -qm "directory payload"
-git tag v9.9.11
-rm -rf config.json
-printf '{\n  "host": "0.0.0.0",\n  "port": 3050\n}\n' > config.json
-git add config.json
-git commit -qm "restore regular config"
+write_fixture_proxy master-build
+commit_fixture "restore valid master"
 
-MASTER_HEAD=$(git rev-parse HEAD)
-TAG_COMMIT=$(git rev-parse v9.9.9^{commit})
-cd "$ROOT_DIR"
+rm -f "$UP/proxy.mjs"
+ln -s config.json "$UP/proxy.mjs"
+commit_fixture "symlink proxy content"
+git -C "$UP" tag v9.9.11
 
-# ---------- 构造 HTTP release API fixture ----------
+rm "$UP/proxy.mjs"
+write_fixture_proxy master-build
+commit_fixture "restore after symlink"
+
+rm "$UP/proxy.mjs"
+mkdir "$UP/proxy.mjs"
+printf '%s\n' 'fixture directory' > "$UP/proxy.mjs/entry"
+commit_fixture "directory proxy content"
+git -C "$UP" tag v9.9.12
+
+rm -rf "$UP/proxy.mjs"
+write_fixture_proxy master-build
+commit_fixture "restore valid master again"
+FIXTURE_MARKER_RE='CCPM_'
+FIXTURE_MARKER_RE+='.*'
+FIXTURE_MARKER_RE+='PATCH_V1'
+if rg -n "$FIXTURE_MARKER_RE" "$UP"; then
+  fail "上游 fixture 不得包含本地补丁标记"
+fi
+MASTER_HEAD=$(git -C "$UP" rev-parse HEAD)
+EXPECTED_MASTER="$T/expected-master"
+mkdir -p "$EXPECTED_MASTER"
+for name in proxy.mjs config.json package.json; do
+  git -C "$UP" show "$MASTER_HEAD:$name" > "$EXPECTED_MASTER/$name"
+done
+
+# ---------- Local release API fixture ----------
 cat > "$T/api-server.mjs" <<'EOF'
 import http from "node:http";
 
 const responses = new Map([
-  ["/release", [200, '{"tag_name":"v9.9.9","name":"v9.9.9"}']],
-  ["/empty-404", [404, '{"message":"Not Found","documentation_url":"https://docs.github.com"}']],
+  ["/release", [200, '{"tag_name":"v9.9.9"}']],
+  ["/empty-404", [404, '{"message":"Not Found"}']],
   ["/empty-null", [200, '{"tag_name":null}']],
   ["/missing-tag", [200, '{"message":"unexpected response"}']],
   ["/malformed", [200, '{"tag_name":']],
   ["/invalid-tag", [200, '{"tag_name":"master"}']],
-  ["/symlink-release", [200, '{"tag_name":"v9.9.10"}']],
-  ["/directory-release", [200, '{"tag_name":"v9.9.11"}']],
+  ["/missing-release-tag", [200, '{"tag_name":"v9.9.13"}']],
+  ["/invalid-syntax", [200, '{"tag_name":"v9.9.10"}']],
+  ["/symlink-release", [200, '{"tag_name":"v9.9.11"}']],
+  ["/directory-release", [200, '{"tag_name":"v9.9.12"}']],
   ["/forbidden", [403, '{"message":"Forbidden"}']],
   ["/rate-limit", [429, '{"message":"rate limit exceeded"}']],
   ["/server-error", [500, '{"message":"server error"}']],
@@ -217,272 +270,97 @@ for _ in {1..100}; do
   if [[ -s "$T/api-port" ]]; then break; fi
   if ! kill -0 "$API_PID" 2>/dev/null; then
     sed -n '1,80p' "$T/api-server.err" >&2 || true
-    fail "HTTP API fixture failed to start"
+    fail "HTTP API fixture 启动失败"
   fi
   sleep 0.01
 done
-[[ -s "$T/api-port" ]] || fail "HTTP API fixture did not publish a port"
+[[ -s "$T/api-port" ]] || fail "HTTP API fixture 未发布端口"
 API_PORT=$(head -n 1 "$T/api-port")
 API_BASE="http://127.0.0.1:$API_PORT"
 
-# ---------- 构造假目标仓库（跑 sync 脚本的地方） ----------
+# ---------- Fake target repository ----------
 FAKE="$T/fake-repo"
-mkdir -p "$FAKE/scripts" "$FAKE/src" "$FAKE/upstream"
-cp "$ROOT_DIR/scripts/sync-upstream.sh" "$FAKE/scripts/"
-cp "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$FAKE/scripts/"
-cp "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$FAKE/scripts/"
-cp "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$FAKE/scripts/"
-cp "$ROOT_DIR/src/serverLifecycle.mjs" "$FAKE/src/"
-printf 'old-proxy\n' > "$FAKE/upstream/proxy.mjs"
-printf 'old-config\n' > "$FAKE/upstream/config.json"
-printf 'old-package\n' > "$FAKE/upstream/package.json"
-printf 'old-version\n' > "$FAKE/UPSTREAM_VERSION"
-( cd "$FAKE" && git init -q -b main . && git config user.email f@f.local && git config user.name f \
-  && git add -A && git commit -qm base )
+mkdir -p "$FAKE/scripts" "$FAKE/upstream"
+cp "$ROOT_DIR/scripts/sync-upstream.sh" "$FAKE/scripts/sync-upstream.sh"
+printf '%s\n' 'old-proxy' > "$FAKE/upstream/proxy.mjs"
+printf '%s\n' 'old-config' > "$FAKE/upstream/config.json"
+printf '%s\n' 'old-package' > "$FAKE/upstream/package.json"
+printf '%s\n' 'old-version' > "$FAKE/UPSTREAM_VERSION"
+( cd "$FAKE" && git init -q -b main . && git config user.email fixture@test.local && git config user.name fixture && git add -A && git commit -qm base )
 
 run_sync_url() {
-  local upstream=$1
-  local api=$2
-  ( cd "$FAKE" && UPSTREAM_URL="file://$upstream" UPSTREAM_API="$api" bash scripts/sync-upstream.sh )
-}
-run_sync() { run_sync_url "$UP" "$1"; }
-
-snapshot_target() {
-  local name=$1
-  SNAPSHOT="$T/snapshot-$name"
-  rm -rf -- "$SNAPSHOT"
-  mkdir -p "$SNAPSHOT"
-  cp -a "$FAKE/upstream" "$SNAPSHOT/upstream"
-  cp -p "$FAKE/UPSTREAM_VERSION" "$SNAPSHOT/UPSTREAM_VERSION"
+  local upstream_url=$1
+  local api_url=$2
+  ( cd "$FAKE" && UPSTREAM_URL="$upstream_url" UPSTREAM_API="$api_url" bash scripts/sync-upstream.sh )
 }
 
-assert_target_unchanged() {
-  local label=$1
-  diff -ruN "$SNAPSHOT/upstream" "$FAKE/upstream" >/dev/null || fail "$label 修改了 upstream/"
-  cmp -- "$SNAPSHOT/UPSTREAM_VERSION" "$FAKE/UPSTREAM_VERSION" || fail "$label 修改了 UPSTREAM_VERSION"
-}
+run_sync() { run_sync_url "file://$UP" "$1"; }
 
-expect_failure() {
-  local label=$1
-  local api=$2
-  local upstream=${3:-$UP}
-  local output="$T/$label.out"
-  snapshot_target "$label"
-  if run_sync_url "$upstream" "$api" > "$output" 2>&1; then
-    sed -n '1,120p' "$output"
-    fail "$label 应失败"
-  fi
-  echo "--- $label output ---"
-  sed -n '1,120p' "$output"
-  assert_target_unchanged "$label"
-  ok "$label 失败且旧 upstream/ 与版本标记保持不变"
-}
+OUT_RELEASE=$(run_sync "$API_BASE/release" 2>&1)
+assert_clean_output "$OUT_RELEASE"
+assert_expected_target "release" "$EXPECTED_RELEASE"
+[[ "$(<"$FAKE/UPSTREAM_VERSION")" == "v9.9.9@$RELEASE_COMMIT" ]] || fail "release UPSTREAM_VERSION 不正确"
+grep -Fq "Fetching upstream release v9.9.9" <<< "$OUT_RELEASE" || fail "release 没有走 release 路径"
+ok "release proxy/config/package 与原始 fixture 逐字节一致"
 
-# ---------- 用例 1：release 的状态、JSON、tag 和 commit ----------
-OUT1=$(run_sync "$API_BASE/release" 2>&1)
-echo "--- case release output ---"; echo "$OUT1"
-V1=$(cat "$FAKE/UPSTREAM_VERSION")
-[ "$V1" = "v9.9.9@$TAG_COMMIT" ] || fail "release UPSTREAM_VERSION 应为 v9.9.9@$TAG_COMMIT，实际: $V1"
-ok "release UPSTREAM_VERSION = $V1"
-grep -Fq 'release-build' "$FAKE/upstream/proxy.mjs" || fail "release proxy.mjs 应来自 tag 内容"
-ok "release 内容来自 tag（非 master）"
-grep -Fq '"host": "127.0.0.1"' "$FAKE/upstream/config.json" || fail "release sed host 改写未生效"
-if grep -Fq '"host": "0.0.0.0"' "$FAKE/upstream/config.json"; then fail "release config.json 残留 0.0.0.0"; fi
-ok "release sed host 改写生效"
-echo "$OUT1" | grep -Fq 'Fetching upstream release v9.9.9' || fail "release 应走 release 路径"
-ok "release HTTP/JSON/tag/commit 校验后同步"
+snapshot_target repeated-sync
+OUT_REPEAT=$(run_sync "$API_BASE/release" 2>&1)
+assert_clean_output "$OUT_REPEAT"
+assert_same_target repeated-sync
+ok "重复同步结果逐字节稳定"
 
-# ---------- 用例 1b：生命周期补丁只应用一次且重复输入字节不变 ----------
-assert_patch_applies_once() {
-  local label=$1
-  local target=$2
-  local first second before after
-  first=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
-  first+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$target" 2>&1)
-  first+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$target" 2>&1)
-  echo "--- $label first patch ---"; echo "$first"
-  echo "$first" | grep -Fq "upstream lifecycle patch applied" || fail "$label 首次应应用补丁"
-  echo "$first" | grep -Fq "upstream version patch applied" || fail "$label 首次应应用版本补丁"
-  cp -p "$target" "$target.before-second"
-  second=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1)
-  second+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$target" 2>&1)
-  second+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$target" 2>&1)
-  echo "--- $label second patch ---"; echo "$second"
-  echo "$second" | grep -Fq "upstream lifecycle patch already present" || fail "$label 重复执行应报告 already present"
-  echo "$second" | grep -Fq "upstream version patch already present" || fail "$label 重复执行版本补丁应报告 already present"
-  cmp -- "$target.before-second" "$target" || fail "$label 重复执行改变了字节"
-  ok "$label clean input 应用一次，重复输入字节不变"
-}
+OUT_MASTER=$(run_sync "$API_BASE/empty-404" 2>&1)
+assert_clean_output "$OUT_MASTER"
+assert_expected_target "master fallback" "$EXPECTED_MASTER"
+[[ "$(<"$FAKE/UPSTREAM_VERSION")" == "master@$MASTER_HEAD" ]] || fail "master fallback UPSTREAM_VERSION 不正确"
+grep -Fq "No upstream release found" <<< "$OUT_MASTER" || fail "明确无 release 时没有打印 fallback 提示"
+ok "明确无 release 时同步 master 原始 fixture"
 
-assert_patch_rejection() {
-  local label=$1
-  local target=$2
-  local message=$3
-  local output
-  cp -p "$target" "$target.before-rejection"
-  if output=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$target" 2>&1); then
-    echo "$output"
-    fail "$label 应拒绝"
-  fi
-  echo "--- $label rejection ---"; echo "$output"
-  echo "$output" | grep -Fq "$message" || fail "$label 缺少明确诊断"
-  cmp -- "$target.before-rejection" "$target" || fail "$label 拒绝时修改了字节"
-  ok "$label 拒绝且输入字节保持不变"
-}
+snapshot_target empty-null
+OUT_NULL=$(run_sync "$API_BASE/empty-null" 2>&1)
+assert_clean_output "$OUT_NULL"
+assert_same_target empty-null
+ok "tag_name:null fallback 不改变已安装字节"
 
-assert_version_patch_rejection() {
-  local label=$1
-  local target=$2
-  local message=$3
-  local output
-  cp -p "$target" "$target.before-version-rejection"
-  if output=$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$target" 2>&1); then
-    echo "$output"
-    fail "$label 应拒绝"
-  fi
-  echo "--- $label version rejection ---"; echo "$output"
-  echo "$output" | grep -Fq "$message" || fail "$label 缺少明确诊断"
-  cmp -- "$target.before-version-rejection" "$target" || fail "$label 拒绝时修改了字节"
-  ok "$label 版本补丁拒绝且输入字节保持不变"
-}
+# ---------- API and checkout failures are fail-closed ----------
+expect_failure api-403 forbidden "状态不可接受：403"
+expect_failure api-429 rate-limit "状态不可接受：429"
+expect_failure api-500 server-error "状态不可接受：500"
+expect_failure api-network-error drop "release API 请求失败"
+expect_failure api-malformed malformed "release API JSON"
+expect_failure api-missing-tag missing-tag "响应结构"
+expect_failure api-invalid-tag invalid-tag "release tag 格式无效"
+expect_failure api-bad-not-found bad-not-found "404 不是明确的无 release 响应"
+expect_failure missing-release-tag missing-release-tag "上游不存在 release tag"
+expect_failure invalid-syntax invalid-syntax "语法校验失败"
+expect_failure upstream-symlink symlink-release "拒绝符号链接"
+expect_failure upstream-directory directory-release "regular file"
 
-CURRENT_CLEAN="$T/current-upstream-clean.mjs"
-git -C "$UP" show "$TAG_COMMIT:proxy.mjs" > "$CURRENT_CLEAN"
-assert_patch_applies_once "当前上游 fixture" "$CURRENT_CLEAN"
-
-RELEASE_CLEAN="$T/release-upstream-clean.mjs"
-git -C "$UP" show "$TAG_COMMIT:proxy.mjs" > "$RELEASE_CLEAN"
-RELEASE_PRISTINE="$T/release-upstream-pristine.mjs"
-cp -p "$RELEASE_CLEAN" "$RELEASE_PRISTINE"
-assert_patch_applies_once "release test fixture" "$RELEASE_CLEAN"
-
-PATCHED_RELEASE="$T/release-upstream-patched.mjs"
-cp -p "$FAKE/upstream/proxy.mjs" "$PATCHED_RELEASE"
-PATCHED_RELEASE_BEFORE="$T/release-upstream-patched.before"
-cp -p "$PATCHED_RELEASE" "$PATCHED_RELEASE_BEFORE"
-PATCHED_RELEASE_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$PATCHED_RELEASE" 2>&1)
-PATCHED_RELEASE_OUT+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PATCHED_RELEASE" 2>&1)
-PATCHED_RELEASE_OUT+=$'\n'$(node "$ROOT_DIR/scripts/patch-upstream-version.mjs" "$PATCHED_RELEASE" 2>&1)
-echo "--- already patched byte check ---"; echo "$PATCHED_RELEASE_OUT"
-echo "$PATCHED_RELEASE_OUT" | grep -Fq "upstream lifecycle patch already present" || fail "已补丁输入应报告 already present"
-echo "$PATCHED_RELEASE_OUT" | grep -Fq "upstream version patch already present" || fail "已补丁输入应报告 version already present"
-cmp -- "$PATCHED_RELEASE_BEFORE" "$PATCHED_RELEASE" || fail "已补丁输入重复执行改变了字节"
-grep -Fq "CCPM_VERSION_PATCH_V1" "$PATCHED_RELEASE" || fail "已补丁 upstream/proxy.mjs 缺少版本补丁"
-grep -Fq "CCPM_LIFECYCLE_PATCH_V1" "$PATCHED_RELEASE" || fail "版本补丁覆盖了生命周期补丁"
-grep -Fq "CCPM_INITIALIZATION_PATCH_V1" "$PATCHED_RELEASE" || fail "版本补丁覆盖了初始化补丁"
-ok "已补丁 upstream/proxy.mjs 三段补丁重复执行字节完全不变"
-
-DUP_VERSION_MARKER="$T/duplicate-version-marker.mjs"
-cp -p "$PATCHED_RELEASE" "$DUP_VERSION_MARKER"
-printf '\n// CCPM_VERSION_PATCH_V1\n' >> "$DUP_VERSION_MARKER"
-assert_version_patch_rejection "重复 version marker" "$DUP_VERSION_MARKER" "version patch marker is duplicated"
-
-BAD_VERSION_FALLBACK="$T/bad-version-fallback.mjs"
-cp -p "$RELEASE_PRISTINE" "$BAD_VERSION_FALLBACK"
-node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$BAD_VERSION_FALLBACK" >/dev/null
-node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$BAD_VERSION_FALLBACK" >/dev/null
-sed -i "s/const CC_VERSION_FALLBACK = '0.32.3';/const CC_VERSION_FALLBACK = 'fixture';/" "$BAD_VERSION_FALLBACK"
-assert_version_patch_rejection "无效固定 fallback" "$BAD_VERSION_FALLBACK" "CC_VERSION_FALLBACK 必须是稳定 semver"
-
-PARTIAL_VERSION="$T/partial-version-patch.mjs"
-cp -p "$RELEASE_PRISTINE" "$PARTIAL_VERSION"
-node "$ROOT_DIR/scripts/patch-upstream-lifecycle.mjs" "$PARTIAL_VERSION" >/dev/null
-node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PARTIAL_VERSION" >/dev/null
-printf '\nconst CC_VERSION_BUILD = CC_VERSION_FALLBACK;\n' >> "$PARTIAL_VERSION"
-assert_version_patch_rejection "不完整 version patch" "$PARTIAL_VERSION" "detected incomplete version patch"
-
-DUP_MARKER="$T/duplicate-marker.mjs"
-cp -p "$PATCHED_RELEASE" "$DUP_MARKER"
-printf '\n// CCPM_LIFECYCLE_PATCH_V1\n' >> "$DUP_MARKER"
-assert_patch_rejection "重复 lifecycle marker" "$DUP_MARKER" "生命周期标记重复"
-
-DUP_INIT_MARKER="$T/duplicate-init-marker.mjs"
-cp -p "$PATCHED_RELEASE" "$DUP_INIT_MARKER"
-printf '\n// CCPM_INITIALIZATION_PATCH_V1\n' >> "$DUP_INIT_MARKER"
-INIT_MARKER_BEFORE="$DUP_INIT_MARKER.before-rejection"
-cp -p "$DUP_INIT_MARKER" "$INIT_MARKER_BEFORE"
-if INIT_MARKER_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$DUP_INIT_MARKER" 2>&1); then
-  echo "$INIT_MARKER_OUT"
-  fail "重复 initialization marker 应拒绝"
+# ---------- A copy failure happens before the directory exchange ----------
+CP_REAL=$(command -v cp)
+mkdir -p "$T/fail-cp-bin"
+cat > "$T/fail-cp-bin/cp" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${CP_MODE:-}" == "fail-stage" && "$*" == *".upstream-sync."* ]]; then
+  echo "fixture: refusing stage copy" >&2
+  exit 91
 fi
-echo "--- 重复 initialization marker rejection ---"; echo "$INIT_MARKER_OUT"
-echo "$INIT_MARKER_OUT" | grep -Fq "初始化补丁标记重复" || fail "重复 initialization marker 缺少明确诊断"
-cmp -- "$INIT_MARKER_BEFORE" "$DUP_INIT_MARKER" || fail "重复 initialization marker 拒绝时修改了字节"
-ok "重复 initialization marker 拒绝且输入字节保持不变"
-
-PARTIAL_INIT="$T/partial-initialization-patch.mjs"
-cp -p "$RELEASE_PRISTINE" "$PARTIAL_INIT"
-printf '\n// partial F11 state: initFlight\n' >> "$PARTIAL_INIT"
-PARTIAL_INIT_BEFORE="$PARTIAL_INIT.before-rejection"
-cp -p "$PARTIAL_INIT" "$PARTIAL_INIT_BEFORE"
-if PARTIAL_INIT_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$PARTIAL_INIT" 2>&1); then
-  echo "$PARTIAL_INIT_OUT"
-  fail "不完整 initialization patch 应拒绝"
+exec "$REAL_CP" "$@"
+EOF
+chmod +x "$T/fail-cp-bin/cp"
+snapshot_target copy-failure
+COPY_FAILURE_OUT="$T/copy-failure.out"
+if ( cd "$FAKE" && REAL_CP="$CP_REAL" CP_MODE=fail-stage PATH="$T/fail-cp-bin:$PATH" \
+  UPSTREAM_URL="file://$UP" UPSTREAM_API="$API_BASE/release" bash scripts/sync-upstream.sh ) \
+  > "$COPY_FAILURE_OUT" 2>&1; then
+  sed -n '1,120p' "$COPY_FAILURE_OUT" >&2
+  fail "复制失败用例应失败"
 fi
-echo "--- 不完整 initialization patch rejection ---"; echo "$PARTIAL_INIT_OUT"
-echo "$PARTIAL_INIT_OUT" | grep -Fq "检测到不完整的初始化补丁" || fail "不完整 initialization patch 缺少明确诊断"
-cmp -- "$PARTIAL_INIT_BEFORE" "$PARTIAL_INIT" || fail "不完整 initialization patch 拒绝时修改了字节"
-ok "不完整 initialization patch 拒绝且输入字节保持不变"
+assert_same_target copy-failure
+grep -Fq "无法复制上游 proxy.mjs" "$COPY_FAILURE_OUT" || fail "复制失败没有明确诊断"
+ok "stage 复制失败时正式目录不变"
 
-MISSING_INIT_CLEANUP="$T/missing-initialization-cleanup.mjs"
-cp -p "$RELEASE_PRISTINE" "$MISSING_INIT_CLEANUP"
-sed -i 's/keyStateStore\.delete(key);/sessionStore.delete(key);/' "$MISSING_INIT_CLEANUP"
-MISSING_INIT_BEFORE="$MISSING_INIT_CLEANUP.before-rejection"
-cp -p "$MISSING_INIT_CLEANUP" "$MISSING_INIT_BEFORE"
-if MISSING_INIT_OUT=$(node "$ROOT_DIR/scripts/patch-upstream-initialization.mjs" "$MISSING_INIT_CLEANUP" 2>&1); then
-  echo "$MISSING_INIT_OUT"
-  fail "缺少初始化 cleanup 锚点应拒绝"
-fi
-echo "--- 缺少 initialization cleanup rejection ---"; echo "$MISSING_INIT_OUT"
-echo "$MISSING_INIT_OUT" | grep -Fq "过期 Key 状态清理锚点应恰好出现一次" || fail "缺少 initialization cleanup 缺少明确诊断"
-cmp -- "$MISSING_INIT_BEFORE" "$MISSING_INIT_CLEANUP" || fail "缺少 initialization cleanup 拒绝时修改了字节"
-ok "缺少 initialization cleanup 锚点拒绝且输入字节保持不变"
-
-DUP_UNREF="$T/duplicate-unref.mjs"
-cp -p "$PATCHED_RELEASE" "$DUP_UNREF"
-sed -i '/^ccVersionRefreshTimer\.unref?\.();$/a ccVersionRefreshTimer.unref?.();' "$DUP_UNREF"
-assert_patch_rejection "重复 timer unref" "$DUP_UNREF" "CC refresh timer unref 不是唯一一处"
-
-OLD_INLINE="$T/old-inline-patch.mjs"
-cp -p "$RELEASE_CLEAN" "$OLD_INLINE"
-printf '\nfunction createProxyLifecycle() {}\n' >> "$OLD_INLINE"
-assert_patch_rejection "旧 inline lifecycle patch" "$OLD_INLINE" "仍残留旧 inline lifecycle 实现"
-
-# ---------- 用例 2：只有明确的空 release 才允许 fallback ----------
-OUT2=$(run_sync "$API_BASE/empty-404" 2>&1)
-echo "--- case empty 404 output ---"; echo "$OUT2"
-V2=$(cat "$FAKE/UPSTREAM_VERSION")
-[ "$V2" = "master@$MASTER_HEAD" ] || fail "empty 404 应为 master@$MASTER_HEAD，实际: $V2"
-grep -Fq 'master-restored' "$FAKE/upstream/proxy.mjs" || fail "empty 404 应同步 master"
-echo "$OUT2" | grep -Fq 'No upstream release found' || fail "empty 404 应打印回退提示"
-ok "明确 404 Not Found 回退 master"
-
-OUT_EMPTY_NULL=$(run_sync "$API_BASE/empty-null" 2>&1)
-echo "--- case empty null output ---"; echo "$OUT_EMPTY_NULL"
-[ "$(cat "$FAKE/UPSTREAM_VERSION")" = "master@$MASTER_HEAD" ] || fail "empty null 应保持 master@$MASTER_HEAD"
-ok "明确 tag_name:null 空 release 回退 master"
-
-# ---------- 用例 3：API 错误不能伪装成无 release ----------
-for spec in forbidden:403 rate-limit:429 server-error:500; do
-  route=${spec%%:*}
-  status=${spec##*:}
-  expect_failure "api-$status" "$API_BASE/$route"
-done
-expect_failure api-malformed "$API_BASE/malformed"
-expect_failure api-missing-tag "$API_BASE/missing-tag"
-expect_failure api-invalid-tag "$API_BASE/invalid-tag"
-expect_failure api-bad-not-found "$API_BASE/bad-not-found"
-expect_failure api-network-error "$API_BASE/drop"
-
-# ---------- 用例 4：上游预期文件必须是 regular file ----------
-expect_failure upstream-symlink "$API_BASE/symlink-release"
-grep -Fq '拒绝符号链接' "$T/upstream-symlink.out" || fail "symlink 用例未明确报告符号链接"
-ok "symlink 输入被明确拒绝"
-expect_failure upstream-directory "$API_BASE/directory-release"
-grep -Fq 'regular file' "$T/upstream-directory.out" || fail "directory 用例未明确报告 regular file 边界"
-ok "目录输入被明确拒绝"
-
-# ---------- 用例 5：版本 rename 失败时目录 rollback ----------
+# ---------- Rename and interrupt failures rollback the directory ----------
 MV_REAL=$(command -v mv)
 mkdir -p "$T/fail-mv-bin"
 cat > "$T/fail-mv-bin/mv" <<'EOF'
@@ -506,28 +384,23 @@ VERSION_FAILURE_OUT="$T/version-rename-failure.out"
 if ( cd "$FAKE" && REAL_MV="$MV_REAL" MV_MODE=fail-version PATH="$T/fail-mv-bin:$PATH" \
   UPSTREAM_URL="file://$UP" UPSTREAM_API="$API_BASE/release" bash scripts/sync-upstream.sh ) \
   > "$VERSION_FAILURE_OUT" 2>&1; then
-  sed -n '1,120p' "$VERSION_FAILURE_OUT"
+  sed -n '1,120p' "$VERSION_FAILURE_OUT" >&2
   fail "版本 rename 失败用例应失败"
 fi
-echo "--- version rename failure output ---"
-sed -n '1,120p' "$VERSION_FAILURE_OUT"
-assert_target_unchanged version-rename-failure
-ok "版本 rename 失败后 rollback 保持旧目录和旧版本"
+assert_same_target version-rename-failure
+ok "UPSTREAM_VERSION rename 失败后 rollback 保持旧目录"
 
-# ---------- 用例 6：目录交换后收到可捕获中断时 rollback ----------
 INTERRUPT_MARKER="$T/interrupt-sent"
 snapshot_target interrupt-after-swap
 INTERRUPT_OUT="$T/interrupt-after-swap.out"
 if ( cd "$FAKE" && REAL_MV="$MV_REAL" MV_MODE=interrupt-after-swap INTERRUPT_MARKER="$INTERRUPT_MARKER" \
   PATH="$T/fail-mv-bin:$PATH" UPSTREAM_URL="file://$UP" UPSTREAM_API="$API_BASE/release" \
   bash scripts/sync-upstream.sh ) > "$INTERRUPT_OUT" 2>&1; then
-  sed -n '1,120p' "$INTERRUPT_OUT"
+  sed -n '1,120p' "$INTERRUPT_OUT" >&2
   fail "目录交换中断用例应失败"
 fi
-echo "--- interrupt after swap output ---"
-sed -n '1,120p' "$INTERRUPT_OUT"
-assert_target_unchanged interrupt-after-swap
-ok "目录交换中断后 rollback 保持旧目录和旧版本"
+assert_same_target interrupt-after-swap
+ok "目录交换后中断 rollback 保持旧目录"
 
 echo
 echo "sync-upstream fixture tests passed ($PASS checks)."

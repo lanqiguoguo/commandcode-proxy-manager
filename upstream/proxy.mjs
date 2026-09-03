@@ -8,7 +8,6 @@ import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { createServerLifecycle } from "../src/serverLifecycle.mjs";
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -119,147 +118,27 @@ function generateFingerprint() {
   };
 }
 
-// CCPM_VERSION_PATCH_V1
-// Keep the protocol version fixed at sync/build time by default.
-const CC_VERSION_FALLBACK = "0.32.3";
-const CC_VERSION_BUILD = CC_VERSION_FALLBACK;
-let CC_VERSION = CC_VERSION_BUILD;
-const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // Fixed 24h refresh boundary
-const CC_VERSION_REGISTRY_URL = 'https://registry.npmjs.org/command-code/latest';
-const CC_VERSION_REFRESH_TIMEOUT_DEFAULT_MS = 5000;
-const CC_VERSION_RESPONSE_MAX_BYTES = 16 * 1024;
-const CC_VERSION_MAX_PATCH_AHEAD = 100;
-const CC_VERSION_REFRESH_ENABLED = process.env.CC_ENABLE_VERSION_REFRESH === '1';
+let CC_VERSION = '0.32.3';
+const CC_VERSION_FALLBACK = '0.32.3';
+const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
 
-function configuredCCVersionRefreshIntervalMs() {
-  const value = Number(process.env.CC_VERSION_REFRESH_INTERVAL_MS);
-  return Number.isSafeInteger(value) && value >= 50 && value <= CC_VERSION_REFRESH_MS
-    ? value
-    : CC_VERSION_REFRESH_MS;
-}
-
-const CC_VERSION_REFRESH_INTERVAL_MS = configuredCCVersionRefreshIntervalMs();
-
-function configuredCCVersionRefreshTimeoutMs() {
-  const value = Number(process.env.CC_VERSION_REFRESH_TIMEOUT_MS);
-  return Number.isSafeInteger(value) && value >= 50 && value <= 10000
-    ? value
-    : CC_VERSION_REFRESH_TIMEOUT_DEFAULT_MS;
-}
-
-const CC_VERSION_REFRESH_TIMEOUT_MS = configuredCCVersionRefreshTimeoutMs();
-
-function parseStableSemver(value) {
-  if (typeof value !== 'string') return null;
-  const match = value.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
-  if (!match) return null;
-  const parts = match.slice(1).map(Number);
-  if (!parts.every(Number.isSafeInteger)) return null;
-  return { value, major: parts[0], minor: parts[1], patch: parts[2] };
-}
-
-const CC_VERSION_FALLBACK_SEMVER = parseStableSemver(CC_VERSION_FALLBACK);
-if (!CC_VERSION_FALLBACK_SEMVER) throw new Error('Invalid fixed CC_VERSION_FALLBACK');
-
-function isAllowedCCVersion(candidate) {
-  const version = parseStableSemver(candidate);
-  const current = parseStableSemver(CC_VERSION) || CC_VERSION_FALLBACK_SEMVER;
-  return version &&
-    version.major === CC_VERSION_FALLBACK_SEMVER.major &&
-    version.minor === CC_VERSION_FALLBACK_SEMVER.minor &&
-    version.patch >= CC_VERSION_FALLBACK_SEMVER.patch &&
-    version.patch >= current.patch &&
-    version.patch <= CC_VERSION_FALLBACK_SEMVER.patch + CC_VERSION_MAX_PATCH_AHEAD
-    ? version
-    : null;
-}
-
-async function readCCVersionResponseBody(response) {
-  const contentLength = response.headers.get('content-length');
-  if (contentLength !== null) {
-    if (!/^(0|[1-9]\d*)$/.test(contentLength.trim())) {
-      throw new Error('registry response content-length is invalid');
-    }
-    const declaredLength = Number(contentLength);
-    if (!Number.isSafeInteger(declaredLength) || declaredLength > CC_VERSION_RESPONSE_MAX_BYTES) {
-      throw new Error('registry response is too large');
-    }
-  }
-  if (!response.body) return '';
-  const reader = response.body.getReader();
-  const chunks = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > CC_VERSION_RESPONSE_MAX_BYTES) {
-        try { await reader.cancel(); } catch {}
-        throw new Error('registry response is too large');
-      }
-      chunks.push(Buffer.from(value));
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
+// ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
 async function refreshCCVersion() {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CC_VERSION_REFRESH_TIMEOUT_MS);
-  timeout.unref?.();
   try {
-    const response = await fetch(CC_VERSION_REGISTRY_URL, {
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error('registry responded with HTTP ' + response.status);
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType && !/json/i.test(contentType)) throw new Error('registry response is not JSON');
-    let payload;
-    try { payload = JSON.parse(await readCCVersionResponseBody(response)); }
-    catch (error) { throw new Error('registry response JSON is invalid: ' + (error?.message || String(error))); }
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.version !== 'string') {
-      throw new Error('registry response must contain a string version');
+    const url = 'https://registry.npmjs.org/command-code/latest';
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`npm responded with ${res.status}`);
+    const pkg = await res.json();
+    if (pkg.version && typeof pkg.version === 'string') {
+      CC_VERSION = pkg.version;
+      log('info', 'CC Version refreshed from npm', { version: CC_VERSION });
     }
-    const accepted = isAllowedCCVersion(payload.version);
-    if (!accepted) throw new Error('registry version is outside the allowed stable range');
-    CC_VERSION = accepted.value;
-    log('info', 'CC Version refreshed from allowlisted registry', { version: CC_VERSION });
-    return true;
-  } catch (error) {
-    try { controller.abort(); } catch {}
-    const message = error instanceof Error ? error.message : String(error);
-    log('warn', 'CC Version registry refresh ignored; fixed version retained', { version: CC_VERSION, error: message });
-    return false;
-  } finally {
-    clearTimeout(timeout);
+  } catch (e) {
+    log('warn', 'CC Version fetch failed, using current', { version: CC_VERSION, error: e.message });
   }
 }
-
-let ccVersionRefreshFlight = null;
-function scheduleCCVersionRefresh() {
-  if (ccVersionRefreshFlight) return ccVersionRefreshFlight;
-  ccVersionRefreshFlight = refreshCCVersion()
-    .catch((error) => {
-      log('warn', 'CC Version refresh task failed; fixed version retained', { version: CC_VERSION, error: error?.message || String(error) });
-      return false;
-    })
-    .finally(() => { ccVersionRefreshFlight = null; });
-  ccVersionRefreshFlight.catch(() => {});
-  return ccVersionRefreshFlight;
-}
-
-// Registry access is opt-in. A failed attempt leaves the fixed version untouched;
-// the next 24h boundary retries when refresh is enabled.
-const ccVersionRefreshTimer = setInterval(() => {
-  if (CC_VERSION_REFRESH_ENABLED) void scheduleCCVersionRefresh();
-}, CC_VERSION_REFRESH_INTERVAL_MS);
-ccVersionRefreshTimer.unref?.();
-if (CC_VERSION_REFRESH_ENABLED) void scheduleCCVersionRefresh();
+refreshCCVersion(); // 启动时立即拉取
+setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
 const MAX_BODY_SIZE = (() => {
@@ -307,19 +186,18 @@ function ensureSession(apiKey) {
 }
 
 // 定期清理过期 session 和 key 状态，防止 Map 无限增长
-const sessionCleanupTimer = setInterval(() => {
+setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
-      evictExpiredKeyState(key); // 同时清理该 key 的指纹状态
+      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
       cleaned++;
     }
   }
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000);
-sessionCleanupTimer.unref?.();
+}, 60 * 60 * 1000); // 每小时
 
 function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
@@ -339,9 +217,9 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
 // 每个请求独立 thread ID
 function newThreadId() { return randomUUID(); }
 
-// CCPM_INITIALIZATION_PATCH_V1
-// 每个 API Key 的初始化使用独立 flight；失败只清理 flight，不推进节流窗口。
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, initFlight, evictWhenIdle }
+// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
+// 每个 API Key 拥有自己的设备指纹和初始化定时器
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
@@ -349,8 +227,6 @@ function getOrCreateKeyState(apiKey) {
     state = {
       fingerprint: generateFingerprint(),
       nextInitAt: 0,
-      initFlight: null,
-      evictWhenIdle: false,
     };
     keyStateStore.set(apiKey, state);
     log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
@@ -358,77 +234,17 @@ function getOrCreateKeyState(apiKey) {
   return state;
 }
 
-function evictExpiredKeyState(apiKey) {
-  const state = keyStateStore.get(apiKey);
-  if (!state) return;
-  const flight = state.initFlight;
-  if (flight && !flight.settled) {
-    state.evictWhenIdle = true;
-    if (!flight.controller.signal.aborted) flight.controller.abort();
-    return;
-  }
-  keyStateStore.delete(apiKey);
-}
-
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
-const INIT_TIMEOUT_DEFAULT_MS = 10000;
-const INIT_TIMEOUT_MIN_MS = 50;
-const INIT_TIMEOUT_MAX_MS = 120000;
-const INIT_RESPONSE_MAX_BYTES = 64 * 1024;
 
-function initializationTimeoutMs() {
-  const value = Number(process.env.CC_INIT_TIMEOUT_MS);
-  return Number.isFinite(value) && value >= INIT_TIMEOUT_MIN_MS && value <= INIT_TIMEOUT_MAX_MS
-    ? Math.floor(value)
-    : INIT_TIMEOUT_DEFAULT_MS;
-}
-
-function initializationAbortError(signal) {
-  const reason = signal?.reason;
-  if (reason && reason.name === 'AbortError') return reason;
-  const error = new Error('The operation was aborted');
-  error.name = 'AbortError';
-  if (reason !== undefined) error.cause = reason;
-  return error;
-}
-
-function throwIfInitializationAborted(signal) {
-  if (signal?.aborted) throw initializationAbortError(signal);
-}
-
-async function consumeInitializationResponse(response, label) {
-  if (!response.ok) {
-    try { await response.body?.cancel(); } catch {}
-    throw new Error(`${label} responded with HTTP ${response.status}`);
-  }
-  if (!response.body) return response;
-  const reader = response.body.getReader();
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalBytes += value.byteLength;
-      if (totalBytes > INIT_RESPONSE_MAX_BYTES) {
-        try { await reader.cancel(); } catch {}
-        throw new Error(`${label} response body exceeds ${INIT_RESPONSE_MAX_BYTES} bytes`);
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return response;
-}
-
-async function performInitialization(apiKey, state, signal) {
-  const timeoutController = new AbortController();
-  const timeoutTimer = setTimeout(() => timeoutController.abort(), initializationTimeoutMs());
-  timeoutTimer.unref?.();
-  const requestSignal = AbortSignal.any([signal, timeoutController.signal]);
+async function ensureInitialized(apiKey, signal) {
+  const state = getOrCreateKeyState(apiKey);
+  const now = Date.now();
+  if (now < state.nextInitAt) return;
 
   try {
+    // 并行发两个预请求
     const headers = {
       'Content-Type': 'application/json',
       'x-cli-environment': 'production',
@@ -436,100 +252,44 @@ async function performInitialization(apiKey, state, signal) {
       'x-command-code-version': CC_VERSION,
     };
     const fingerprint = state.fingerprint || {};
-    const request = (url, body, label) => fetch(url, {
-      method: 'POST', headers, signal: requestSignal, body: JSON.stringify(body),
-    }).then((response) => consumeInitializationResponse(response, label));
 
-    // allSettled 确保另一条预请求也已收尾，避免失败后留下旧 flight 的网络活动。
-    const results = await Promise.allSettled([
-      request(`${CFG.apiBase}/alpha/fingerprint/record`, fingerprint, 'Fingerprint record'),
-      request(`${CFG.apiBase}/alpha/lifecycle-events`, {
-        eventType: 'cli_session_exists',
-        metadata: {
-          sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
-          cliVersion: CC_VERSION,
-          mode: 'interactive',
-          os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
-        },
-      }, 'Lifecycle event'),
+    await Promise.all([
+      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+        method: 'POST', headers, signal,
+        body: JSON.stringify(fingerprint),
+      }).then(r => {
+        if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status });
+        else log('info', 'Fingerprint recorded');
+      }).catch(e => {
+        if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
+      }),
+
+      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+        method: 'POST', headers, signal,
+        body: JSON.stringify({
+          eventType: 'cli_session_exists',
+          metadata: {
+            sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
+            cliVersion: CC_VERSION,
+            mode: 'interactive',
+            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
+          },
+        }),
+      }).then(r => {
+        if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status });
+        else log('info', 'Lifecycle event sent');
+      }).catch(e => {
+        if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message });
+      }),
     ]);
-    const failure = results.find((result) => result.status === 'rejected');
-    if (failure || requestSignal.aborted) {
-      const error = failure?.reason instanceof Error
-        ? failure.reason
-        : new Error('Initialization request aborted');
-      const reason = timeoutController.signal.aborted ? 'timeout' : signal.aborted ? 'abort' : 'failure';
-      log('warn', 'Fingerprint/lifecycle initialization failed; will retry', { reason, error: error.message });
-      return false;
-    }
 
-    // 只有两条请求都拿到 2xx，才开始 8h+2h 节流窗口。
+    // 成功：8h + 2h 随机抖动
     const jitter = Math.floor(Math.random() * INIT_JITTER_MS);
     state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
     log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` });
-    return true;
-  } catch (error) {
-    // 保护 flight 的最终收尾；调用方的 abort 由 waitForInitialization 单独传播。
-    const message = error instanceof Error ? error.message : String(error);
-    log('warn', 'Fingerprint/lifecycle initialization exception; will retry', { error: message });
-    return false;
-  } finally {
-    clearTimeout(timeoutTimer);
+  } catch (e) {
+    if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
   }
-}
-
-function finishInitialization(apiKey, state, flight) {
-  flight.settled = true;
-  if (state.initFlight !== flight) return;
-  state.initFlight = null;
-  if (state.evictWhenIdle && !sessionStore.has(apiKey)) keyStateStore.delete(apiKey);
-}
-
-function startInitialization(apiKey, state) {
-  const flight = { controller: new AbortController(), waiters: 0, settled: false, promise: null };
-  const operation = performInitialization(apiKey, state, flight.controller.signal);
-  flight.promise = operation.then((result) => {
-    finishInitialization(apiKey, state, flight);
-    return result;
-  }, (error) => {
-    finishInitialization(apiKey, state, flight);
-    throw error;
-  });
-  // 即使所有调用方都在 abort 后离开，也要显式消费异常 flight。
-  flight.promise.catch(() => {});
-  state.initFlight = flight;
-  return flight;
-}
-
-async function waitForInitialization(flight, signal) {
-  flight.waiters++;
-  let onAbort = null;
-  try {
-    if (!signal) return await flight.promise;
-    const abortPromise = new Promise((resolve, reject) => {
-      onAbort = () => reject(initializationAbortError(signal));
-      if (signal.aborted) onAbort();
-      else signal.addEventListener('abort', onAbort, { once: true });
-    });
-    const result = await Promise.race([flight.promise, abortPromise]);
-    throwIfInitializationAborted(signal);
-    return result;
-  } finally {
-    if (onAbort) signal.removeEventListener('abort', onAbort);
-    flight.waiters--;
-    if (flight.waiters === 0 && !flight.settled && !flight.controller.signal.aborted) {
-      flight.controller.abort();
-    }
-  }
-}
-
-async function ensureInitialized(apiKey, signal) {
-  const state = getOrCreateKeyState(apiKey);
-  throwIfInitializationAborted(signal);
-  if (Date.now() < state.nextInitAt) return;
-
-  const flight = state.initFlight || startInitialization(apiKey, state);
-  await waitForInitialization(flight, signal);
 }
 
 // ── 模型列表 ───────────────────────────────────────
@@ -1127,20 +887,9 @@ async function handleChatCompletions(req, res) {
   let reader = null;
   let translator = null;
 
-  // CCPM_INITIALIZATION_ABORT_GUARD_V1
-  let initializationComplete = false;
-  const abortInitialization = () => {
-    if (initializationComplete || res.writableEnded) return;
-    if (!abortController.signal.aborted) abortController.abort();
-  };
-  req.once('aborted', abortInitialization);
-  res.once('close', abortInitialization);
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    initializationComplete = true;
-    req.off('aborted', abortInitialization);
-    res.off('close', abortInitialization);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
@@ -1910,20 +1659,9 @@ async function handleMessages(req, res) {
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
-  // CCPM_INITIALIZATION_ABORT_GUARD_V1
-  let initializationComplete = false;
-  const abortInitialization = () => {
-    if (initializationComplete || res.writableEnded) return;
-    if (!abortController.signal.aborted) abortController.abort();
-  };
-  req.once('aborted', abortInitialization);
-  res.once('close', abortInitialization);
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    initializationComplete = true;
-    req.off('aborted', abortInitialization);
-    res.off('close', abortInitialization);
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
@@ -2264,17 +2002,6 @@ function handleHealth(req, res) {
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  // CCPM_LIFECYCLE_GUARD_V1
-  if (upstreamLifecycle.isClosing()) {
-    res.setHeader('Connection', 'close');
-    sendJSON(res, 503, { error: { message: 'Server is shutting down', type: 'server_shutdown' } });
-    return;
-  }
-
-
-
-
-
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -2315,19 +2042,7 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-// CCPM_LIFECYCLE_PATCH_V1
-const upstreamLifecycle = createServerLifecycle(server, { label: "embedded upstream" });
-
-function clearBackgroundTimers() {
-  clearInterval(ccVersionRefreshTimer);
-  clearInterval(sessionCleanupTimer);
-}
-
-export async function shutdownUpstream() {
-  clearBackgroundTimers();
-  return upstreamLifecycle.close();
-}
-export const ready = upstreamLifecycle.listen(CFG.port, CFG.host, () => {
+server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
@@ -2339,20 +2054,3 @@ export const ready = upstreamLifecycle.listen(CFG.port, CFG.host, () => {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });
-ready.catch(() => clearBackgroundTimers());
-await ready;
-
-if (process.env.CC_EMBEDDED_UPSTREAM !== '1') {
-  let standaloneShutdown = null;
-  for (const sig of ['SIGTERM', 'SIGINT']) {
-    process.on(sig, () => {
-      if (standaloneShutdown) return;
-      standaloneShutdown = shutdownUpstream()
-        .then(() => process.exit(0))
-        .catch((error) => {
-          console.error('[embedded upstream] shutdown failed: ' + error.message);
-          process.exit(1);
-        });
-    });
-  }
-}

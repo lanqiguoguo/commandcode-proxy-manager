@@ -1,55 +1,174 @@
 name: publish
+
+# main pushes and explicit semver release tags are the only automatic publish
+# sources. A manual run is still checked below because workflow_dispatch can be
+# started from any branch or tag visible to the operator. There is deliberately
+# no schedule trigger.
 on:
   push:
     branches: [main]
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
-permissions:
-  contents: read
-  packages: write
+
+# No repository or package access is inherited by the ref gate. The publishing
+# job grants only read access to the checkout and write access to GHCR.
+permissions: {}
+
 jobs:
-  build-and-push:
+  ref-gate:
     runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Validate publish ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+
+          die() {
+            printf 'ERROR: %s\n' "$*" >&2
+            exit 1
+          }
+
+          # A release tag is an annotated or lightweight vMAJOR.MINOR.PATCH
+          # tag, with optional semver prerelease/build metadata. The protected
+          # main branch is the only branch that may publish latest.
+          semver_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          case "$EVENT_NAME" in
+            push|workflow_dispatch)
+              case "$REF" in
+                refs/heads/main)
+                  [[ "$REF_PROTECTED" == "true" ]] || die "main ref is not protected: $REF"
+                  ;;
+                refs/tags/*)
+                  tag=${REF#refs/tags/}
+                  [[ "$tag" =~ $semver_tag ]] || die "ref is not an allowed release tag: $REF"
+                  ;;
+                *)
+                  die "publishing is allowed only from protected main or a semver release tag: $REF"
+                  ;;
+              esac
+              ;;
+            *)
+              die "unsupported publish event: $EVENT_NAME"
+              ;;
+          esac
+
+          printf 'publish ref accepted: %s (%s)\n' "$REF" "$EVENT_NAME"
+
+  publish:
+    needs: ref-gate
+    if: needs.ref-gate.result == 'success'
+    runs-on: ubuntu-latest
+    environment: release
+    # latest is a shared image channel, so main and release-tag runs must be
+    # serialized together. Keeping pending runs (rather than cancelling the
+    # active one) prevents an older run from finishing after a newer one.
+    concurrency:
+      group: publish-${{ github.repository }}-latest
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
+
       - name: Test
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install --no-audit --no-fund
-          fi
+          set -euo pipefail
+          npm ci --ignore-scripts
           npm test
-      - name: Read upstream version
-        id: upstream
+
+      - name: Read upstream version and image tags
+        id: meta
+        env:
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          V_TAG=$(cut -d@ -f1 UPSTREAM_VERSION)
-          V_COMMIT=$(cut -d@ -f2 UPSTREAM_VERSION | cut -c1-12)
+          set -euo pipefail
+
+          die() {
+            printf 'ERROR: %s\n' "$*" >&2
+            exit 1
+          }
+
+          version=$(<UPSTREAM_VERSION)
+          upstream_tag=${version%@*}
+          upstream_commit=${version##*@}
+          [[ "$version" == *@* && -n "$upstream_tag" && -n "$upstream_commit" ]] || die "invalid UPSTREAM_VERSION"
+          [[ "$upstream_tag" == master || "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || die "untrusted upstream tag: $upstream_tag"
+          [[ "$upstream_commit" =~ ^[0-9a-fA-F]{40}$ || "$upstream_commit" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid upstream commit: $upstream_commit"
+
+          image="ghcr.io/${REPOSITORY,,}"
+          smoke_image="$image:smoke-${SOURCE_SHA:0:12}-${RUN_ID}"
+          docker_upstream_tag=${upstream_tag//+/_}
+          [[ ${#docker_upstream_tag} -le 128 ]] || die "upstream tag is too long for Docker: $upstream_tag"
+          release_tag=""
+          docker_release_tag=""
+          if [[ "$SOURCE_REF" == refs/tags/* ]]; then
+            release_tag=${SOURCE_REF#refs/tags/}
+            [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || die "invalid release tag: $release_tag"
+            docker_release_tag=${release_tag//+/_}
+            [[ ${#docker_release_tag} -le 128 ]] || die "release tag is too long for Docker: $release_tag"
+          elif [[ "$SOURCE_REF" != refs/heads/main ]]; then
+            die "publish ref changed after the ref gate: $SOURCE_REF"
+          fi
+
           {
-            echo "tags<<TAGS_EOF"
-            echo "ghcr.io/${GITHUB_REPOSITORY}:latest"
-            echo "ghcr.io/${GITHUB_REPOSITORY}:upstream-${V_TAG}"
-            echo "ghcr.io/${GITHUB_REPOSITORY}:upstream-${V_COMMIT}"
-            echo "TAGS_EOF"
+            printf 'image=%s\n' "$image"
+            printf 'smoke_image=%s\n' "$smoke_image"
+            printf 'tags<<TAGS_EOF\n'
+            printf '%s:latest\n' "$image"
+            if [[ -n "$docker_release_tag" ]]; then
+              printf '%s:%s\n' "$image" "$docker_release_tag"
+            fi
+            printf '%s:upstream-%s\n' "$image" "$docker_upstream_tag"
+            printf '%s:upstream-%s\n' "$image" "${upstream_commit:0:12}"
+            printf 'TAGS_EOF\n'
           } >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Build smoke image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.smoke_image }}
+
+      - name: Smoke test image with local upstream
+        run: bash scripts/container-smoke.sh "${{ steps.meta.outputs.smoke_image }}"
+
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v6
+
+      - name: Build and push release image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.upstream.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }}

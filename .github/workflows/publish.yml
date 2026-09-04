@@ -32,6 +32,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ inputs.source_ref || github.ref }}
+          SOURCE_INPUT_REF: ${{ inputs.source_ref }}
+          SOURCE_INPUT_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
 
@@ -45,11 +47,13 @@ jobs:
           # publication reaches this workflow through workflow_call only after
           # upstream-sync has completed successfully.
           semver_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
-          case "$EVENT_NAME" in
-            workflow_call)
-              [[ "$REF" == refs/heads/main ]] || die "workflow_call source is not main: $REF"
-              ;;
-            push|workflow_dispatch)
+          if [[ -n "$SOURCE_INPUT_REF" || -n "$SOURCE_INPUT_SHA" ]]; then
+            [[ "$SOURCE_INPUT_REF" == refs/heads/main ]] || die "synchronized source is not main: $SOURCE_INPUT_REF"
+            [[ "$SOURCE_INPUT_SHA" =~ ^[0-9a-fA-F]{40}$ || "$SOURCE_INPUT_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || \
+              die "synchronized source SHA is invalid: $SOURCE_INPUT_SHA"
+          else
+            case "$EVENT_NAME" in
+              push|workflow_dispatch)
               case "$REF" in
                 refs/heads/main)
                   [[ "$EVENT_NAME" == workflow_dispatch ]] || die "direct main push must pass through upstream-sync: $REF"
@@ -62,11 +66,12 @@ jobs:
                   die "publishing is allowed only from the synchronized main source or a semver release tag: $REF"
                   ;;
               esac
-              ;;
-            *)
-              die "unsupported publish event: $EVENT_NAME"
-              ;;
-          esac
+                ;;
+              *)
+                die "unsupported publish event: $EVENT_NAME"
+                ;;
+            esac
+          fi
 
           printf 'publish ref accepted: %s (%s)\n' "$REF" "$EVENT_NAME"
 

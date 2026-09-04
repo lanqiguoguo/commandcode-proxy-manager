@@ -60,12 +60,14 @@ run_gate() {
   local event_name=$2
   local ref=$3
   local expected=$4
+  local source_ref=${5:-}
+  local source_sha=${6:-}
   local log="$T/$label.log"
 
   if [[ "$expected" == pass ]]; then
     if ! (
       cd "$T"
-      EVENT_NAME="$event_name" REF="$ref" \
+      EVENT_NAME="$event_name" REF="$ref" SOURCE_INPUT_REF="$source_ref" SOURCE_INPUT_SHA="$source_sha" \
         bash "$GATE_SCRIPT" > "$log" 2>&1
     ); then
       sed -n '1,80p' "$log" >&2 || true
@@ -78,7 +80,7 @@ run_gate() {
 
   if (
     cd "$T"
-    EVENT_NAME="$event_name" REF="$ref" \
+    EVENT_NAME="$event_name" REF="$ref" SOURCE_INPUT_REF="$source_ref" SOURCE_INPUT_SHA="$source_sha" \
       bash "$GATE_SCRIPT" > "$log" 2>&1
   ); then
     sed -n '1,80p' "$log" >&2 || true
@@ -87,8 +89,10 @@ run_gate() {
   ok "$label -> reject"
 }
 
-# main publication must come through the reusable workflow after sync.
-run_gate synchronized-main workflow_call refs/heads/main pass
+# main publication must come through the reusable workflow after sync. The
+# caller event remains visible as push, so the required inputs identify it.
+run_gate synchronized-main push refs/heads/main pass refs/heads/main 98502ffdea90928a0f68117eac40b05a0f28ab0b
+run_gate synchronized-main-invalid-sha push refs/heads/main reject refs/heads/main not-a-sha
 run_gate direct-main-push push refs/heads/main reject
 run_gate manual-main workflow_dispatch refs/heads/main pass
 

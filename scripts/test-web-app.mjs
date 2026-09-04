@@ -226,10 +226,10 @@ function response(status, body = {}) {
   return { status, ok: status >= 200 && status < 300, json: async () => body };
 }
 
-function historyItem(model) {
+function historyItem(model, overrides = {}) {
   return { ts: 1725400000000, keyId: "key-1", model, stream: false, ok: true, status: 200,
     inputTokens: 1, outputTokens: 2, cachedTokens: 0, retries: 0, latencyMs: 4,
-    eventType: "request", requestId: model + "-request" };
+    eventType: "request", requestId: model + "-request", ...overrides };
 }
 
 async function flush() {
@@ -344,8 +344,8 @@ function createHarness({ token = "token-a", hash = "#/history" } = {}) {
     csvBlobs,
     session,
     async ready() { await flush(); await flush(); },
-    async resolveHistory(index, model, page = 1, total = 100) {
-      historyRequests[index].deferred.resolve(response(200, { items: [historyItem(model)], total, page }));
+    async resolveHistory(index, model, page = 1, total = 100, overrides = {}) {
+      historyRequests[index].deferred.resolve(response(200, { items: [historyItem(model, overrides)], total, page }));
       await flush();
     },
     async rejectHistory(index, error) {
@@ -407,6 +407,35 @@ async function testHistoryRequestSequence() {
   assert.equal(harness.document.app.innerHTML.includes("历史记录加载失败：history unavailable"), true, "current history errors are observable");
 }
 
+async function testHistoryCacheRateFormatting() {
+  const cases = [
+    { inputTokens: 5, outputTokens: 7, cachedTokens: 1, expected: "5 / 7 / 1 / 20.00%" },
+    { inputTokens: 3, outputTokens: 4, cachedTokens: 2, expected: "3 / 4 / 2 / 66.67%" },
+    { inputTokens: 0, outputTokens: 0, cachedTokens: 0, expected: "0 / 0 / 0 / 0.00%" },
+    { inputTokens: 1, outputTokens: 0, cachedTokens: 2, expected: "1 / 0 / 2 / 200.00%" }
+  ];
+  for (const [index, fixture] of cases.entries()) {
+    const harness = createHarness();
+    await harness.ready();
+    await harness.resolveHistory(0, "cache-rate-" + index, 1, 1, fixture);
+    const html = harness.document.app.innerHTML;
+    assert.equal(html.includes("<th>入/出/缓存/缓存率</th>"), true, "history header includes cache rate");
+    assert.equal(html.includes(fixture.expected), true, "history row formats cache rate " + fixture.expected);
+  }
+
+  for (const [index, fixture] of [
+    { inputTokens: undefined, cachedTokens: undefined },
+    { inputTokens: NaN, cachedTokens: Infinity }
+  ].entries()) {
+    const harness = createHarness();
+    await harness.ready();
+    await harness.resolveHistory(0, "missing-cache-rate-" + index, 1, 1, fixture);
+    const html = harness.document.app.innerHTML;
+    assert.equal(html.includes(" / 2 / - / -"), true, "missing or non-finite cache data displays dashes");
+    assert.equal(/(?:NaN|Infinity|undefined)%/.test(html), false, "invalid cache rates never reach history HTML");
+  }
+}
+
 async function testCsvUsesExternalRequestRows() {
   const harness = createHarness();
   await harness.ready();
@@ -414,11 +443,16 @@ async function testCsvUsesExternalRequestRows() {
   harness.document.getElementById("h-csv").click();
   await flush();
   assert.equal(harness.historyRequests.length, 2, "CSV export fetches the filtered history source");
-  await harness.resolveHistory(1, "csv-request-row", 1, 1);
+  await harness.resolveHistory(1, "csv-request-row", 1, 1, { inputTokens: 5, outputTokens: 7, cachedTokens: 1 });
   assert.equal(harness.csvBlobs.length, 1, "CSV export creates one document");
   const csv = await harness.csvBlobs[0].text();
+  const [header, row] = csv.split("\n");
+  const expectedHeader = ["时间", "Key", "模型", "流式", "状态", "错误", "入tok", "出tok", "缓存tok", "缓存率", "重试", "延迟ms"];
+  assert.deepEqual(header.split(","), expectedHeader, "CSV header preserves order and adds cache rate");
   assert.equal(csv.split("\n").length, 2, "one external request produces one CSV data row");
+  assert.equal(row.split(",").length, expectedHeader.length, "CSV row has the same column count as its header");
   assert.equal(csv.includes("csv-request-row"), true, "CSV contains the returned request row");
+  assert.equal(row.split(",")[9], '"20.00%"', "CSV uses the same cache rate formatting as history HTML");
 }
 
 async function testSseStateMachine() {
@@ -521,6 +555,7 @@ async function main() {
   process.on("unhandledRejection", onUnhandled);
   try {
     await testHistoryRequestSequence();
+    await testHistoryCacheRateFormatting();
     await testCsvUsesExternalRequestRows();
     await testSseStateMachine();
     await testSessionCleanup();

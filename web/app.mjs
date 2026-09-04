@@ -170,6 +170,19 @@ function fmtTok(v) {
   if (v == null || !Number.isFinite(Number(v))) return "-";
   return esc(String(v));
 }
+function toFiniteNumber(v) {
+  if (v == null || (typeof v === "string" && v.trim() === "")) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function fmtCacheRate(inputTokens, cachedTokens) {
+  const input = toFiniteNumber(inputTokens);
+  const cached = toFiniteNumber(cachedTokens);
+  if (input == null || cached == null) return "-";
+  if (input === 0 && cached === 0) return "0.00%";
+  const rate = cached / input * 100;
+  return Number.isFinite(rate) ? rate.toFixed(2) + "%" : "-";
+}
 // 统一时间格式：2026/09/02 00:45:38（24 小时制，不随浏览器 locale 变化）
 function fmtTime(ts) {
   if (!ts) return "-";
@@ -471,9 +484,10 @@ function renderHistory() {
     '<div><label>结束</label><input type="datetime-local" id="h-to"></div>' +
     '<div><label>&nbsp;</label><button id="h-search">查询</button> <button id="h-csv" class="ghost">导出 CSV</button></div>' +
     "</div></div>";
-  html += '<div class="card"><div class="table-scroll"><table><thead><tr><th>时间</th><th>Key</th><th>模型</th><th>流式</th><th>状态</th><th>错误</th><th>入/出/缓存 tok</th><th>重试</th><th>延迟</th></tr></thead><tbody>';
+  html += '<div class="card"><div class="table-scroll"><table><thead><tr><th>时间</th><th>Key</th><th>模型</th><th>流式</th><th>状态</th><th>错误</th><th>入/出/缓存/缓存率</th><th>重试</th><th>延迟</th></tr></thead><tbody>';
   for (const it of state.history.items || []) {
     const keyName = (state.keys.find((k) => k.id === it.keyId) || {}).alias || it.keyId;
+    const cacheRate = fmtCacheRate(it.inputTokens, it.cachedTokens);
     html += "<tr>" +
       "<td>" + fmtTime(it.ts) + "</td>" +
       "<td>" + esc(keyName) + "</td>" +
@@ -481,7 +495,7 @@ function renderHistory() {
       "<td>" + (it.stream ? "是" : "否") + "</td>" +
       '<td><span class="badge ' + (it.ok ? "ok" : "bad") + '">' + it.status + "</span></td>" +
       '<td class="muted small">' + esc(it.errorKind || "") + "</td>" +
-      '<td class="mono small">' + fmtTok(it.inputTokens) + " / " + fmtTok(it.outputTokens) + " / " + fmtTok(it.cachedTokens) + "</td>" +
+      '<td class="mono small">' + fmtTok(it.inputTokens) + " / " + fmtTok(it.outputTokens) + " / " + fmtTok(it.cachedTokens) + " / " + esc(cacheRate) + "</td>" +
       "<td>" + (it.retries || 0) + "</td>" +
       "<td>" + (it.latencyMs != null ? Math.round(it.latencyMs) + "ms" : "-") + "</td>" +
       "</tr>";
@@ -609,11 +623,12 @@ async function exportCsv() {
   if (to) params.set("to", to);
   params.set("pageSize", "500");
   const data = await api("/admin/api/history?" + params.toString());
-  const head = ["时间", "Key", "模型", "流式", "状态", "错误", "入tok", "出tok", "缓存tok", "重试", "延迟ms"];
+  const head = ["时间", "Key", "模型", "流式", "状态", "错误", "入tok", "出tok", "缓存tok", "缓存率", "重试", "延迟ms"];
   const rows = [head.join(",")];
   for (const it of data.items || []) {
     const keyName = (state.keys.find((k) => k.id === it.keyId) || {}).alias || it.keyId;
-    rows.push([new Date(it.ts).toISOString(), keyName, it.model || "", it.stream ? "yes" : "no", it.status, it.errorKind || "", it.inputTokens ?? "", it.outputTokens ?? "", it.cachedTokens ?? "", it.retries || 0, it.latencyMs ?? ""].map(csvCell).join(","));
+    const cacheRate = fmtCacheRate(it.inputTokens, it.cachedTokens);
+    rows.push([new Date(it.ts).toISOString(), keyName, it.model || "", it.stream ? "yes" : "no", it.status, it.errorKind || "", it.inputTokens ?? "", it.outputTokens ?? "", it.cachedTokens ?? "", cacheRate, it.retries || 0, it.latencyMs ?? ""].map(csvCell).join(","));
   }
   const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");

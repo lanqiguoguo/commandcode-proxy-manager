@@ -239,7 +239,7 @@ async function flush() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-function createHarness({ token = "token-a", hash = "#/history" } = {}) {
+function createHarness({ token = "token-a", hash = "#/history", keys = [], pool = null } = {}) {
   const document = new FakeDocument();
   const timers = new TimerHarness();
   const session = new Map(token ? [["ccpm_token", token]] : []);
@@ -252,6 +252,7 @@ function createHarness({ token = "token-a", hash = "#/history" } = {}) {
   const poolProbeResponses = [];
   const fetchCalls = [];
   const csvBlobs = [];
+  const poolData = pool || { counts: {}, stats: {}, poolCfg: {} };
   class CaptureBlob extends Blob {
     constructor(parts, options) {
       super(parts, options);
@@ -261,14 +262,14 @@ function createHarness({ token = "token-a", hash = "#/history" } = {}) {
   const fetch = (url, options = {}) => {
     fetchCalls.push({ url: String(url), options });
     if (String(url).startsWith("/admin/api/keys")) {
-      return Promise.resolve(response(200, { keys: [] }));
+      return Promise.resolve(response(200, { keys }));
     }
     if (String(url).startsWith("/admin/api/pool")) {
       if (options.cache === "no-store") {
         const result = poolProbeResponses.shift() || response(200, {});
         return Promise.resolve(result);
       }
-      return Promise.resolve(response(200, { counts: {}, stats: {}, poolCfg: {} }));
+      return Promise.resolve(response(200, poolData));
     }
     if (String(url).startsWith("/admin/api/history")) {
       const deferred = new Deferred();
@@ -455,6 +456,55 @@ async function testCsvUsesExternalRequestRows() {
   assert.equal(row.split(",")[9], '"20.00%"', "CSV uses the same cache rate formatting as history HTML");
 }
 
+function dashboardKey(totals = {}) {
+  return {
+    id: "dashboard-key",
+    alias: "主账号",
+    maskedKey: "user_5***XYoU",
+    priority: 0,
+    enabled: true,
+    health: {},
+    quota: {
+      updatedAt: 1725400000000,
+      totals: { runs: 8, tokens: 64, ...totals }
+    },
+    usage: {
+      h5: { requests: 0, input: 0, output: 0 },
+      d7: { requests: 0, input: 0, output: 0, err429: 0, errOther: 0 },
+      d30: { requests: 0 },
+      d30Valid: true
+    }
+  };
+}
+
+async function dashboardHtml(totals = {}) {
+  const harness = createHarness({
+    hash: "#/dashboard",
+    keys: [dashboardKey(totals)],
+    pool: { counts: { enabled: 1 }, stats: { requests: 81, success: 80 }, poolCfg: {} }
+  });
+  await harness.ready();
+  return harness.document.app.innerHTML;
+}
+
+async function testDashboardSuccessRateFormatting() {
+  for (const [value, expected] of [[98.765, "98.77%"], [100, "100.00%"], [0, "0.00%"]]) {
+    const html = await dashboardHtml({ successRate: value });
+    assert.equal(html.includes('<div class="ms-v mono">' + expected + "</div>"), true, "Key card renders success rate " + expected);
+    assert.equal(html.includes('<div class="stat"><div class="v">99%</div><div class="k">成功率</div></div>'), true, "top overview success rate remains an integer");
+  }
+
+  const missingHtml = await dashboardHtml();
+  assert.equal(missingHtml.includes('<div class="ms-k">成功率</div>'), false, "missing Key success rate is not rendered");
+  assert.equal(/(?:NaN|Infinity|undefined)%/.test(missingHtml), false, "missing success rate never reaches dashboard HTML");
+
+  for (const value of [NaN, Infinity, "not-a-number"]) {
+    const html = await dashboardHtml({ successRate: value });
+    assert.equal(html.includes('<div class="ms-k">成功率</div>'), false, "invalid Key success rate is not rendered");
+    assert.equal(/(?:NaN|Infinity|undefined)%/.test(html), false, "invalid success rate never reaches dashboard HTML");
+  }
+}
+
 async function testSseStateMachine() {
   const harness = createHarness({ hash: "#/dashboard" });
   await harness.ready();
@@ -557,6 +607,7 @@ async function main() {
     await testHistoryRequestSequence();
     await testHistoryCacheRateFormatting();
     await testCsvUsesExternalRequestRows();
+    await testDashboardSuccessRateFormatting();
     await testSseStateMachine();
     await testSessionCleanup();
     await testLoginStartsSingleton();

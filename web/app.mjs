@@ -374,9 +374,10 @@ function keyCard(k) {
   let totalsHtml = '<div class="muted small">暂无账期汇总数据</div>';
   if (q && q.totals) {
     const t = q.totals;
+    const successRate = toFiniteNumber(t.successRate);
     totalsHtml = '<div class="mini-stats">' +
       '<div class="ms"><div class="ms-v mono">' + fmtNum(t.runs) + '</div><div class="ms-k">本账期调用（次）</div></div>' +
-      (t.successRate != null ? '<div class="ms"><div class="ms-v mono">' + t.successRate + "%</div><div class=\"ms-k\">成功率</div></div>" : "") +
+      (successRate != null ? '<div class="ms"><div class="ms-v mono">' + successRate.toFixed(2) + "%</div><div class=\"ms-k\">成功率</div></div>" : "") +
       '<div class="ms"><div class="ms-v mono">' + fmtNum(t.tokens) + '</div><div class="ms-k">总 Token</div></div>' +
       "</div>";
   }

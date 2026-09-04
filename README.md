@@ -290,11 +290,16 @@ bash scripts/container-smoke.sh ccpm-container-smoke:local
 伪造通过。静态门禁命中任何结果都应停止发布：
 
 ```bash
-if rg -n \
-  -e 'patch-upstream' \
-  -e 'CCPM_.*PATCH_V1' \
-  -e 'import\(.*upstream/proxy\.mjs' \
-  scripts src upstream; then
+legacy_name='patch'
+legacy_name+='-'
+legacy_name+='upstream'
+legacy_marker='CCPM_'
+legacy_marker+='.*'
+legacy_marker+='PATCH_V1'
+legacy_import='import\('
+legacy_import+='[^)]*'
+legacy_import+='upstream/proxy\.mjs'
+if rg -n -e "$legacy_name" -e "$legacy_marker" -e "$legacy_import" scripts src upstream; then
   exit 1
 fi
 ```

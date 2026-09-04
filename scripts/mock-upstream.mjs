@@ -10,6 +10,7 @@
 // 管理端点：GET /__calls 调用记录；GET /__init-calls 初始化调用记录；GET /__slow slowsse 断流观测；POST /__reset 清空
 import http from "http";
 import { setTimeout as sleep } from "timers/promises";
+import { performance } from "node:perf_hooks";
 
 const PORT = Number(process.env.MOCK_PORT || 3051);
 const HOST = process.env.MOCK_HOST || "127.0.0.1";
@@ -103,13 +104,15 @@ const server = http.createServer((req, res) => {
     //    串行/间隔断言，但不进 /__calls 计数，避免干扰 chat 路径断言）。
     //    resetAt 故意用 epoch 毫秒——与真实 API 一致，回归 parseWindow 数字形态。
     if (p === "/alpha/whoami" || p.startsWith("/alpha/billing") || p.startsWith("/alpha/usage")) {
-      const now = Date.now();
+      // quotaLog 只用于区间/耗时断言，必须使用单调时钟；API 返回的 resetAt
+      // 仍使用 Date.now()，保持真实 wall-clock 时间语义。
+      const now = performance.now();
       // 持有自身条目引用：/__reset 清空数组不影响在途探测的回填（防 undefined 崩溃）
       const e = { p, auth, start: now, active: ++quotaActive };
       quotaLog.push(e);
       if (quotaActive > quotaMaxActive) quotaMaxActive = quotaActive;
       await sleep(quotaLatency); // 轻微延迟，让并发/串行可测
-      e.end = Date.now(); e.active = --quotaActive;
+      e.end = performance.now(); e.active = --quotaActive;
       if (p === "/alpha/whoami") return json(res, 200, { success: true, data: { org: { id: "o_test" } } });
       if (p === "/alpha/billing/credits") return json(res, 200, {
         credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 },

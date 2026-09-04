@@ -1682,14 +1682,11 @@ async function main() {
   const ql = JSON.parse((await mockGet("/__quota")).body);
   ql.maxActive === 1 && ql.quotaLog.length >= 8
     ? ok("并发刷新被串行化（探测 maxActive=1，共 " + ql.quotaLog.length + " 次）") : bad("串行化", "maxActive=" + ql.maxActive);
-  // 同 Key 连续探测时间线不得重叠（串行队列核心不变式）。
-  // 容忍 20ms：mock 的 start/end 时间戳记在 handler 两端，事件循环在高负载下
-  // 的调度抖动会让相邻探测的记录区间产生 <20ms 的表观重叠（真实并发在
-  // maxActive=1 主断言即被捕获；即便主断言因时序缝隙漏过，真并发的重叠时长
-  // ≈ MOCK_QUOTA_LATENCY(120ms) 也远超容差）。
+  // 同 Key 连续探测时间线不得重叠（串行队列核心不变式）。quotaLog 使用
+  // mock 进程的 performance.now()，因此这里比较的是单调时间，不受 wall clock 调整影响。
   let overlap = 0;
   const sorted = [...ql.quotaLog].sort((a, b) => a.start - b.start);
-  for (let i = 1; i < sorted.length; i++) if (sorted[i].start < sorted[i - 1].end - 20) overlap++;
+  for (let i = 1; i < sorted.length; i++) if (sorted[i].start < sorted[i - 1].end) overlap++;
   overlap === 0 ? ok("探测时间线零重叠（严格串行）") : bad("时间线重叠", overlap + " 处");
   const qEvents = sseEvents.filter(([n]) => n === "quota-status");
   const phases = qEvents.map(([, d]) => { try { return JSON.parse(d).phase; } catch { return ""; } });

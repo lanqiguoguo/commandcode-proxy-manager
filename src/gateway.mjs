@@ -1,10 +1,12 @@
 // ── 网关：clientToken 鉴权 + 主备选 Key + 429 退避/同 Key 重试 + 流式透传 ──
-// 转发目标 = 同进程嵌入的上游代理（127.0.0.1:3050），协议转换全部交给上游
+// 转发目标 = 管理器通过 HTTP 连接的上游代理：托管模式由管理器启动本地子进程，
+// 外置模式连接 UPSTREAM_HOST:UPSTREAM_PORT；协议转换全部交给上游。
 import { getConfig } from "./config.mjs";
 import * as pool from "./keyPool.mjs";
 import * as stats from "./stats.mjs";
 import { safeEqual } from "./tokens.mjs";
 import { randomUUID } from "crypto";
+import { performance } from "node:perf_hooks";
 
 // 非流式响应体读取上限：LLM 非流式 JSON 响应远小于此，纯防内存放大（M3）。
 // 请求体侧已有 100MB 上限（readBody），响应体原无上限——upRes.text() 被 undici
@@ -495,6 +497,7 @@ export async function handleGateway(req, res, url) {
   let lastErrorKind = "rate_limit";
   let lastKeyId = null;
   const startedAt = Date.now();
+  const startedMono = performance.now();
   const requestId = randomUUID();
   const attemptedKeyIds = [];
   let requestEventRecorded = false;
@@ -512,6 +515,7 @@ export async function handleGateway(req, res, url) {
   } = {}) => {
     if (requestEventRecorded) return;
     requestEventRecorded = true;
+    const elapsedMs = performance.now() - startedMono;
     stats.appendEvent({
       eventType: stats.EVENT_TYPE_REQUEST,
       requestId,
@@ -527,7 +531,7 @@ export async function handleGateway(req, res, url) {
       attempts,
       retries: Math.max(0, attempts - 1),
       attemptedKeyIds: attemptedKeyIds.length ? [...attemptedKeyIds] : undefined,
-      latencyMs: Date.now() - startedAt,
+      latencyMs: Number.isFinite(elapsedMs) ? Math.max(0, Math.round(elapsedMs)) : 0,
     });
   };
   const recordClientAbort = ({ keyId = lastKeyId, stream: eventStream = stream } = {}) => {

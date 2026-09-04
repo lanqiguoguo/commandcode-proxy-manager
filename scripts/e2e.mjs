@@ -978,6 +978,62 @@ async function main() {
   clearBackoffResponse.status === 200 && JSON.parse(clearBackoffResponse.body).durable === true && clearBackoffState.failCount === 0 && clearBackoffState.backoffUntilMs === 0
     ? ok("clear-backoff 成功后 state.json 即时更新") : bad("clear-backoff state", JSON.stringify({ response: clearBackoffResponse, state: clearBackoffState }));
 
+  // ── T6b 模型套餐错误不污染 Key 健康，未知 403 仍按 auth ──
+  console.log("\n=== T6b model plan error classification ===");
+  await restartClean();
+  await mock("/__control", { auth: "user_keyA", responses: [{
+    mode: "model_plan", status: 401,
+    message: "MODEL_NOT_IN_PLAN: model is not included in this plan (Bearer user_keyA; fixture-user@example.com)"
+  }] });
+  r = await gw({ model: "m-model-plan-401", messages: [] });
+  let modelPlanBody = parseJsonResponse(r, "MODEL_NOT_IN_PLAN 401");
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  r.status === 401 && modelPlanBody.error?.code === "MODEL_NOT_IN_PLAN" &&
+    modelPlanBody.error?.type === "authentication_error" &&
+    modelPlanBody.error?.message.includes("MODEL_NOT_IN_PLAN") &&
+    !r.body.includes("user_keyA") && !r.body.includes("fixture-user@example.com") &&
+    kA.health.authError === false && kA.health.backoffUntilMs <= Date.now()
+    ? ok("MODEL_NOT_IN_PLAN 401 透传语义且不污染 auth health")
+    : bad("MODEL_NOT_IN_PLAN 401 分类", JSON.stringify({ status: r.status, body: r.body.replaceAll("user_keyA", "user_***").replaceAll("fixture-user@example.com", "[redacted]"), health: kA.health }));
+  r = await http1(MG + "/v1/models", "GET", { Authorization: "Bearer " + CLIENT });
+  r.status === 200 ? ok("MODEL_NOT_IN_PLAN 后同一 Key /v1/models 仍为 200") : bad("套餐错误后 models", "status=" + r.status);
+
+  await mock("/__control", { auth: "user_keyA", responses: [{
+    mode: "model_plan", status: 403, code: "MODEL_NOT_SUPPORTED_BY_PLAN",
+    message: "model is not supported by this plan"
+  }] });
+  r = await gw({ model: "m-model-plan-403", messages: [] });
+  modelPlanBody = parseJsonResponse(r, "model plan 403");
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  r.status === 403 && modelPlanBody.error?.code === "MODEL_NOT_SUPPORTED_BY_PLAN" &&
+    kA.health.authError === false && kA.health.backoffUntilMs <= Date.now()
+    ? ok("明确模型套餐错误 403 保留状态码且不标 auth")
+    : bad("模型套餐 403 分类", JSON.stringify({ status: r.status, body: r.body, health: kA.health }));
+  r = await http1(MG + "/v1/models", "GET", { Authorization: "Bearer " + CLIENT });
+  r.status === 200 ? ok("模型套餐 403 后同一 Key 仍可请求 models") : bad("套餐 403 后 models", "status=" + r.status);
+
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "client4xx", status: 400 }] });
+  r = await gw({ model: "m-model-plan-ordinary-4xx", messages: [] });
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  r.status === 400 && kA.health.authError === false && kA.health.backoffUntilMs <= Date.now()
+    ? ok("普通 4xx 不误标 auth health")
+    : bad("普通 4xx health", JSON.stringify({ status: r.status, health: kA.health }));
+
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "auth", status: 403 }] });
+  r = await gw({ model: "m-unknown-403", messages: [] });
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  kA.health.authError === true && kA.health.backoffUntilMs > Date.now() && r.status === 403
+    ? ok("未知 403 仍按保守认证失败标记 auth")
+    : bad("未知 403 保守认证", JSON.stringify({ status: r.status, health: kA.health }));
+  const modelPlanStats = await historyForModel("m-model-plan-401");
+  modelPlanStats.length === 1 && modelPlanStats[0].status === 401 && modelPlanStats[0].errorKind === "client" && modelPlanStats[0].ok === false
+    ? ok("模型套餐错误历史按 client 记录且不伪装 auth")
+    : bad("模型套餐历史分类", JSON.stringify(modelPlanStats));
+
   // ── T7 零输出 → 同 Key 重试（决策 8）──
   console.log("\n=== T7 zero output ===");
   await restartClean();

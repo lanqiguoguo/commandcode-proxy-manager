@@ -110,13 +110,114 @@ function isZeroOutput(text) {
   return typeof text === "string" && /zero output|Empty response/i.test(text);
 }
 
-function mapError(status, text) {
-  let message = "";
+// Upstream can use HTTP 401/403 for model entitlement failures as well as
+// invalid credentials. Keep this list deliberately explicit: an unknown
+// 401/403 remains an auth failure and still protects the key pool.
+const MODEL_PLAN_ERROR_CODES = new Set([
+  "MODEL_NOT_IN_PLAN",
+  "MODEL_NOT_INCLUDED_IN_PLAN",
+  "MODEL_NOT_SUPPORTED_BY_PLAN",
+  "MODEL_NOT_AVAILABLE_ON_PLAN",
+  "MODEL_NOT_IN_SUBSCRIPTION",
+  "MODEL_NOT_INCLUDED_IN_SUBSCRIPTION",
+  "MODEL_REQUIRES_SUBSCRIPTION",
+  "MODEL_NOT_ENTITLED",
+  "MODEL_ENTITLEMENT_REQUIRED",
+  "MODEL_REQUIRES_UPGRADE",
+  "MODEL_PLAN_REQUIRED",
+  "PLAN_REQUIRED",
+  "PLAN_REQUIRED_FOR_MODEL",
+  "SUBSCRIPTION_REQUIRED_FOR_MODEL",
+  "ENTITLEMENT_REQUIRED_FOR_MODEL",
+]);
+
+function firstString(...values) {
+  return values.find((value) => typeof value === "string" && value.trim())?.trim() || "";
+}
+
+function normalizeErrorCode(value) {
+  return typeof value === "string"
+    ? value.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "")
+    : "";
+}
+
+function parseUpstreamError(text) {
+  let payload = null;
   try {
-    const j = JSON.parse(text);
-    message = (j.error && j.error.message) || j.message || "";
-  } catch {
-    message = (text || "").slice(0, 200);
+    const parsed = JSON.parse(typeof text === "string" ? text : "");
+    if (isRecord(parsed)) payload = parsed;
+  } catch {}
+  const nested = isRecord(payload?.error) ? payload.error : null;
+  const errorText = typeof payload?.error === "string" ? payload.error : "";
+  return {
+    payload,
+    code: firstString(nested?.code, nested?.error_code, nested?.errorCode, payload?.code, payload?.error_code, payload?.errorCode),
+    type: firstString(nested?.type, payload?.type),
+    message: firstString(nested?.message, payload?.message, errorText),
+  };
+}
+
+function hasModelPlanMarker(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const normalized = normalizeErrorCode(value);
+  if (MODEL_PLAN_ERROR_CODES.has(normalized)) return true;
+  if (/(?:^|[^A-Z0-9])MODEL(?:[_\s-]+)NOT(?:[_\s-]+)IN(?:[_\s-]+)PLAN(?:$|[^A-Z0-9])/i.test(value)) return true;
+  return false;
+}
+
+function isModelPlanMessage(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  if (!/\b(?:plan|subscription|entitlement|upgrade)\b/i.test(value)) return false;
+  return [
+    /\bmodel\b[\s\S]{0,100}\b(?:not included|not available|not supported|not allowed|requires?)\b[\s\S]{0,100}\b(?:plan|subscription|entitlement|upgrade)\b/i,
+    /\bmodel\b[\s\S]{0,80}\b(?:access|permission)\b[\s\S]{0,80}\b(?:denied|forbidden|not allowed|not authorized)\b[\s\S]{0,80}\b(?:plan|subscription|entitlement|upgrade)\b/i,
+    /\b(?:plan|subscription|entitlement)\b[\s\S]{0,100}\b(?:does not|doesn't|cannot|can't|not)\b[\s\S]{0,100}\b(?:include|allow|support|authorize)\b[\s\S]{0,40}\bmodel\b/i,
+  ].some((pattern) => pattern.test(value));
+}
+
+function redactUpstreamMessage(value) {
+  return String(value || "")
+    .slice(0, 200)
+    .replace(/Bearer\s+[^\s,;)]+/gi, "Bearer [REDACTED]")
+    .replace(/\buser_[A-Za-z0-9_-]+\b/g, "user_***")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]");
+}
+
+function safeErrorToken(value) {
+  if (typeof value !== "string") return "";
+  const token = value.trim().slice(0, 128);
+  return /^[A-Za-z][A-Za-z0-9_.:-]*$/.test(token) ? token : "";
+}
+
+function preservedUpstreamError(parsed, text, status) {
+  const body = { error: {} };
+  const code = safeErrorToken(parsed.code);
+  const type = safeErrorToken(parsed.type);
+  const message = redactUpstreamMessage(parsed.message || (text || "").slice(0, 200));
+  if (code) body.error.code = code;
+  if (type) body.error.type = type;
+  body.error.message = message || "Upstream error (" + status + ")";
+  return body;
+}
+
+// Return a category after parsing only the structured error fields that the
+// upstream contract uses. Model-plan errors are checked before status-only
+// handling so a future 429/402 response cannot poison key health either.
+export function classifyUpstreamError(status, text) {
+  const parsed = parseUpstreamError(text);
+  const modelPlan = [parsed.code, parsed.type, parsed.message].some(hasModelPlanMarker) || isModelPlanMessage(parsed.message);
+  if (modelPlan) return { kind: "model_plan", parsed };
+  if (status === 401 || status === 403) return { kind: "auth", parsed };
+  if (status === 402 || status === 429) return { kind: "rate_limit", parsed };
+  if (status >= 500) return { kind: "upstream", parsed };
+  return { kind: "client", parsed };
+}
+
+function mapError(status, text, options = {}) {
+  const parsed = options.parsed || parseUpstreamError(text);
+  const message = redactUpstreamMessage(parsed.message || (text || "").slice(0, 200));
+  if (options.preserveUpstream) {
+    return { status, body: preservedUpstreamError(parsed, text, status) };
   }
   if (status === 402 || status === 429) {
     return { status: 429, body: { error: { message: message || "Rate limited", type: "rate_limit_error" }, retry_after: 30 } };
@@ -721,8 +822,30 @@ export async function handleGateway(req, res, url) {
 
       const text = await upRes.text().catch(() => "");
       const retryAfterMs = parseRetryAfter(upRes, text);
+      const classification = classifyUpstreamError(upRes.status, text);
 
-      if (upRes.status === 401 || upRes.status === 403) {
+      if (classification.kind === "model_plan") {
+        if (clientGone) {
+          activeAc = null;
+          recordClientAbort({ keyId: chosen.id });
+          return;
+        }
+        activeAc = null;
+        lastStatus = upRes.status;
+        lastErrorKind = "client";
+        // Model entitlement is a request-level failure. Do not clear a
+        // concurrent health state or add an auth/rate-limit penalty.
+        if (clientGone || res.writableEnded || res.destroyed) {
+          if (clientGone) recordClientAbort({ keyId: chosen.id });
+          return;
+        }
+        recordRequestEvent({ keyId: chosen.id, status: upRes.status, errorKind: "client" });
+        const mapped = mapError(upRes.status, text, { parsed: classification.parsed, preserveUpstream: true });
+        sendJson(res, mapped.status, mapped.body);
+        return;
+      }
+
+      if (classification.kind === "auth") {
         if (clientGone) {
           activeAc = null;
           recordClientAbort({ keyId: chosen.id });

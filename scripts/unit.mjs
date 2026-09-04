@@ -11,7 +11,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const SC = process.argv[2];
-const SCENARIOS = ["config", "persistence", "quota", "pool", "stats", "logs", "tokens", "state", "durable"];
+const SCENARIOS = ["config", "persistence", "quota", "gateway", "pool", "stats", "logs", "tokens", "state", "durable"];
 
 if (SC && !SCENARIOS.includes(SC)) {
   console.error(`未知 unit 场景：${SC}。可选值：${SCENARIOS.join(", ")}`);
@@ -667,6 +667,39 @@ if (SC === "persistence") {
     "validateStateDocument knownIds 跳过未知坏 key");
   check(validateQuotaCacheDocument({ reports: { k1: validReport, "unknown-id": unknownQuotaReport } }, { knownIds: new Set(["k1"]) }).length === 0,
     "validateQuotaCacheDocument knownIds 跳过未知坏报告");
+}
+
+// ════ gateway ════
+if (SC === "gateway") {
+  console.log("=== gateway upstream error classification ===");
+  const { classifyUpstreamError } = await import("../src/gateway.mjs");
+  const classify = (status, body) => classifyUpstreamError(status, JSON.stringify(body));
+  const model401 = classify(401, {
+    error: { code: "MODEL_NOT_IN_PLAN", type: "authentication_error", message: "model is not included in this plan" }
+  });
+  check(model401.kind === "model_plan", "MODEL_NOT_IN_PLAN 401 → model_plan 非认证类别", JSON.stringify(model401));
+  const model403 = classify(403, {
+    error: { code: "MODEL_NOT_SUPPORTED_BY_PLAN", message: "model is not supported by this plan" }
+  });
+  check(model403.kind === "model_plan", "明确模型套餐码 403 → model_plan 非认证类别", JSON.stringify(model403));
+  const modelMessage = classify(401, {
+    error: { type: "authentication_error", message: "The selected model is not available for this subscription" }
+  });
+  check(modelMessage.kind === "model_plan", "明确模型/订阅文案 → model_plan 非认证类别", JSON.stringify(modelMessage));
+  const modelMarkerMessage = classify(401, {
+    error: { type: "authentication_error", message: "MODEL_NOT_IN_PLAN" }
+  });
+  check(modelMarkerMessage.kind === "model_plan", "仅 message 中的 MODEL_NOT_IN_PLAN → model_plan", JSON.stringify(modelMarkerMessage));
+  const auth401 = classify(401, { error: { type: "authentication_error", message: "invalid api key" } });
+  check(auth401.kind === "auth", "真正凭证错误 401 → auth", JSON.stringify(auth401));
+  const unknown403 = classify(403, { error: { type: "forbidden", message: "access denied" } });
+  check(unknown403.kind === "auth", "未知 403 → 保守 auth", JSON.stringify(unknown403));
+  const genericModel403 = classify(403, { error: { code: "MODEL_ACCESS_DENIED", type: "forbidden", message: "model access denied" } });
+  check(genericModel403.kind === "auth", "无套餐上下文的模型 access denied → 保守 auth", JSON.stringify(genericModel403));
+  const genericModel401 = classify(401, { error: { code: "MODEL_NOT_SUPPORTED", type: "authentication_error", message: "invalid api key" } });
+  check(genericModel401.kind === "auth", "通用 MODEL_NOT_SUPPORTED + 凭证错误 → auth", JSON.stringify(genericModel401));
+  const ordinary4xx = classify(422, { error: { type: "invalid_request_error", message: "bad request" } });
+  check(ordinary4xx.kind === "client", "普通 4xx → client 且不进入 auth", JSON.stringify(ordinary4xx));
 }
 
 // ════ keyPool ════

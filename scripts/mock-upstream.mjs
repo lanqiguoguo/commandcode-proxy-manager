@@ -2,7 +2,7 @@
 // 行为通道：
 //   1) 请求 body 的 testMode 字段（经网关原样转发的 body 传递）
 //   2) POST /__control {auth, responses:[{mode,...}]} 设置该 Key 的响应队列（优先）
-// 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | server5xx | hang | bodyhang | delay(delayMs)
+// 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | model_plan | server5xx | hang | bodyhang | delay(delayMs)
 //          | empty | malformed | truncated | missingstructure | empty_sse | malformed_sse | missingdone | unterminateddone | split_sse
 //          | cutstream（200 SSE 写数帧后 destroy，模拟上游流中途断连）| cutbody（200 JSON 写半身后 destroy）
 //          | badusage（200 JSON，usage 字段为字符串/对象/null 恶意值，P1-6 净化验证）
@@ -209,7 +209,18 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (spec.mode === "auth") {
-      json(res, 401, { error: { message: "invalid api key (mock)", type: "auth_error" } });
+      json(res, spec.status || 401, { error: { message: "invalid api key (mock)", type: "auth_error" } });
+      return;
+    }
+    if (spec.mode === "model_plan") {
+      json(res, spec.status || 401, {
+        error: {
+          code: spec.code || "MODEL_NOT_IN_PLAN",
+          message: spec.message || "MODEL_NOT_IN_PLAN: model is not included in the current plan",
+          type: spec.type || "authentication_error"
+        },
+        account: { email: "fixture-user@example.com", apiKey: auth, authorization: "Bearer " + auth }
+      });
       return;
     }
     if (spec.mode === "server5xx") {

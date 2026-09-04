@@ -237,7 +237,8 @@ async function doProbe(keyId, signal) {
   let probeErr = "";
   try {
     const whoami = requirePayload("whoami", await fetchJsonWithSignal(API_BASE + PATH_WHOAMI, rec.key, signal));
-    if (whoami.org !== undefined && (!isRecord(whoami.org) || typeof whoami.org.id !== "string" || !whoami.org.id)) {
+    if (whoami.org !== undefined && whoami.org !== null &&
+      (!isRecord(whoami.org) || typeof whoami.org.id !== "string" || !whoami.org.id)) {
       throw new Error("whoami: invalid org structure");
     }
     if (whoami.user !== undefined && (!isRecord(whoami.user) || typeof whoami.user.id !== "string" || !whoami.user.id)) {

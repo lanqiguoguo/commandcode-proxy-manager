@@ -70,9 +70,11 @@ if (SC === "quota") {
   let netDown = false;
   let quotaFailure = "";
   let usageCalls = 0;
+  const requestUrls = [];
   globalThis.fetch = async (url) => {
     if (netDown) throw new Error("network down");
     const u = String(url);
+    requestUrls.push(u);
     const pathname = new URL(u).pathname;
     if (quotaFailure === "subscriptions" && pathname === "/alpha/billing/subscriptions") throw new Error("subscriptions down");
     if (quotaFailure === "usage" && pathname === "/alpha/usage/summary") throw new Error("usage down");
@@ -112,6 +114,40 @@ if (SC === "quota") {
   initQuota(fakePool, liveCfg, {});
 
   let r = await probeKey("k1");
+  check(!r.stale && requestUrls.some((u) => u.endsWith("/alpha/billing/credits?orgId=o1")) &&
+    requestUrls.some((u) => u.endsWith("/alpha/billing/subscriptions?orgId=o1")) &&
+    requestUrls.some((u) => u.includes("/alpha/usage/summary?orgId=o1&since=")),
+    "合法 org 对象使用 org.id 拼接额度 URL", JSON.stringify(requestUrls));
+  responses.whoami = { user: { id: "u1" } };
+  requestUrls.length = 0;
+  r = await probeKey("k1");
+  check(!r.stale && requestUrls.some((u) => u.endsWith("/alpha/billing/credits")) &&
+    requestUrls.some((u) => u.endsWith("/alpha/billing/subscriptions")) &&
+    requestUrls.some((u) => u.includes("/alpha/usage/summary?since=") && !u.includes("orgId=")),
+    "org 缺失视为无组织账号并使用无 orgId URL", JSON.stringify(requestUrls));
+  responses.whoami = { user: { id: "u1" }, org: null };
+  requestUrls.length = 0;
+  r = await probeKey("k1");
+  check(!r.stale && requestUrls.some((u) => u.endsWith("/alpha/billing/credits")) &&
+    requestUrls.some((u) => u.endsWith("/alpha/billing/subscriptions")) &&
+    requestUrls.some((u) => u.includes("/alpha/usage/summary?since=") && !u.includes("orgId=")),
+    "org=null 视为无组织账号并使用无 orgId URL", JSON.stringify(requestUrls));
+  const invalidOrgCases = [
+    ["字符串", "o1"],
+    ["数组", []],
+    ["缺少 id", {}],
+    ["空 id", { id: "" }],
+    ["错误 id 类型", { id: 123 }],
+  ];
+  for (const [label, org] of invalidOrgCases) {
+    responses.whoami = { user: { id: "u1" }, org };
+    requestUrls.length = 0;
+    const invalid = await probeKey("k1");
+    check(invalid.stale === true && invalid.error === "whoami: invalid org structure" && requestUrls.length === 1,
+      `org ${label} 拒绝并返回明确诊断`, JSON.stringify({ error: invalid.error, requestUrls }));
+  }
+  responses.whoami = { org: { id: "o1" } };
+  requestUrls.length = 0;
   check(r.fiveHour.percent === 95 && !r.stale && quotaCalls[0]?.[0] === "set" && quotaCalls[0]?.[1] === "fiveHour", "5h 95%≥90 → quota_limited(fiveHour)", JSON.stringify(quotaCalls));
   check(softCalls[softCalls.length - 1] === true, "5h 95% 同时置软限制标记", JSON.stringify(softCalls));
 

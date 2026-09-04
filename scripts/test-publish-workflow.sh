@@ -19,15 +19,27 @@ ok() { printf 'ok: %s\n' "$*"; PASS=$((PASS + 1)); }
 [[ -f "$WORKFLOW" ]] || fail "publish workflow is missing"
 
 # ---------- workflow static boundaries ----------
-grep -Fqx '          REF_PROTECTED: ${{ github.ref_protected }}' "$WORKFLOW" || \
-  fail 'ref-gate does not pass github.ref_protected'
-grep -Fq '[[ "$REF_PROTECTED" == "true" ]] || die' "$WORKFLOW" || \
-  fail 'main gate does not require REF_PROTECTED=true'
-grep -Fq 'refs/heads/main)' "$WORKFLOW" || fail 'main branch case is missing'
+grep -Fq '  workflow_call:' "$WORKFLOW" || fail 'workflow_call trigger is missing'
+grep -Fq '      source_ref:' "$WORKFLOW" || fail 'source_ref input is missing'
+grep -Fq '      source_sha:' "$WORKFLOW" || fail 'source_sha input is missing'
+grep -Fq '  push:' "$WORKFLOW" || fail 'push trigger is missing'
+grep -Fq '    tags:' "$WORKFLOW" || fail 'release tag trigger is missing'
+if grep -Fq '    branches: [main]' "$WORKFLOW"; then
+  fail 'main push must enter upstream-sync before publication'
+fi
+if grep -Fq 'github.ref_protected' "$WORKFLOW"; then
+  fail 'publish workflow still depends on branch protection'
+fi
+if grep -Fq 'environment: release' "$WORKFLOW"; then
+  fail 'publish workflow still has a potentially approval-gated environment'
+fi
+grep -Fq 'refs/heads/main)' "$WORKFLOW" || fail 'main source case is missing'
 grep -Fq 'refs/tags/*)' "$WORKFLOW" || fail 'release tag case is missing'
 grep -Fq '[[ "$tag" =~ $semver_tag ]] || die' "$WORKFLOW" || \
   fail 'release tag does not retain the semver gate'
-ok 'workflow contains the protected-main gate and semver tag branch'
+grep -Fq 'ref: ${{ inputs.source_sha || github.sha }}' "$WORKFLOW" || \
+  fail 'checkout is not pinned to the caller source SHA'
+ok 'workflow contains the synchronized-main gate and semver tag branch'
 
 # ---------- extract the ref-gate executed by the workflow ----------
 GATE_SCRIPT="$T/gate.sh"
@@ -47,14 +59,13 @@ run_gate() {
   local label=$1
   local event_name=$2
   local ref=$3
-  local ref_protected=$4
-  local expected=$5
+  local expected=$4
   local log="$T/$label.log"
 
   if [[ "$expected" == pass ]]; then
     if ! (
       cd "$T"
-      EVENT_NAME="$event_name" REF="$ref" REF_PROTECTED="$ref_protected" \
+      EVENT_NAME="$event_name" REF="$ref" \
         bash "$GATE_SCRIPT" > "$log" 2>&1
     ); then
       sed -n '1,80p' "$log" >&2 || true
@@ -67,7 +78,7 @@ run_gate() {
 
   if (
     cd "$T"
-    EVENT_NAME="$event_name" REF="$ref" REF_PROTECTED="$ref_protected" \
+    EVENT_NAME="$event_name" REF="$ref" \
       bash "$GATE_SCRIPT" > "$log" 2>&1
   ); then
     sed -n '1,80p' "$log" >&2 || true
@@ -76,17 +87,19 @@ run_gate() {
   ok "$label -> reject"
 }
 
-# main must come from a ref GitHub marks as protected.
-run_gate main-protected push refs/heads/main true pass
-run_gate main-unprotected push refs/heads/main false reject
+# main publication must come through the reusable workflow after sync.
+run_gate synchronized-main workflow_call refs/heads/main pass
+run_gate direct-main-push push refs/heads/main reject
+run_gate manual-main workflow_dispatch refs/heads/main pass
 
-# release tags are an explicit rule independent of ref_protected.
-run_gate semver-release-tag push refs/tags/v1.2.3 false pass
-run_gate semver-prerelease-tag workflow_dispatch refs/tags/v2.0.0-rc.1 false pass
+# release tags are an explicit rule independent of the synchronized-main path.
+run_gate semver-release-tag push refs/tags/v1.2.3 pass
+run_gate semver-prerelease-tag workflow_dispatch refs/tags/v2.0.0-rc.1 pass
 
 # Other events, branches, and invalid tags must be rejected.
-run_gate ordinary-branch push refs/heads/feature false reject
-run_gate invalid-tag push refs/tags/v1.2 false reject
-run_gate unknown-event schedule refs/heads/main true reject
+run_gate ordinary-branch push refs/heads/feature reject
+run_gate invalid-tag push refs/tags/v1.2 reject
+run_gate unknown-event schedule refs/heads/main reject
+run_gate unsupported-workflow-run workflow_run refs/heads/main reject
 
 printf '\npublish workflow ref-gate tests passed (%s checks).\n' "$PASS"

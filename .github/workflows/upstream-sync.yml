@@ -1,14 +1,22 @@
 name: upstream-sync
 on:
+  push:
+    branches: [main]
   schedule:
     - cron: "0 20 * * *"     # 决策 10：每天轮询上游正式版（UTC 20:00 = 北京时间次日凌晨 4 点）
   workflow_dispatch:
   repository_dispatch:
     types: [upstream-release]
 
-# Job-level permissions below deliberately start from no access. The write job
-# can publish only a candidate branch; the protected default branch still
-# requires the repository's normal PR review/approval rules.
+# A single repository pipeline owns the main branch update and publication.
+# Keeping runs queued makes each push wait for the previous sync/publish chain.
+concurrency:
+  group: main-sync-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+# Job-level permissions below deliberately start from no access. The sync job
+# receives only the contents write permission needed to update the default
+# branch after all upstream and container checks pass.
 permissions: {}
 jobs:
   check:
@@ -17,6 +25,7 @@ jobs:
       contents: read
     outputs:
       need_sync: ${{ steps.check.outputs.need_sync }}
+      base_sha: ${{ steps.check.outputs.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -177,6 +186,7 @@ jobs:
           fi
 
           printf 'need_sync=%s\n' "$NEED_SYNC" >> "$GITHUB_OUTPUT"
+          printf 'base_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           printf 'current=%s latest_release=%s upstream_commit=%s state=%s\n' \
             "$CURRENT_TAG@$CURRENT_COMMIT" "${LATEST_RELEASE:-none}" "$UPSTREAM_COMMIT" "$RELEASE_STATE"
           # END upstream-sync decision check
@@ -187,7 +197,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
     env:
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
@@ -280,52 +289,44 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/container-smoke.sh "$SMOKE_IMAGE"
-      - name: Prepare sync PR
-        id: prepare
+      - name: Commit synchronized upstream to default branch
+        id: commit
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add upstream UPSTREAM_VERSION
           if git diff --cached --quiet; then
-            printf 'has_changes=false\n' >> "$GITHUB_OUTPUT"
-            echo 'No actual changes; skip PR.'
+            printf 'commit_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo 'No actual changes; keep the checked-out default branch commit.'
             exit 0
           fi
-          BRANCH="chore/upstream-sync-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
-          if [[ "$BRANCH" == "$BASE_BRANCH" || "$BRANCH" != chore/upstream-sync-* ]]; then
-            echo 'ERROR: refusing to use the protected base branch as the sync branch' >&2
-            exit 1
-          fi
           TITLE="chore: sync upstream $(<UPSTREAM_VERSION)"
-          git checkout -b "$BRANCH"
           git commit -m "$TITLE"
-          {
-            printf 'has_changes=true\n'
-            printf 'branch=%s\n' "$BRANCH"
-          } >> "$GITHUB_OUTPUT"
-      - name: Push candidate branch and open PR
-        if: steps.prepare.outputs.has_changes == 'true'
+          printf 'commit_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push synchronized default branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CANDIDATE_BRANCH: ${{ steps.prepare.outputs.branch }}
         run: |
           set -euo pipefail
           : "${GH_TOKEN:?GITHUB_TOKEN is required}"
-          : "${CANDIDATE_BRANCH:?candidate branch is required}"
-          TITLE="chore: sync upstream $(<UPSTREAM_VERSION)"
-          # The token is introduced only for gh/git operations after the
-          # untrusted upstream has been copied and the unit smoke has passed.
-          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
-          if [[ -n "$EXISTING" ]]; then
-            echo "Open PR #$EXISTING already covers [$TITLE]; skip creating duplicate."
-            exit 0
-          fi
+          : "${BASE_BRANCH:?default branch is required}"
+          # The token is introduced only after the untrusted upstream has been
+          # copied and all source/container checks have passed.
           gh auth setup-git
-          git push --set-upstream origin "$CANDIDATE_BRANCH"
-          gh pr create --repo "$GITHUB_REPOSITORY" \
-            --base "$BASE_BRANCH" \
-            --head "$CANDIDATE_BRANCH" \
-            --title "$TITLE" \
-            --body "自动上游同步 PR：本 PR 由 upstream-sync workflow 生成，替换 vendored 的上游代码（upstream/ 目录）并更新 UPSTREAM_VERSION。属于第三方代码变更，请人工审阅后再合并。默认分支受仓库分支保护与 PR 审批规则约束，本流程不会直接写入默认分支。"
+          git push origin "HEAD:$BASE_BRANCH"
+
+  publish:
+    needs: [check, sync]
+    if: >-
+      always() && needs.check.result == 'success' &&
+      (needs.sync.result == 'success' || needs.sync.result == 'skipped')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      source_ref: refs/heads/main
+      source_sha: ${{ needs.sync.outputs.commit_sha || needs.check.outputs.base_sha }}
+    secrets: inherit

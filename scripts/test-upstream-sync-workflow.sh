@@ -40,15 +40,24 @@ grep -Fqx 'permissions: {}' "$WORKFLOW" || fail "缺少默认 deny permissions"
 grep -Fq '    permissions:' "$WORKFLOW" || fail "缺少 job-level permissions"
 grep -Fq '      contents: read' "$WORKFLOW" || fail "check job 缺少 contents: read"
 grep -Fq '      contents: write' "$WORKFLOW" || fail "sync job 缺少 contents: write"
-grep -Fq '      pull-requests: write' "$WORKFLOW" || fail "sync job 缺少 pull-requests: write"
-ok "权限按 check/sync job 收窄"
+grep -Fq '  push:' "$WORKFLOW" || fail "缺少 main push trigger"
+grep -Fq '    branches: [main]' "$WORKFLOW" || fail "main push trigger 未固定到 main"
+grep -Fq 'group: main-sync-publish-${{ github.repository }}' "$WORKFLOW" || fail "缺少串行 pipeline concurrency"
+if grep -Fq 'pull-requests: write' "$WORKFLOW"; then
+  fail "无人值守同步不应申请 pull-requests: write"
+fi
+ok "权限、main push trigger 和串行 pipeline 边界正确"
 
 [[ $(rg -c '^[[:space:]]+GH_TOKEN:' "$WORKFLOW") -eq 1 ]] || fail "GITHUB_TOKEN 不应暴露到多个 workflow step"
 [[ $(rg -c 'persist-credentials: false' "$WORKFLOW") -eq 2 ]] || fail "两个 checkout 都必须关闭持久化凭证"
-grep -Fq 'git checkout -b "$BRANCH"' "$WORKFLOW" || fail "同步没有创建候选分支"
-grep -Fq 'gh pr create' "$WORKFLOW" || fail "同步没有创建 PR"
-grep -Fq -- '--base "$BASE_BRANCH"' "$WORKFLOW" || fail "PR 没有固定到默认分支"
-ok "同步只推候选分支并创建人工审阅 PR"
+grep -Fq 'git push origin "HEAD:$BASE_BRANCH"' "$WORKFLOW" || fail "同步没有直接更新默认分支"
+grep -Fq 'gh auth setup-git' "$WORKFLOW" || fail "同步没有通过 gh CLI 配置推送凭证"
+grep -Fq 'uses: ./.github/workflows/publish.yml' "$WORKFLOW" || fail "同步完成后没有调用发布 workflow"
+grep -Fq 'source_sha: ${{ needs.sync.outputs.commit_sha || needs.check.outputs.base_sha }}' "$WORKFLOW" || fail "发布没有绑定同步后的精确 commit"
+if grep -Fq 'gh pr create' "$WORKFLOW" || grep -Fq 'git checkout -b "$BRANCH"' "$WORKFLOW"; then
+  fail "无人值守同步不应创建候选分支或 PR"
+fi
+ok "同步通过 gh CLI 直接推送默认分支，并调用精确 commit 的发布 workflow"
 
 # ---------- 从 YAML 提取生产检查脚本 ----------
 CHECK_SCRIPT="$T/check.sh"

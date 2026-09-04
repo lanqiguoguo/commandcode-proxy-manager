@@ -1,12 +1,20 @@
 name: publish
 
-# main pushes and explicit semver release tags are the only automatic publish
-# sources. A manual run is still checked below because workflow_dispatch can be
-# started from any branch or tag visible to the operator. There is deliberately
-# no schedule trigger.
+# Normal main publication is called by upstream-sync after the upstream check,
+# sync, source validation, and container smoke test complete. Semver tags and
+# manual runs remain explicit release entry points.
 on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: 'Fully qualified source ref that passed upstream-sync'
+        required: true
+        type: string
+      source_sha:
+        description: 'Exact source commit that passed upstream-sync'
+        required: true
+        type: string
   push:
-    branches: [main]
     tags:
       - "v*.*.*"
   workflow_dispatch:
@@ -23,8 +31,7 @@ jobs:
       - name: Validate publish ref
         env:
           EVENT_NAME: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          REF_PROTECTED: ${{ github.ref_protected }}
+          REF: ${{ inputs.source_ref || github.ref }}
         run: |
           set -euo pipefail
 
@@ -34,21 +41,25 @@ jobs:
           }
 
           # A release tag is an annotated or lightweight vMAJOR.MINOR.PATCH
-          # tag, with optional semver prerelease/build metadata. The protected
-          # main branch is the only branch that may publish latest.
+          # tag, with optional semver prerelease/build metadata. Normal main
+          # publication reaches this workflow through workflow_call only after
+          # upstream-sync has completed successfully.
           semver_tag='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
           case "$EVENT_NAME" in
+            workflow_call)
+              [[ "$REF" == refs/heads/main ]] || die "workflow_call source is not main: $REF"
+              ;;
             push|workflow_dispatch)
               case "$REF" in
                 refs/heads/main)
-                  [[ "$REF_PROTECTED" == "true" ]] || die "main ref is not protected: $REF"
+                  [[ "$EVENT_NAME" == workflow_dispatch ]] || die "direct main push must pass through upstream-sync: $REF"
                   ;;
                 refs/tags/*)
                   tag=${REF#refs/tags/}
                   [[ "$tag" =~ $semver_tag ]] || die "ref is not an allowed release tag: $REF"
                   ;;
                 *)
-                  die "publishing is allowed only from protected main or a semver release tag: $REF"
+                  die "publishing is allowed only from the synchronized main source or a semver release tag: $REF"
                   ;;
               esac
               ;;
@@ -63,7 +74,6 @@ jobs:
     needs: ref-gate
     if: needs.ref-gate.result == 'success'
     runs-on: ubuntu-latest
-    environment: release
     # latest is a shared image channel, so main and release-tag runs must be
     # serialized together. Keeping pending runs (rather than cancelling the
     # active one) prevents an older run from finishing after a newer one.
@@ -77,6 +87,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
 
       - name: Use Node.js
@@ -93,8 +104,8 @@ jobs:
       - name: Read upstream version and image tags
         id: meta
         env:
-          SOURCE_REF: ${{ github.ref }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ inputs.source_ref || github.ref }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
         run: |

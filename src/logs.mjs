@@ -10,6 +10,7 @@ export const MAX_DISK_LINES = MEM_CAP; // physical rows never exceed the memory 
 export const MAX_DISK_BYTES = 16 * 1024 * 1024; // bounds unusually large log payloads
 export const MIN_FREE_BYTES = 16 * 1024 * 1024; // reserve space for the temp-file rename
 const MAX_RECORD_BYTES = 256 * 1024;
+const MAX_KEY_ID_LENGTH = 128;
 const MAX_COMPACT_RETRIES = 3;
 const COMPACT_DELAY_MS = envMs("CCPM_COMPACT_DELAY_MS", 5000, 0, 10 * 60 * 1000);
 const COMPACT_RETRY_DELAY_MS = envMs("CCPM_COMPACT_RETRY_DELAY_MS", 30000, 1, 10 * 60 * 1000);
@@ -45,10 +46,20 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isValidKeyId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_KEY_ID_LENGTH &&
+    /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
+}
+
 function isValidLog(value) {
   return isRecord(value) && typeof value.ts === "number" && Number.isFinite(value.ts) &&
     typeof value.msg === "string" && (value.level === undefined || typeof value.level === "string") &&
-    (value.src === undefined || typeof value.src === "string");
+    (value.src === undefined || typeof value.src === "string") &&
+    (value.keyId === undefined || isValidKeyId(value.keyId));
+}
+
+function logIdentity(entry) {
+  return entry.ts + "|" + (entry.src || "manager") + "|" + (entry.keyId || "") + "|" + entry.msg;
 }
 
 function lineCount(body) {
@@ -252,7 +263,7 @@ function load() {
 
   const cutoff = cutoffMs();
   let dirty = !physicalCanonical;
-  const seen = new Set(lines.map((entry) => entry.ts + "|" + (entry.src || "manager") + "|" + entry.msg));
+  const seen = new Set(lines.map(logIdentity));
   const rawLines = body.split("\n");
   for (let i = 0; i < rawLines.length; i++) {
     const raw = rawLines[i];
@@ -274,7 +285,7 @@ function load() {
         dirty = true;
         continue;
       }
-      const key = entry.ts + "|" + (entry.src || "manager") + "|" + entry.msg;
+      const key = logIdentity(entry);
       if (seen.has(key)) continue;
       seen.add(key);
       lines.push(entry);
@@ -315,7 +326,9 @@ export function initLogs(emitter, retentionDaysArg = 7) {
   emitter.on("log", (entry) => {
     // ts 单一来源：本订阅先于 adminApi 的 SSE onLog 注册，若 entry 无 ts 在此补一次。
     if (entry.ts === undefined) entry.ts = Date.now();
-    append({ ts: entry.ts, level: entry.level || "info", msg: String(entry.msg || ""), src: entry.src || "manager" });
+    const stored = { ts: entry.ts, level: entry.level || "info", msg: String(entry.msg || ""), src: entry.src || "manager" };
+    if (isValidKeyId(entry.keyId)) stored.keyId = entry.keyId;
+    append(stored);
   });
 }
 

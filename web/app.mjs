@@ -760,11 +760,16 @@ async function saveSecurity() {
 
 // ── 日志 ──（DESIGN §6：按 Key 过滤；SSE log 事件与轮询共用同一渲染；
 // 来源含 manager 自身事件与上游 proxy.mjs 捕获日志）
+function logMatchesKey(log, selectedKeyId) {
+  if (!selectedKeyId) return true;
+  return typeof log.keyId === "string" ? log.keyId === selectedKeyId : String(log.msg || "").includes(selectedKeyId);
+}
+
 function renderLogs() {
   const sel = state.logFilterKeyId || "";
   const src = state.logFilterSrc || "";
   let filtered = src ? state.logs.filter((l) => (l.src || "manager") === src) : state.logs;
-  filtered = sel ? filtered.filter((l) => l.msg.includes(sel)) : filtered;
+  filtered = sel ? filtered.filter((l) => logMatchesKey(l, sel)) : filtered;
   app.innerHTML = "<h2>日志</h2>" +
     (state.logError ? '<div class="alert err mb" role="alert">日志加载失败：' + esc(state.logError) + "</div>" : "") +
     '<div class="card mb"><div class="row">' +
@@ -791,9 +796,9 @@ function renderLogs() {
   });
 }
 
-function logKey(l) { return l.ts + "|" + (l.src || "manager") + "|" + l.msg; }
+function logKey(l) { return l.ts + "|" + (l.src || "manager") + "|" + (l.keyId || "") + "|" + l.msg; }
 function pushLogs(incoming) {
-  // SSE 与轮询双通道写入，按 ts+msg 去重合并（同毫秒竞态下时间游标不可靠）
+  // SSE 与轮询双通道写入，按 ts+keyId+msg 去重合并（同毫秒竞态下时间游标不可靠）
   const seen = new Set(state.logs.map(logKey));
   for (const l of incoming) {
     const k = logKey(l);

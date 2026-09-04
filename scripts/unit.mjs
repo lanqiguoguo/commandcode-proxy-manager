@@ -9,6 +9,7 @@
 import fs, { mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from "fs";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
+import vm from "node:vm";
 
 const SC = process.argv[2];
 const SCENARIOS = ["config", "persistence", "quota", "gateway", "pool", "stats", "logs", "tokens", "state", "durable"];
@@ -705,13 +706,31 @@ if (SC === "gateway") {
 // ════ keyPool ════
 if (SC === "pool") {
   console.log("=== keyPool 选 Key ===");
-  const { initKeyPool, addKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess } =
+  const { initKeyPool, addKey, updateKey, removeKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess } =
     await import("../src/keyPool.mjs");
-  initKeyPool({ strategy: "active-standby", failoverCooldownMs: 0, backoffBaseMs: 5000, backoffMaxMs: 120000 }, {});
-  const k1 = addKey({ alias: "A", key: "user_aaa111" });
-  const k2 = addKey({ alias: "B", key: "user_bbb222" });
+  const logEvents = [];
+  initKeyPool({ strategy: "active-standby", failoverCooldownMs: 0, backoffBaseMs: 5000, backoffMaxMs: 120000 }, {
+    emitter: { emit: (type, event) => { if (type === "log") logEvents.push(event); } }
+  });
+  const k1 = addKey({ alias: "主账号", key: "user_5abcdefXYoU" });
+  const k2 = addKey({ alias: "备账号", key: "user_5backupXYoV" });
+  const addLog = logEvents.find((event) => event.keyId === k1.id);
+  check(addLog && addLog.msg === "新增 Key[主账号]: user_5***XYoU" && addLog.keyId === k1.id,
+    "新增日志显示别名、掩码和 keyId", JSON.stringify(addLog));
+  check(logEvents.every((event) => !String(event.msg || "").includes(k1.key) && !String(event.msg || "").includes(k2.key)),
+    "Key 日志消息不含完整 Key");
+  logEvents.length = 0;
+  updateKey(k2.id, { priority: 0 });
+  const orderLog = logEvents.at(-1);
+  check(orderLog && orderLog.msg.includes("调整主备顺序: Key[备账号]") && orderLog.keyId === k2.id,
+    "主备顺序日志显示别名并携带正确 keyId", JSON.stringify(orderLog));
+  updateKey(k2.id, { priority: 1 });
+  logEvents.length = 0;
   check(selectKey().id === k1.id, "默认选主 Key");
   setQuotaLimited(k1.id, Date.now() + 60000, "fiveHour");
+  const healthLog = logEvents.at(-1);
+  check(healthLog && healthLog.msg.includes("Key[主账号]") && healthLog.keyId === k1.id,
+    "健康状态日志显示别名并携带正确 keyId", JSON.stringify(healthLog));
   check(selectKey().id === k2.id, "quota_limited 跳过主→备");
   const quotaWait = nextRetryAfterMs();
   check(quotaWait > 55000 && quotaWait <= 60000, "普通 quota window 仍作为 Retry-After 候选", String(quotaWait));
@@ -767,6 +786,21 @@ if (SC === "pool") {
   const seen = new Set();
   for (let i = 0; i < 4; i++) seen.add(selectKey().id);
   check(seen.has(k1.id) && seen.has(k2.id), "round-robin 软限制 Key 仍参与均摊", [...seen].join(","));
+  check(logEvents.every((event) => event.keyId && String(event.msg || "").includes("Key[") &&
+    !String(event.msg || "").includes(k1.id) && !String(event.msg || "").includes(k2.id)),
+    "全部 manager Key 日志使用别名且不暴露内部 id", JSON.stringify(logEvents));
+  const webSource = readFileSync(new URL("../web/app.mjs", import.meta.url), "utf8");
+  const matcherSource = webSource.match(/function logMatchesKey\(log, selectedKeyId\) \{[\s\S]*?\n\}/)?.[0];
+  const logMatchesKey = matcherSource ? vm.runInNewContext("(" + matcherSource + ")") : null;
+  check(typeof logMatchesKey === "function" &&
+    logMatchesKey({ keyId: "k-same-a", msg: "Key[同名] 事件含 k-same-b" }, "k-same-a") &&
+    !logMatchesKey({ keyId: "k-same-a", msg: "Key[同名] 事件含 k-same-b" }, "k-same-b") &&
+    logMatchesKey({ msg: "旧日志 k-same-a" }, "k-same-a"),
+    "前端按结构化 keyId 优先筛选，同名 alias 不串行", matcherSource || "missing logMatchesKey");
+  removeKey(k2.id);
+  const deleteLog = logEvents.at(-1);
+  check(deleteLog && deleteLog.msg === "删除 Key[备账号]: user_5***XYoV" && deleteLog.keyId === k2.id,
+    "删除日志显示别名、掩码和 keyId", JSON.stringify(deleteLog));
 }
 
 // ════ stats ════
@@ -986,9 +1020,30 @@ if (SC === "logs") {
   check(!after.some((l) => l.msg.includes("random manager output")), "非 proxy 格式行不入环");
 
   // 3) manager emit 通路（bus emit log → listener append，src 默认 manager）
-  bus.emit("log", { level: "info", msg: "新增 Key: user_x***yz" });
+  const managerKeyId = "k-log-a";
+  const managerFullKey = "user_log_secret_alpha";
+  bus.emit("log", { ts: Date.now(), level: "info", msg: "新增 Key[主账号]: user_l***lpha", keyId: managerKeyId });
   const mgrRows = getLogs({ src: "manager" });
-  check(mgrRows.some((l) => l.msg.includes("新增 Key") && l.src === "manager"), "manager emit 入环 src=manager");
+  const managerRow = mgrRows.find((l) => l.keyId === managerKeyId);
+  check(managerRow && managerRow.msg === "新增 Key[主账号]: user_l***lpha" && managerRow.src === "manager",
+    "manager emit 入环并保留 keyId", JSON.stringify(managerRow));
+  check(!String(managerRow?.msg || "").includes(managerFullKey) && !readFileSync(DATA + "/events.jsonl", "utf8").includes(managerFullKey),
+    "manager 日志和 JSONL 不含完整 Key");
+  const sameTs = Date.now() + 1;
+  bus.emit("log", { ts: sameTs, level: "info", msg: "Key[同名] 发生主备切换", keyId: "k-log-a" });
+  bus.emit("log", { ts: sameTs, level: "info", msg: "Key[同名] 发生主备切换", keyId: "k-log-b" });
+  const sameAliasRows = getLogs({ src: "manager" }).filter((l) => l.msg === "Key[同名] 发生主备切换");
+  check(sameAliasRows.length === 2 && new Set(sameAliasRows.map((l) => l.keyId)).size === 2,
+    "同名别名的相同时间日志按 keyId 分开保留", JSON.stringify(sameAliasRows));
+  const replayBus = new EventEmitter();
+  const ReplayLogs = await import("../src/logs.mjs?keyid-replay");
+  ReplayLogs.initLogs(replayBus, 7);
+  const replayedManagerRow = ReplayLogs.getLogs({ src: "manager" }).find((l) => l.keyId === managerKeyId);
+  check(replayedManagerRow && replayedManagerRow.msg === managerRow?.msg,
+    "独立日志实例重启回放保留 keyId", JSON.stringify(replayedManagerRow));
+  bus.emit("log", { level: "info", msg: "legacy manager log" });
+  const legacyRow = getLogs({ src: "manager" }).find((l) => l.msg === "legacy manager log");
+  check(legacyRow && legacyRow.keyId === undefined, "无 keyId 的旧日志仍可读取");
   const onlyProxy = getLogs({ src: "proxy" });
   check(onlyProxy.every((l) => l.src === "proxy"), "src=proxy 过滤纯净");
   check(getLogs({}).length >= mgrRows.length + onlyProxy.length, "src 过滤不影响全量查询");
@@ -1195,25 +1250,45 @@ if (SC === "durable") {
     restoreFs();
     saveConfig(getConfig());
 
-    pool.initKeyPool(getConfig().pool);
+    const durableLogEvents = [];
+    pool.initKeyPool(getConfig().pool, {
+      emitter: { emit: (type, event) => { if (type === "log") durableLogEvents.push(event); } }
+    });
     const first = pool.addKey({ alias: "first", key: "user_unit_first" });
     const keysBeforeFailure = pool.listKeys();
     const diskKeysBeforeFailure = JSON.parse(readFileSync(DATA + "/keys.json", "utf-8"));
+    durableLogEvents.length = 0;
     failOn("write", "keys.json.tmp", "simulated keys write failure");
     const addFailure = expectFailure(() => pool.addKey({ alias: "second", key: "user_unit_second" }));
     check(addFailure && addFailure.statusCode === 503, "Key 添加失败返回持久化错误", String(addFailure && addFailure.message));
     check(JSON.stringify(pool.listKeys()) === JSON.stringify(keysBeforeFailure) &&
       JSON.stringify(JSON.parse(readFileSync(DATA + "/keys.json", "utf-8"))) === JSON.stringify(diskKeysBeforeFailure),
       "Key 添加失败回滚内存和磁盘快照");
+    check(!durableLogEvents.some((event) => String(event.msg || "").includes("新增")),
+      "Key 添加持久化失败不记录虚假的新增成功日志", JSON.stringify(durableLogEvents));
     restoreFs();
     writeJson("keys.json", diskKeysBeforeFailure);
 
+    durableLogEvents.length = 0;
+    failOn("rename", "keys.json.tmp", "simulated keys delete rename failure");
+    const removeFailure = expectFailure(() => pool.removeKey(first.id));
+    restoreFs();
+    check(removeFailure && removeFailure.statusCode === 503, "Key 删除失败返回持久化错误", String(removeFailure && removeFailure.message));
+    check(pool.getKeyRecord(first.id) &&
+      JSON.stringify(JSON.parse(readFileSync(DATA + "/keys.json", "utf-8"))) === JSON.stringify(diskKeysBeforeFailure),
+      "Key 删除失败回滚内存和磁盘快照");
+    check(!durableLogEvents.some((event) => String(event.msg || "").includes("删除")),
+      "Key 删除持久化失败不记录虚假的删除成功日志", JSON.stringify(durableLogEvents));
+
+    durableLogEvents.length = 0;
     failOn("rename", "keys.json.tmp", "simulated keys rename failure");
     const updateFailure = expectFailure(() => pool.updateKey(first.id, { alias: "changed" }));
     check(updateFailure && updateFailure.statusCode === 503, "Key 更新失败返回持久化错误", String(updateFailure && updateFailure.message));
     check(pool.listKeys().find((k) => k.id === first.id).alias === "first" &&
       JSON.parse(readFileSync(DATA + "/keys.json", "utf-8")).keys[0].alias === "first",
       "Key 更新失败回滚内存和磁盘快照");
+    check(!durableLogEvents.some((event) => String(event.msg || "").includes("调整主备顺序")),
+      "Key 更新持久化失败不记录虚假的顺序成功日志", JSON.stringify(durableLogEvents));
     restoreFs();
     writeJson("keys.json", diskKeysBeforeFailure);
 

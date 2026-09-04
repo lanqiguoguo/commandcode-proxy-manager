@@ -1775,6 +1775,14 @@ async function main() {
   const phases = qEvents.map(([, d]) => { try { return JSON.parse(d).phase; } catch { return ""; } });
   phases.includes("updating") && phases.includes("done")
     ? ok("SSE quota-status 事件流（updating→done）", phases.slice(0, 6).join(">")) : bad("quota-status", JSON.stringify(phases.slice(0, 8)));
+  await admin("/admin/api/keys/" + idC22, "PUT", { priority: 1 });
+  await sleep(100);
+  const sseKeyLog = sseEvents
+    .filter(([n]) => n === "log")
+    .map(([, data]) => { try { return JSON.parse(data); } catch { return null; } })
+    .find((event) => event && event.keyId === idC22 && String(event.msg || "").includes("Key[keyC]"));
+  sseKeyLog && sseKeyLog.msg && !sseKeyLog.msg.includes(idC22)
+    ? ok("SSE manager Key 日志保留别名和 keyId") : bad("SSE manager Key 日志", JSON.stringify(sseKeyLog));
   try { sseConn?.destroy(); } catch {}
   // 日志持久化：重启后 events.jsonl 回放，历史日志不丢
   const logsBefore = JSON.parse((await admin("/admin/api/logs?since=0")).body).logs;
@@ -1787,7 +1795,14 @@ async function main() {
   const logsAfter = JSON.parse((await admin("/admin/api/logs?since=0")).body).logs;
   logsAfter.length >= logsBefore.length && JSON.stringify(logsAfter).includes(addLine[0] ? addLine[0].msg.slice(0, 8) : "新增 Key")
     ? ok("重启后系统日志保留（" + logsBefore.length + " → " + logsAfter.length + " 条）") : bad("日志持久化", logsBefore.length + " → " + logsAfter.length);
-  if (!JSON.stringify(logsAfter).includes("user_keyA")) ok("持久化日志无 Key 明文"); else bad("日志明文", "");
+  const replayedCLog = logsAfter.find((event) => event.keyId === idC22 && String(event.msg || "").includes("新增 Key[keyC]"));
+  replayedCLog && replayedCLog.msg && !replayedCLog.msg.includes(idC22)
+    ? ok("重启回放保留 manager Key 日志 keyId") : bad("回放 Key 日志 keyId", JSON.stringify(replayedCLog));
+  const logsTextAfterRestart = readFileSync(resolve(DATA, "events.jsonl"), "utf8");
+  !JSON.stringify(logsAfter).includes("user_keyA") && !JSON.stringify(logsAfter).includes("user_keyC") &&
+    !logsTextAfterRestart.includes("user_keyA") && !logsTextAfterRestart.includes("user_keyC") &&
+    !JSON.stringify(sseEvents).includes("user_keyA") && !JSON.stringify(sseEvents).includes("user_keyC")
+    ? ok("API/SSE/JSONL 持久化日志无 Key 明文") : bad("日志明文", "");
 
   // ── T22b F10 dirty JSONL + existing permissions through a real restart ──
   console.log("\n=== T22b stats/logs physical cleanup on restart (F10) ===");

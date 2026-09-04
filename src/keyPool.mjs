@@ -49,10 +49,27 @@ export function initKeyPool(cfgPool, opts = {}) {
 }
 
 // emit 时统一携带 ts：日志事件有两个消费者（logs.mjs 落盘、adminApi SSE 推送），
-// 若此处不带 ts，两处各自用 Date.now() 补齐会得到不同毫秒值 → 前端按 ts|src|msg
+// 若此处不带 ts，两处各自用 Date.now() 补齐会得到不同毫秒值 → 前端按 ts|src|keyId|msg
 // 去重失效，同一条日志经 SSE 与轮询双通道显示两条（实测差 1ms 即复现）。
-function emitLog(msg) {
-  if (emitter) emitter.emit("log", { ts: Date.now(), level: "info", msg });
+function emitLog(msg, keyId) {
+  if (!emitter) return;
+  const entry = { ts: Date.now(), level: "info", msg };
+  if (typeof keyId === "string" && keyId) entry.keyId = keyId;
+  emitter.emit("log", entry);
+}
+
+function logAlias(rec) {
+  const alias = rec.alias || maskKey(rec.key);
+  // An alias is user-controlled. Keep even a malicious alias from repeating
+  // the complete credential in a manager log.
+  return rec.key && alias.includes(rec.key) ? alias.split(rec.key).join(maskKey(rec.key)) : alias;
+}
+
+function keyLabel(rec) { return "Key[" + logAlias(rec) + "]"; }
+
+function emitKeyLog(id, suffix) {
+  const rec = keys.find((key) => key.id === id);
+  if (rec) emitLog(keyLabel(rec) + suffix, rec.id);
 }
 
 function persistKeys() { return writeJson("keys.json", { keys }); }
@@ -125,7 +142,7 @@ export function addKey({ alias = "", key = "", note = "" }) {
     failoverCount: 0, lastFailoverAt: 0, lastUsedAt: 0
   });
   healthVersion.set(rec.id, 0);
-  emitLog("新增 Key: " + maskKey(rec.key));
+  emitLog("新增 " + keyLabel(rec) + ": " + maskKey(rec.key), rec.id);
   return rec;
 }
 
@@ -153,7 +170,7 @@ export function updateKey(id, patch) {
     throw e;
   }
   if (movedRecord) {
-    emitLog("调整主备顺序: " + (movedRecord.alias || maskKey(movedRecord.key)) + " -> 第 " + (movedTargetIndex + 1) + " 位");
+    emitLog("调整主备顺序: " + keyLabel(movedRecord) + " -> 第 " + (movedTargetIndex + 1) + " 位", movedRecord.id);
   }
   return rec;
 }
@@ -173,7 +190,7 @@ export function moveKey(id, targetIndex) {
     keys = before;
     throw e;
   }
-  emitLog("调整主备顺序: " + (movedRecord.alias || maskKey(movedRecord.key)) + " -> 第 " + (targetIndex + 1) + " 位");
+  emitLog("调整主备顺序: " + keyLabel(movedRecord) + " -> 第 " + (targetIndex + 1) + " 位", movedRecord.id);
 }
 
 export function removeKey(id) {
@@ -181,7 +198,10 @@ export function removeKey(id) {
   if (i < 0) throw new Error("Key 不存在");
   const before = snapshotKeys();
   const healthBefore = new Map([...health.entries()].map(([keyId, h]) => [keyId, { ...h }]));
-  const [rec] = keys.splice(i, 1);
+  const rec = keys[i];
+  const deleteLabel = keyLabel(rec);
+  const maskedKey = maskKey(rec.key);
+  keys.splice(i, 1);
   keys.forEach((k, idx) => { k.priority = idx; });
   health.delete(id);
   try {
@@ -193,7 +213,7 @@ export function removeKey(id) {
   }
   healthVersion.delete(id);
   if (persistState) persistState();
-  emitLog("删除 Key: " + maskKey(rec.key));
+  emitLog("删除 " + deleteLabel + ": " + maskedKey, rec.id);
 }
 
 // ── 健康状态（退避状态机，决策 5/6/8） ──────────
@@ -213,7 +233,7 @@ export function recordRateLimit(id, retryAfterMs) {
   h.backoffUntilMs = nowMs() + wait;
   bumpHealthVersion(id);
   persistState();
-  emitLog("Key " + id + " 限流退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s（第 " + h.failCount + " 次）");
+  emitKeyLog(id, " 限流退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s（第 " + h.failCount + " 次）");
 }
 
 export function recordTimeout(id) {
@@ -225,7 +245,7 @@ export function recordTimeout(id) {
   h.backoffUntilMs = nowMs() + Math.min(poolCfg.backoffMaxMs || 120000, base * Math.pow(2, h.failCount - 1));
   bumpHealthVersion(id);
   persistState();
-  emitLog("Key " + id + " 超时退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s");
+  emitKeyLog(id, " 超时退避 " + Math.round((h.backoffUntilMs - nowMs()) / 1000) + "s");
 }
 
 // 每次上游尝试开始前取得 token。成功只允许清理该 token 之后没有被其他路径更新过的状态。
@@ -261,7 +281,7 @@ export function markAuthError(id) {
   h.backoffUntilMs = nowMs() + 3600 * 1000;
   bumpHealthVersion(id);
   persistState();
-  emitLog("Key " + id + " 认证失败（401/403），已标记异常并停止自动使用");
+  emitKeyLog(id, " 认证失败（401/403），已标记异常并停止自动使用");
 }
 
 export function clearAuthError(id) {
@@ -271,7 +291,7 @@ export function clearAuthError(id) {
     h.backoffUntilMs = 0;
     h.lastErrorKind = "";
   });
-  emitLog("Key " + id + " 认证异常已清除");
+  emitKeyLog(id, " 认证异常已清除");
   return result;
 }
 
@@ -286,7 +306,7 @@ export function clearBackoff(id) {
     healthState.failCount = 0;
     if (!healthState.authError) healthState.lastErrorKind = "";
   });
-  emitLog("Key " + id + " 退避已手动清除");
+  emitKeyLog(id, " 退避已手动清除");
   return result;
 }
 
@@ -308,8 +328,8 @@ export function setQuotaLimited(id, untilMs, reason) {
   persistState();
   const isLimited = now < h.quotaLimitedUntil;
   // 探测每周期都会重设限制（credits 自延长场景），仅在状态翻转/原因变化时记日志防刷屏
-  if (isLimited && (!wasLimited || prevReason !== reason)) emitLog("Key " + id + " 额度受限（" + reason + "），暂停使用至窗口重置");
-  else if (!isLimited && wasLimited) emitLog("Key " + id + " 额度限制解除");
+  if (isLimited && (!wasLimited || prevReason !== reason)) emitKeyLog(id, " 额度受限（" + reason + "），暂停使用至窗口重置");
+  else if (!isLimited && wasLimited) emitKeyLog(id, " 额度限制解除");
 }
 
 // 软限制（决策 2 / DESIGN §5.2B）：额度 ≥softStop 时该 Key 保留可用，但优先级降到
@@ -322,7 +342,7 @@ export function setSoftLimited(id, val) {
   h.softLimited = next;
   bumpHealthVersion(id);
   persistState();
-  emitLog("Key " + id + (next ? " 额度将尽（软限制），降级为后备" : " 软限制解除"));
+  emitKeyLog(id, next ? " 额度将尽（软限制），降级为后备" : " 软限制解除");
 }
 
 export function clearQuotaLimited(id) { setQuotaLimited(id, 0, ""); }
@@ -334,7 +354,7 @@ export function recordFailover(id) {
   h.lastFailoverAt = nowMs();
   bumpHealthVersion(id);
   persistState();
-  emitLog("Key " + id + " 发生主备切换（累计 " + h.failoverCount + " 次）");
+  emitKeyLog(id, " 发生主备切换（累计 " + h.failoverCount + " 次）");
 }
 
 // ── 选 Key（决策 5：主备模式，任一时刻单一活跃 Key） ──

@@ -549,7 +549,11 @@ export async function handleAdmin(req, res, url) {
       };
       const onQuota = (d) => send("quota", d);
       const onStats = (d) => send("stats", d);
-      const onLog = (d) => send("log", { ts: d.ts || Date.now(), level: d.level || "info", msg: d.msg, src: d.src || "manager" });
+      const onLog = (d) => {
+        const event = { ts: d.ts || Date.now(), level: d.level || "info", msg: d.msg, src: d.src || "manager" };
+        if (typeof d.keyId === "string" && d.keyId) event.keyId = d.keyId;
+        send("log", event);
+      };
       const onQuotaStatus = (d) => send("quota-status", d);
       emitter.on("quota", onQuota);
       emitter.on("stats", onStats);

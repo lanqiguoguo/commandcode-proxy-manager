@@ -234,6 +234,27 @@ const historyForModel = async (model, path = "/admin/api/history?pageSize=500") 
   const result = parseJsonResponse(await admin(path), "history for " + model);
   return result.items.filter((event) => event.model === model);
 };
+const historyEventSummary = (items) => items.map((event) => ({
+  model: event.model,
+  ts: event.ts,
+  status: event.status,
+  ok: event.ok,
+  errorKind: event.errorKind,
+  stream: event.stream,
+  attempts: event.attempts,
+  retries: event.retries,
+}));
+async function waitForHistoryEvent(model, path, predicate, timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
+  let items = [];
+  while (performance.now() < deadline) {
+    items = await historyForModel(model, path);
+    const match = items.find(predicate);
+    if (match) return { match, items };
+    await sleep(25);
+  }
+  return { match: null, items };
+}
 
 async function waitUp(url, timeout = 20000, child, predicate = (response) => response.status < 500) {
   const t0 = performance.now();
@@ -1086,10 +1107,13 @@ async function main() {
   r = await gw({ model: "m-sse", messages: [], stream: true });
   r.status === 200 && (r.headers["content-type"] || "").includes("text/event-stream") && r.body.includes("[DONE]")
     ? ok("SSE 透传完整") : bad("SSE", "status=" + r.status + " ct=" + r.headers["content-type"]);
-  await sleep(200);
-  r = await admin("/admin/api/history?pageSize=3");
-  ev = JSON.parse(r.body).items[0];
-  ev && ev.stream && ev.ok && ev.inputTokens === 3 && ev.outputTokens === 4 && ev.cachedTokens === 2
+  const sseHistory = await waitForHistoryEvent(
+    "m-sse",
+    "/admin/api/history?pageSize=500",
+    (event) => event.stream && event.ok && event.status === 200,
+  );
+  ev = sseHistory.match;
+  ev && ev.inputTokens === 3 && ev.outputTokens === 4 && ev.cachedTokens === 2
     ? ok("流式 usage 3/4/2") : bad("流式 usage", JSON.stringify(ev));
 
   // ── T9b 上游流中途断连（P1-1 修复后：客户端不挂起、不误记成功、记 upstream 失败）──
@@ -1155,11 +1179,14 @@ async function main() {
   cutbRes.outcome !== "HANG" && cutbRes.ms < 6000
     ? ok("非流式半身断连：客户端有限时间终止（" + cutbRes.outcome + " " + cutbRes.ms + "ms）")
     : bad("P1-1 非流式挂起", "outcome=" + cutbRes.outcome + " ms=" + cutbRes.ms);
-  await sleep(250);
-  r = await admin("/admin/api/history?keyId=" + idA9b + "&errorKind=upstream&status=502");
-  const cutbodyEvents = JSON.parse(r.body).items.filter((event) => event.model === "m-cutb");
-  cutbodyEvents.length === 1 && cutbodyEvents[0].attempts === 1 && cutbodyEvents[0].retries === 0
-    ? ok("cutbody 也记单条 ok:false upstream 终态事件") : bad("cutbody 事件", r.body.slice(0, 200));
+  const cutbodyHistory = await waitForHistoryEvent(
+    "m-cutb",
+    "/admin/api/history?keyId=" + idA9b + "&errorKind=upstream&status=502&pageSize=500",
+    (event) => event.ok === false && event.status === 502 && event.errorKind === "upstream" && event.attempts === 1 && event.retries === 0,
+  );
+  cutbodyHistory.match && cutbodyHistory.items.length === 1
+    ? ok("cutbody 也记单条 ok:false upstream 终态事件")
+    : bad("cutbody 事件", JSON.stringify({ items: historyEventSummary(cutbodyHistory.items) }));
   mgrStderr.slice(stderrMark2).includes("unhandledRejection")
     ? bad("cutbody 拒绝噪音", mgrStderr.slice(stderrMark2).trim().split("\n").slice(0, 3).join(" | "))
     : ok("非流式断连无 unhandledRejection 噪音");

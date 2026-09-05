@@ -200,6 +200,27 @@ function preservedUpstreamError(parsed, text, status) {
   return body;
 }
 
+// B-2：上游（含 vendored proxy 的 CC_STATUS_MAP 映射层）已给出标准 OpenAI/Anthropic
+// error type 时，出口保留该 type，避免真实语义（401 凭证失效/404 不存在等）被归一成
+// 中性的 proxy_error 而让客户端 SDK 误判为"代理故障"。集合是白名单：上游可控文本
+// 不得把任意 type 注入前端/SDK 语义。proxy_error 未列入（它是 manager 自己合成的
+// 出口型），5xx 走下方分支维持 502/proxy_error，客户端 SDK 兼容不回退。
+const KNOWN_UPSTREAM_TYPES = new Set([
+  "authentication_error",
+  "invalid_request_error",
+  "not_found",
+  "rate_limit_error",
+  "upstream_error",
+  "temporarily_unavailable",
+  "auth_error",
+  "invalid_api_key",
+  "permission_error",
+  "server_error",
+  "overloaded_error",
+  "api_error",
+  "request_too_large",
+]);
+
 // Return a category after parsing only the structured error fields that the
 // upstream contract uses. Model-plan errors are checked before status-only
 // handling so a future 429/402 response cannot poison key health either.
@@ -213,9 +234,13 @@ export function classifyUpstreamError(status, text) {
   return { kind: "client", parsed };
 }
 
-function mapError(status, text, options = {}) {
+// 下游出口的 retry_after（秒）：透传分支（第四表）要求把上游解析到的值原样带出，
+// 不再回退到硬编码 30；调用方已按 parseRetryAfter 覆写 body，此处只保留显式入参
+// 的默认值（429 分支 mapError 内建 30 秒默认，调用方无解析值时兜底）。
+export function mapError(status, text, options = {}) {
   const parsed = options.parsed || parseUpstreamError(text);
   const message = redactUpstreamMessage(parsed.message || (text || "").slice(0, 200));
+  const whitelistedType = safeErrorToken(parsed.type);
   if (options.preserveUpstream) {
     return { status, body: preservedUpstreamError(parsed, text, status) };
   }
@@ -225,7 +250,30 @@ function mapError(status, text, options = {}) {
   if (status >= 500) {
     return { status: 502, body: { error: { message: message || "Upstream error", type: "proxy_error" } } };
   }
+  if (KNOWN_UPSTREAM_TYPES.has(whitelistedType)) {
+    // 上游已给出标准 type（CC_STATUS_MAP/OpenAI/Anthropic 白名单内）→ 保留，message 已净化
+    return { status, body: { error: { message: message || "Upstream error (" + status + ")", type: whitelistedType } } };
+  }
   return { status, body: { error: { message: message || "Upstream error (" + status + ")", type: "proxy_error" } } };
+}
+
+// B-1：把上游流内错误终止帧解析为可记录的净化错误对象。入参是 SSE data 载荷解析后的
+// 对象（openai 形态 `{error:{message,type},retry_after}` 或 anthropic 形态
+// `{type:"error",error:{type,message},retry_after}`）。调用方保证 event.error 是 record；
+// 仅允许字符串/有限数字字段，全部字段必须经 safeErrorToken/redactUpstreamMessage
+// 白名单净化后方可落盘或透传。
+function extractStreamUpstreamError(event) {
+  const nested = event.error;
+  const type = safeErrorToken(firstString(nested?.type));
+  const message = redactUpstreamMessage(firstString(nested?.message, event.message));
+  const rawRetry = nested?.retry_after ?? event.retry_after;
+  const retryAfter = typeof rawRetry === "number" && Number.isFinite(rawRetry) && rawRetry >= 0 ? Math.floor(rawRetry) : undefined;
+  const error = {};
+  if (type) error.type = type;
+  error.message = message || "Upstream stream error";
+  if (retryAfter !== undefined) error.retry_after = retryAfter;
+  if (retryAfter !== undefined) error.retryAfter = retryAfter;
+  return error;
 }
 
 // P1-6：上游 usage 字段数值强转——上游应答方给什么收什么（EMBED_UPSTREAM=0 时
@@ -302,8 +350,11 @@ function newSseState(protocol) {
     messageStopped: false,
     sawContent: false,
     usage: null,
+    upstreamError: null, // B-1：错误终止帧到达后置位；此后流只能结束
   };
 }
+// B-1 纯函数仅导出供 unit 级直接校验（不改任何生产路径）
+export { newSseState, validateSsePayload, finishSseValidation };
 
 function mergeUsage(current, next) {
   if (!next) return current;
@@ -315,6 +366,13 @@ function mergeUsage(current, next) {
 }
 
 function validateSsePayload(payload, state) {
+  if (state.upstreamError) {
+    // 错误终止帧之后的帧：只有结束帧允许到达（与 sawDone 同语义的流尾闸门）。
+    // 真实上游在错误帧后最多补一条 [DONE]（个别收尾形态），其余 data 均为协议外内容。
+    return payload.trim() === "[DONE]" && !state.sawDone && state.protocol === "openai"
+      ? (state.sawDone = true, null)
+      : "SSE data appeared after upstream error frame";
+  }
   if (payload.trim() === "[DONE]") {
     if (state.protocol !== "openai" || state.sawDone || !state.sawChunk) {
       return "invalid or premature SSE [DONE] termination";
@@ -330,6 +388,15 @@ function validateSsePayload(payload, state) {
   if (!isRecord(event)) return "SSE data event must be an object";
 
   if (state.protocol === "openai") {
+    // B-1：OpenAI 错误终止帧——真实上游出口形态（upstream/proxy.mjs）为
+    // data: {"error":{"message","type"},"retry_after"}（无 [DONE]）。判为合法终止帧：
+    // 置位 state.upstreamError 并放行（帧内容随后经 writeChunk 自然到达客户端），
+    // 连接以 res.end() 收尾而非 destroy。只有终态记录能区分"流内错误"与正常完成。
+    if (isRecord(event.error)) {
+      if (!state.sawChunk) return "upstream OpenAI SSE error frame before any chunk"; // 200 SSE 却从未开始 → 仍判损坏
+      state.upstreamError = extractStreamUpstreamError(event);
+      return null;
+    }
     if (event.object !== "chat.completion.chunk" || !Array.isArray(event.choices)) {
       return "upstream OpenAI SSE chunk is incomplete";
     }
@@ -380,6 +447,14 @@ function validateSsePayload(payload, state) {
       state.messageStopped = true;
       return null;
     case "error":
+      // B-1：Anthropic 错误终止帧（upstream/proxy.mjs case 'error' 后不再有
+      // message_delta/message_stop）。真实错误（message_start 已到、帧含 error 对象）→
+      // 置位并放行（内容已写出）；错误帧出现在 message_start 之前则仍判损坏——
+      // 那属于"200 SSE 却从未开始"的异常形态（上游正常路径会先发 message_start）。
+      if (state.messageStarted && isRecord(event.error)) {
+        state.upstreamError = extractStreamUpstreamError(event);
+        return null;
+      }
       return "upstream Anthropic SSE reported an error";
     default:
       return "unknown or unsupported Anthropic SSE event";
@@ -388,6 +463,7 @@ function validateSsePayload(payload, state) {
 
 function finishSseValidation(state) {
   if (state.frameLines.length > 0) return "upstream SSE ended with an incomplete event frame";
+  if (state.upstreamError) return null; // B-1：错误终止帧 = 合法结束（无需 [DONE]/message_stop）
   if (state.protocol === "openai") {
     if (!state.sawChunk || !state.sawDone) return "upstream OpenAI SSE is missing a valid [DONE] termination";
   } else if (!state.messageStarted || !state.sawContent || !state.messageStopped) {
@@ -419,7 +495,8 @@ async function waitDrain(res) {
   });
 }
 
-// 返回 { body, usage, err }：err = null（正常完成）| "client"（客户端断开）|
+// 返回 { body, usage, err, reason?, upstreamError }：err = null（正常完成，可能带
+// upstreamError 表示流以错误终止帧合法结束）| "client"（客户端断开）|
 // "upstream"（上游中途断连）| "invalid"（200 响应协议不完整）。非流式在完整校验
 // 前不写客户端，流式则保留已写出的前缀并由调用方销毁连接，避免切 Key 重放。
 // isClientGone(): 调用方闭包，判定客户端是否已断开（断开检测优先于分类，避免误判上游故障）。
@@ -535,7 +612,9 @@ async function pipeBody(upRes, res, isStream, isClientGone, protocol) {
   const reason = finishSseValidation(state);
   if (reason) return invalid(reason);
   try { res.end(); } catch {}
-  return { usage: state.usage, err: null };
+  // B-1：finish 校验通过时若流以错误终止帧收尾（客户端已收到该帧内容与干净 EOF），
+  // 错误摘要随返回值带回给 handleGateway，用于区分"流内错误"与纯成功的记录端语义。
+  return { usage: state.usage, err: null, upstreamError: state.upstreamError || null };
 }
 
 function sleep(ms) {
@@ -610,6 +689,7 @@ export async function handleGateway(req, res, url) {
     ok = false,
     status = lastStatus,
     errorKind = lastErrorKind,
+    reason,          // B-1：错误终止帧的净化摘要（仅 stream_error 终态携带）
     inputTokens,
     outputTokens,
     cachedTokens,
@@ -626,6 +706,7 @@ export async function handleGateway(req, res, url) {
       ok,
       status,
       errorKind: ok ? undefined : errorKind,
+      reason,
       inputTokens,
       outputTokens,
       cachedTokens,
@@ -686,6 +767,10 @@ export async function handleGateway(req, res, url) {
       const ac = new AbortController();
       activeAc = ac;
       let upRes = null;
+      // 等待上游响应头的超时：connectTimeoutMs 默认 120s（上游非流式 90s / 流式 30s 自身超时
+      // 会先返回 JSON，网关侧纯兜底），不能用 30s 总预算压缩单次等待——否则合法的慢生成会被误杀。
+      // 声明在 try 之外：catch 分支（超时文案）也需要读取该阈值（const 块级作用域不跨 try/catch）。
+      const perAttemptMs = poolCfg.connectTimeoutMs ?? 120000;
       try {
         const url2 = upstreamBase() + upstreamPath;
         const headers = {
@@ -696,9 +781,6 @@ export async function handleGateway(req, res, url) {
         if (req.headers["x-session-id"]) headers["x-session-id"] = req.headers["x-session-id"];
         if (req.headers["x-claude-code-session-id"]) headers["x-claude-code-session-id"] = req.headers["x-claude-code-session-id"];
         let t;
-        // 等待上游响应头的超时：connectTimeoutMs 默认 120s（上游非流式 90s / 流式 30s 自身超时
-        // 会先返回 JSON，网关侧纯兜底），不能用 30s 总预算压缩单次等待——否则合法的慢生成会被误杀
-        const perAttemptMs = poolCfg.connectTimeoutMs ?? 120000;
         const timeoutP = new Promise((_, rej) => {
           t = setTimeout(() => {
             try { ac.abort(); } catch {}
@@ -725,14 +807,18 @@ export async function handleGateway(req, res, url) {
           try { pool.recordTimeout(chosen.id); } catch {}
           lastStatus = 502;
           lastErrorKind = "timeout";
-          lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
+          // B-2（第四表）：附真实等待阈值（perAttemptMs = connectTimeoutMs 配置值），
+          // 不再笼统说 "connect timeout"——慢生成/CC 长尾与网络不可达可被运维区分。
+          lastBody = { error: { message: "Upstream did not respond within " + Math.round(perAttemptMs / 1000) + "s", type: "proxy_error" } };
           // 超时退避后换 Key：外层 while 顶部的截止检查会决定是否继续发起新尝试，
           // 预算耗尽时此处 break 即进入最终响应路径（502）。
           break;
         }
         lastStatus = 502;
         lastErrorKind = "upstream";
-        lastBody = { error: { message: "Upstream unreachable: " + e.message, type: "proxy_error" } };
+        // B-2（第四表）：fetch 抛错时附底层网络码（quota.mjs 同型读取 e.cause.code）；
+        // e.cause 可能缺 code（TLS/undici 包装错），兜底 "network"。
+        lastBody = { error: { message: "Upstream unreachable: fetch failed (" + (e.cause?.code || "network") + ")", type: "proxy_error" } };
         break;
       }
 
@@ -768,12 +854,14 @@ export async function handleGateway(req, res, url) {
         let usage = null;
         let pipeErr = null;
         let pipeReason = "";
+        let pipeUpstreamError = null;
         let responseBody = null;
         try {
           const result = await pipeBody(upRes, res, isStream, isClientGone, protocol);
           usage = result.usage;
           pipeErr = result.err;
           pipeReason = result.reason || "";
+          pipeUpstreamError = result.upstreamError || null;
           responseBody = result.body || null;
         } catch {
           // pipeBody 已不抛出；此处纯兜底（如 writeHead/end 意外抛错）
@@ -798,8 +886,27 @@ export async function handleGateway(req, res, url) {
           if (isStream) {
             try { res.destroy(); } catch {}
           } else if (!clientGone && !res.writableEnded && !res.destroyed) {
-            sendJson(res, 502, { error: { message: pipeReason || "Invalid response from upstream", type: "proxy_error" } });
+            // B-2（第四表）：读体中途 socket 死亡（err=upstream）与格式损坏（err=invalid）
+            // 分离文案——invalid 路径 pipeReason 恒非空，可精确区分，不会误伤格式错误。
+            const broken = pipeErr === "upstream" && pipeReason === "";
+            sendJson(res, 502, {
+              error: { message: broken ? "Upstream connection lost while reading response" : (pipeReason || "Invalid response from upstream"), type: "proxy_error" }
+            });
           }
+          return;
+        }
+        if (pipeUpstreamError) {
+          // B-1：连接层成功（客户端已收到 200 + 错误尾帧 + 干净 EOF），不按 502 记。
+          // 记录端 status 保持 200 且 ok:false，用独立 errorKind 区分"流内上游错误"与
+          // 纯成功/断流——history 页 UI 对该组合渲染不变（badge/筛选按 status 工作）。
+          recordRequestEvent({
+            keyId: chosen.id, stream: isStream, ok: false, status: 200,
+            errorKind: "stream_error",
+            reason: (pipeUpstreamError.message || "upstream stream error").slice(0, 200),
+            inputTokens: usage ? usage.inputTokens : undefined,
+            outputTokens: usage ? usage.outputTokens : undefined,
+            cachedTokens: usage ? usage.cachedTokens : undefined,
+          });
           return;
         }
         if (!isStream) {
@@ -877,9 +984,12 @@ export async function handleGateway(req, res, url) {
         lastStatus = 429;
         lastErrorKind = "rate_limit";
         const mapped = mapError(429, text);
-        // Retry-After 为 0 表示“立即重试”，必须保留 0（不能回退成 30）。
-        // 注意：mapped.body.retry_after 已是 mapError 默认填的 30，下面的回退只在
-        // parseRetryAfter 既没解析到 header 也没解析到 body 时使用。
+        // B-2（第四表）：Retry-After 原样透传——parseRetryAfter 同时解析响应头与
+        // body.retry_after（parseRetryAfter 的 header 优先，mock/真实上游 429 均以
+        // body.retry_after 下发），不再落入 mapError 内建的 30 硬编码。
+        // Retry-After 为 0 表示"立即重试"，必须保留 0。
+        // 注意：mapped.body.retry_after 仍是 mapError 默认的 30，下面的覆写仅在
+        // parseRetryAfter 既没解析到 header 也没解析到 body 时兜底使用（行为不变）。
         mapped.body.retry_after = retryAfterMs !== null
           ? Math.ceil(retryAfterMs / 1000)
           : (mapped.body.retry_after !== undefined ? mapped.body.retry_after : 30);

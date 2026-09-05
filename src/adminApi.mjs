@@ -318,7 +318,14 @@ export async function refreshQuotaWithTimeout(keyId, options = {}) {
   const timeout = new Promise((_, reject) => {
     timer = scheduleTimeout(() => {
       controller.abort(new Error("probe timeout"));
-      reject(new Error("probe timeout"));
+      // B-5：超时是服务器侧探测/排队问题而非客户端请求错误——错误对象带 504 +
+      // internal_error（sendAdminError 不再 fallback 400/invalid_request_error）。
+      // message 注明预算含 quota 串行队列排队等待（B-5 复现 B 形态：还没轮到探测
+      // 就超时）。前端 api() 以 data.error.message alert 出来，保持可读。
+      reject(Object.assign(
+        new Error("quota probe did not complete within " + timeoutMs + "ms（含队列等待）"),
+        { statusCode: 504, errorType: "internal_error" }
+      ));
     }, timeoutMs);
   });
   try {

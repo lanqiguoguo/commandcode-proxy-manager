@@ -5,6 +5,8 @@
 // 模式 mode：ok | sse | slowsse | rate_limit(retryAfter秒) | zeroout | auth | model_plan | server5xx | hang | bodyhang | delay(delayMs)
 //          | empty | malformed | truncated | missingstructure | empty_sse | malformed_sse | missingdone | unterminateddone | split_sse
 //          | cutstream（200 SSE 写数帧后 destroy，模拟上游流中途断连）| cutbody（200 JSON 写半身后 destroy）
+//          | error_frame（OpenAI 流：正常 chunk + data:{"error":{…},"retry_after"} 尾帧后干净 EOF，无 [DONE]，B-1）
+//          | anthropic_error_frame（/v1/messages 流：message_start/…/delta + event:error 后干净 EOF，无 message_stop，B-1）
 //          | badusage（200 JSON，usage 字段为字符串/对象/null 恶意值，P1-6 净化验证）
 // 初始化控制：POST /__control {auth, init:{fingerprint:[spec], lifecycle:[spec]}}
 // 管理端点：GET /__calls 调用记录；GET /__init-calls 初始化调用记录；GET /__slow slowsse 断流观测；POST /__reset 清空
@@ -23,7 +25,11 @@ const slowLog = [];
 const quotaLog = [];
 let quotaActive = 0;
 let quotaMaxActive = 0;
-const quotaLatency = Number(process.env.MOCK_QUOTA_LATENCY || 120);
+const quotaLatencyEnv = Number(process.env.MOCK_QUOTA_LATENCY || 120);
+let quotaLatency = Number.isFinite(quotaLatencyEnv) && quotaLatencyEnv >= 0 ? quotaLatencyEnv : 120;
+// B-5：探测端点"永不返回"开关（响应在客户端 abort 后才落盘）——刷新超时复现用，
+// 只对 quota 端点生效，不影响 chat 路径（不依赖 __reset，重启即复位）
+const quotaHang = String(process.env.MOCK_QUOTA_HANG || "") === "1";
 let initActive = 0;
 let initMaxActive = 0;
 
@@ -111,6 +117,18 @@ const server = http.createServer((req, res) => {
       const e = { p, auth, start: now, active: ++quotaActive };
       quotaLog.push(e);
       if (quotaActive > quotaMaxActive) quotaMaxActive = quotaActive;
+      if (quotaHang) {
+        // 永不返回：等客户端（manager 刷新超时）abort；注意本 mock 的 res 事件已挂 noop error
+        await new Promise((resolveHang) => {
+          const settle = () => { resolveHang(); };
+          res.once("close", settle);
+          req.once("close", settle);
+          setTimeout(settle, 60000).unref?.();
+        });
+        e.end = performance.now(); e.active = --quotaActive;
+        try { res.end(); } catch {}
+        return;
+      }
       await sleep(quotaLatency); // 轻微延迟，让并发/串行可测
       e.end = performance.now(); e.active = --quotaActive;
       if (p === "/alpha/whoami") return json(res, 200, { success: true, data: { org: { id: "o_test" } } });
@@ -209,7 +227,11 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (spec.mode === "auth") {
-      json(res, spec.status || 401, { error: { message: "invalid api key (mock)", type: "auth_error" } });
+      json(res, spec.status || 401, { error: { message: "invalid api key (mock)", type: spec.type || "auth_error" } });
+      return;
+    }
+    if (spec.mode === "client4xx") {
+      json(res, spec.status || 400, { error: { message: spec.message || "bad request (mock)", type: spec.type || "invalid_request_error" } });
       return;
     }
     if (spec.mode === "model_plan") {
@@ -225,10 +247,6 @@ const server = http.createServer((req, res) => {
     }
     if (spec.mode === "server5xx") {
       json(res, spec.status || 503, { error: { message: "upstream down (mock)", type: "server_error" } });
-      return;
-    }
-    if (spec.mode === "client4xx") {
-      json(res, spec.status || 400, { error: { message: "bad request (mock)", type: "invalid_request_error" } });
       return;
     }
     if (spec.mode === "slowsse") {
@@ -329,6 +347,21 @@ const server = http.createServer((req, res) => {
         res.end();
         return;
       }
+      if (spec.mode === "anthropic_error_frame") {
+        // B-1 复现：与真实上游出口同形（upstream/proxy.mjs case 'error' 后无 message_stop）：
+        // message_start/…/delta → event:error（error.type/message + retry_after）→ 干净 EOF。
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+        res.write("event: message_start\ndata: " + JSON.stringify({ type: "message_start", message: { id: "msg-ef", type: "message", role: "assistant", content: [], model: parsed.model || "mock", usage: { input_tokens: 3, output_tokens: 0 } } }) + "\n\n");
+        res.write("event: content_block_start\ndata: " + JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) + "\n\n");
+        res.write("event: content_block_delta\ndata: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello before error" } }) + "\n\n");
+        const errType = spec.errType || "rate_limit_error";
+        const errMsg = spec.errMessage || "rate limited (mock)";
+        const errBody = { type: "error", error: { type: errType, message: errMsg } };
+        if (spec.retryAfter !== undefined && spec.retryAfter !== null) errBody.retry_after = spec.retryAfter;
+        res.write("event: error\ndata: " + JSON.stringify(errBody) + "\n\n");
+        res.end();
+        return;
+      }
       json(res, 200, {
         id: "msg-mock", type: "message", role: "assistant", model: parsed.model || "mock",
         content: [{ type: "text", text: "hello from messages mock" }],
@@ -374,6 +407,20 @@ const server = http.createServer((req, res) => {
       await sleep(30);
       res.write('data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"k"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7,"prompt_tokens_details":{"cached_tokens":2}}}\n\n');
       res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+    if (spec.mode === "error_frame") {
+      // B-1 复现：与真实上游出口同形（upstream/proxy.mjs:1007-1012 错误尾帧后无 [DONE]）：
+      // 正常 chunk → data:{"error":{message,type},"retry_after"} → 干净 EOF。
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      res.write('data: {"id":"c-ef","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"tok1"},"finish_reason":null}]}\n\n');
+      await sleep(20);
+      const errType = spec.errType || "rate_limit_error";
+      const errMsg = spec.errMessage || "rate limited (upstream)";
+      const errBody = { error: { message: errMsg, type: errType } };
+      if (spec.retryAfter !== undefined && spec.retryAfter !== null) errBody.retry_after = spec.retryAfter;
+      res.write("data: " + JSON.stringify(errBody) + "\n\n");
       res.end();
       return;
     }

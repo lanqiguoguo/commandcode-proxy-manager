@@ -401,6 +401,7 @@ async function testHelperLifecycle() {
 
     const timeoutTimers = makeFakeTimers();
     let timeoutSignal;
+    let timeoutError = null;
     const timeoutPromise = refreshQuotaWithTimeout("timeout", {
       timeoutMs: 25,
       setTimeout: timeoutTimers.setTimeout,
@@ -411,7 +412,16 @@ async function testHelperLifecycle() {
       },
     });
     timeoutTimers.fireAll();
-    await assert.rejects(timeoutPromise, /probe timeout/);
+    try {
+      await timeoutPromise;
+    } catch (error) {
+      timeoutError = error;
+    }
+    assert.ok(timeoutError, "refresh timeout must reject");
+    assert.equal(timeoutError.statusCode, 504, "B-5 timeout must carry statusCode 504");
+    assert.equal(timeoutError.errorType, "internal_error", "B-5 timeout must carry errorType internal_error");
+    assert.match(timeoutError.message, /did not complete within 25ms/, "B-5 timeout message must state budget");
+    assert.doesNotMatch(timeoutError.message, /probe timeout/, "B-5 no stale 'probe timeout' text");
     await sleep(40);
     assert.equal(timeoutSignal.aborted, true);
     assert.equal(timeoutTimers.activeCount, 0);
@@ -510,13 +520,15 @@ async function testHttpBoundaries() {
       timeoutMs: 2000,
     });
     const timeoutBody = parseJson(timeout, "refresh timeout response");
-    assert.equal(timeout.status, 400);
-    assert.equal(timeoutBody.error?.message, "probe timeout");
+    assert.equal(timeout.status, 504);
+    assert.equal(timeoutBody.error?.type, "internal_error");
+    // spawnManager 固定以 CC_ADMIN_REFRESH_QUOTA_TIMEOUT_MS=150 启动该 manager
+    assert.equal(timeoutBody.error?.message, "quota probe did not complete within 150ms（含队列等待）");
     assert.ok(Date.now() - timeoutStarted < 1200, `timeout response was too slow: ${Date.now() - timeoutStarted}ms`);
     const abortedStarted = Date.now();
     while (quotaMock.state.aborted < 1 && Date.now() - abortedStarted < 1000) await sleep(20);
     assert.ok(quotaMock.state.aborted >= 1, "timed out quota request was not aborted at the mock");
-    console.log("  PASS refresh-quota timeout -> bounded 400 and underlying HTTP probe aborted");
+    console.log("  PASS refresh-quota timeout -> bounded 504 internal_error and underlying HTTP probe aborted");
 
     quotaMock.state.mode = "success";
     const repeats = [];

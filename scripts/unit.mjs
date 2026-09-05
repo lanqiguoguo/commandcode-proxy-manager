@@ -714,10 +714,10 @@ if (SC === "persistence") {
     "validateQuotaCacheDocument knownIds 跳过未知坏报告");
 }
 
-// ════ gateway ════
+// ════ gateway（B-1/B-2：无网络纯函数级校验 + 错误出口语义）════
 if (SC === "gateway") {
   console.log("=== gateway upstream error classification ===");
-  const { classifyUpstreamError } = await import("../src/gateway.mjs");
+  const { classifyUpstreamError, mapError } = await import("../src/gateway.mjs");
   const classify = (status, body) => classifyUpstreamError(status, JSON.stringify(body));
   const model401 = classify(401, {
     error: { code: "MODEL_NOT_IN_PLAN", type: "authentication_error", message: "model is not included in this plan" }
@@ -745,6 +745,90 @@ if (SC === "gateway") {
   check(genericModel401.kind === "auth", "通用 MODEL_NOT_SUPPORTED + 凭证错误 → auth", JSON.stringify(genericModel401));
   const ordinary4xx = classify(422, { error: { type: "invalid_request_error", message: "bad request" } });
   check(ordinary4xx.kind === "client", "普通 4xx → client 且不进入 auth", JSON.stringify(ordinary4xx));
+
+  // ── B-2 错误出口 type 白名单保留（mapError 纯函数）──
+  const m400 = mapError(400, JSON.stringify({ error: { message: "bad request", type: "invalid_request_error" } }));
+  check(m400.status === 400 && m400.body.error.type === "invalid_request_error",
+    "B-2 白名单 400 → 出口保留 invalid_request_error", JSON.stringify(m400));
+  const m404 = mapError(404, JSON.stringify({ error: { message: "no model", type: "not_found" } }));
+  check(m404.status === 404 && m404.body.error.type === "not_found",
+    "B-2 白名单 404 → 出口保留 not_found", JSON.stringify(m404));
+  const mAuth = mapError(401, JSON.stringify({ error: { message: "bad key", type: "authentication_error" } }));
+  check(mAuth.status === 401 && mAuth.body.error.type === "authentication_error",
+    "B-2 白名单 401 → 出口保留 authentication_error", JSON.stringify(mAuth));
+  const mMystery = mapError(422, JSON.stringify({ error: { message: "weird", type: "mystery_error" } }));
+  check(mMystery.status === 422 && mMystery.body.error.type === "proxy_error",
+    "B-2 白名单外 type → 仍归一 proxy_error（防上游任意 type 注入）", JSON.stringify(mMystery));
+  const m5xx = mapError(503, JSON.stringify({ error: { message: "down", type: "temporarily_unavailable" } }));
+  check(m5xx.status === 502 && m5xx.body.error.type === "proxy_error",
+    "B-2 5xx → 出口维持 502/proxy_error（SDK 兼容不回退）", JSON.stringify(m5xx));
+  const mRedact = mapError(400, JSON.stringify({
+    error: { message: "Bearer user_private_XA21 bad token", type: "invalid_request_error" }
+  }));
+  check(mRedact.body.error.message.includes("Bearer [REDACTED]") && !mRedact.body.error.message.includes("user_private_XA21"),
+    "B-2 出口 message 经 redact（无原始 key）", JSON.stringify(mRedact));
+  const mPreserve = mapError(401, JSON.stringify({
+    error: { code: "MODEL_NOT_IN_PLAN", message: "plan", type: "authentication_error" }
+  }), { parsed: { code: "MODEL_NOT_IN_PLAN", type: "authentication_error", message: "plan" }, preserveUpstream: true });
+  check(mPreserve.body.error.code === "MODEL_NOT_IN_PLAN" && mPreserve.body.error.type === "authentication_error",
+    "B-2 preserveUpstream（model_plan 路径）不受影响", JSON.stringify(mPreserve));
+  const m402 = mapError(402, JSON.stringify({ error: { message: "payment required", type: "rate_limit_error" }, retry_after: 10 }));
+  check(m402.status === 429 && m402.body.retry_after === 30,
+    "B-2 402 → 429 rate_limit_error，retry_after 默认 30（调用方 parseRetryAfter 覆写在外层）", JSON.stringify(m402));
+
+  // ── B-1 流内错误终止帧（校验器/收尾纯函数，经导出 internal 符号）──
+  const sse = await import("../src/gateway.mjs?b1-sse");
+  const { newSseState, validateSsePayload, finishSseValidation } = sse;
+  const st1 = newSseState("openai");
+  check(validateSsePayload(JSON.stringify({
+    id: "c1", object: "chat.completion.chunk", model: "m",
+    choices: [{ index: 0, delta: { content: "tok1" }, finish_reason: null }]
+  }), st1) === null && st1.sawChunk === true, "B-1 openai 正常 chunk 校验放行", JSON.stringify(st1));
+  const errBody = { error: { message: "rate limited", type: "rate_limit_error" }, retry_after: 5 };
+  check(validateSsePayload(JSON.stringify(errBody), st1) === null && st1.upstreamError !== null,
+    "B-1 openai 错误尾帧（chunk 后）判为合法终止帧", JSON.stringify(st1.upstreamError));
+  check(st1.upstreamError.type === "rate_limit_error" && st1.upstreamError.message === "rate limited" &&
+    st1.upstreamError.retry_after === 5 && st1.upstreamError.retryAfter === 5,
+    "B-1 错误帧净化字段（type/message/retry_after 白名单）", JSON.stringify(st1.upstreamError));
+  check(validateSsePayload("data-ignored-not-here", st1) === "SSE data appeared after upstream error frame",
+    "B-1 错误帧后 data 帧 → 拒绝（流只能结束）");
+  check(validateSsePayload("[DONE]", st1) === null && st1.sawDone === true,
+    "B-1 错误帧后 [DONE] 仍可放行（个别上游收尾形态）");
+  check(finishSseValidation(st1) === null, "B-1 openai 错误帧收尾通过 finish（无需 sawDone 前置）");
+  const st2 = newSseState("openai");
+  check(validateSsePayload(JSON.stringify({ error: { message: "never started" } }), st2) ===
+    "upstream OpenAI SSE error frame before any chunk" && st2.upstreamError === null,
+    "B-1 无 chunk 即错误帧 → 仍判损坏（200 SSE 从未开始）");
+  const st3 = newSseState("openai");
+  check(finishSseValidation(st3) !== null, "B-1 空流无错误帧 finish 仍失败（对照不回退）");
+  const st4 = newSseState("openai");
+  check(validateSsePayload(JSON.stringify({
+    id: "c1", object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "x" } }]
+  }), st4) === null &&
+    validateSsePayload(JSON.stringify({ error: { message: "boom", type: "authentication_error" }, retry_after: 7 }), st4) === null,
+    "B-1 多形态错误帧 type 任意白名单 token 均可放行（分类在记录端不在校验端）");
+  check(st4.upstreamError.retryAfter === 7 && st4.upstreamError.retry_after === 7, "B-1 retry_after 双形态字段");
+  const stA = newSseState("anthropic");
+  check(validateSsePayload(JSON.stringify({
+    type: "message_start", message: { type: "message", role: "assistant", content: [] }
+  }), stA) === null && stA.messageStarted === true, "B-1 anthropic message_start 校验放行");
+  check(validateSsePayload(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "limit" } }), stA) === null &&
+    stA.upstreamError !== null && stA.upstreamError.message === "limit",
+    "B-1 anthropic event:error（message_start 后）判为合法终止帧");
+  check(validateSsePayload(JSON.stringify({ type: "error", error: { message: "boom" } }), newSseState("anthropic")) ===
+    "upstream Anthropic SSE reported an error",
+    "B-1 anthropic 错误帧在 message_start 前 → 仍判损坏");
+  check(finishSseValidation(stA) === null, "B-1 anthropic 错误帧收尾通过 finish（无需 message_stop）");
+  const stB = newSseState("anthropic");
+  check(validateSsePayload(JSON.stringify({
+    type: "message_start", message: { type: "message", role: "assistant", content: [] }
+  }), stB) === null && finishSseValidation(stB) !== null,
+    "B-1 anthropic 无错误帧无 message_stop → finish 仍失败（对照不回退）");
+  const stClean = newSseState("openai");
+  check(validateSsePayload(JSON.stringify({
+    id: "c1", object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "ok" } }]
+  }), stClean) === null && validateSsePayload("[DONE]", stClean) === null && finishSseValidation(stClean) === null,
+    "B-1 正常 [DONE] 成功流行为零变化");
 }
 
 // ════ keyPool ════

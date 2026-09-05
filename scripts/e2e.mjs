@@ -1261,6 +1261,88 @@ async function main() {
     ? ok("SSE 跨 chunk 拆分后仍按完整帧解析并成功")
     : bad("SSE 跨 chunk 正常路径", JSON.stringify({ result: r, event: splitEvent }));
 
+  // ── T9f B-1 流式错误终止帧：错误尾帧不再判损 RST，客户端收错误帧 + 干净 EOF，
+  //      记录端 status=200 ok=false errorKind=stream_error + 净化 reason（不重复计 502）──
+  console.log("\n=== T9f stream error termination frame (B-1) ===");
+  {
+    await mock("/__reset");
+    await mock("/__control", { auth: "user_keyA", responses: [{
+      mode: "error_frame", errType: "rate_limit_error", errMessage: "rate limited (upstream)", retryAfter: 5
+    }] });
+    const efResult = await rawGwOnce({ model: "m-errframe-openai", messages: [], stream: true });
+    await sleep(150);
+    const efRows = await historyForModel("m-errframe-openai");
+    const efEvent = efRows[0];
+    efResult.outcome === "end" && efResult.status === 200 && efResult.txt.includes("tok1") &&
+      efResult.txt.includes('"rate_limit_error"') && efResult.txt.includes("rate limited (upstream)") &&
+      efResult.txt.includes('"retry_after":5') && !efResult.txt.includes("[DONE]") && !efResult.txt.includes("Connection lost")
+      ? ok("OpenAI 错误尾帧透传 + 干净 EOF（无 RST、无 [DONE]）")
+      : bad("B-1 OpenAI 错误帧透传", JSON.stringify(efResult).slice(0, 400));
+    efEvent && efEvent.ok === false && efEvent.status === 200 && efEvent.errorKind === "stream_error" &&
+      efEvent.attempts === 1 && efEvent.retries === 0 && efEvent.reason === "rate limited (upstream)"
+      ? ok("记录端：200/ok=false/stream_error + reason 净化摘要")
+      : bad("B-1 OpenAI 记录端", JSON.stringify(historyEventSummary(efRows)));
+
+    await mock("/__reset");
+    await mock("/__control", { auth: "user_keyA", responses: [{
+      mode: "error_frame", errType: "authentication_error", errMessage: "Bearer user_secret_AAAA expired (bad) <img src=x>", retryAfter: 7
+    }] });
+    const efAuth = await rawGwOnce({ model: "m-errframe-oa-auth", messages: [], stream: true });
+    await sleep(150);
+    const efAuthRows = await historyForModel("m-errframe-oa-auth");
+    // 出口帧是逐行透传（错误帧内容自然到达客户端，不重写）；记录端 reason 必须已净化
+    efAuth.outcome === "end" && efAuth.txt.includes("authentication_error") && efAuth.txt.includes("retry_after")
+      ? ok("OpenAI 错误帧出口保真（type/retry_after 到达客户端）")
+      : bad("B-1 出口保真", JSON.stringify({ outcome: efAuth.outcome, body: efAuth.txt.slice(0, 300) }));
+    const efAuthEvent = efAuthRows[0];
+    efAuthEvent && efAuthEvent.reason && efAuthEvent.reason.includes("Bearer [REDACTED]") &&
+      !JSON.stringify(efAuthRows).includes("user_secret") && typeof efAuthEvent.reason === "string" && efAuthEvent.reason.length <= 200
+      ? ok("记录端 reason 经 redactUpstreamMessage（key 掩码、≤200 字符、无原始 key 明文）")
+      : bad("B-1 记录净化", JSON.stringify({ event: efAuthEvent, rows: efAuthRows }).slice(0, 300));
+
+    // Anthropic：/v1/messages 流，message_start/…/delta + event:error（无 message_stop）
+    await mock("/__reset");
+    await mock("/__control", { auth: "user_keyA", responses: [{
+      mode: "anthropic_error_frame", errType: "rate_limit_error", errMessage: "rate limited (anthropic)", retryAfter: 3
+    }] });
+    const anRaw = await http1(MG + "/v1/messages", "POST", { "Content-Type": "application/json", Authorization: "Bearer " + CLIENT },
+      JSON.stringify({ model: "m-errframe-anthropic", messages: [{ role: "user", content: "x" }], stream: true }))
+      .catch((e) => ({ err: e.code || e.message }));
+    await sleep(150);
+    const anRows = await historyForModel("m-errframe-anthropic", "/admin/api/history?pageSize=500");
+    const anEvent = anRows[0];
+    anRaw && anRaw.err === undefined && anRaw.status === 200 && anRaw.body.includes("hello before error") &&
+      anRaw.body.includes("event: error") && anRaw.body.includes("rate limited (anthropic)") &&
+      anRaw.body.includes("event: message_start") && !anRaw.body.includes("message_stop")
+      ? ok("Anthropic 错误帧（event:error）透传 + 干净 EOF（无 RST）")
+      : bad("B-1 Anthropic 错误帧", JSON.stringify(anRaw).slice(0, 400));
+    anEvent && anEvent.ok === false && anEvent.status === 200 && anEvent.errorKind === "stream_error" && anEvent.reason === "rate limited (anthropic)"
+      ? ok("Anthropic 记录端同样 200/ok=false/stream_error + reason")
+      : bad("B-1 Anthropic 记录端", JSON.stringify(historyEventSummary(anRows)));
+    // 错误帧流不算成功（status=200 的筛选不应把 ok:false/stream_error 行漏给成功语义）
+    const anSuccessQuery = JSON.parse((await admin("/admin/api/history?keyId=" + idA9b + "&status=200&pageSize=500")).body).items;
+    anSuccessQuery.some((e) => e.model === "m-errframe-anthropic" && e.ok === true)
+      ? bad("B-1 Anthropic 错误帧被误记成功", JSON.stringify(historyEventSummary(anSuccessQuery.filter((e) => e.model === "m-errframe-anthropic"))))
+      : ok("错误帧流未产生 ok:true 成功事件");
+
+    // 对照：畸形/缺终止帧的流仍判损坏（B-1 只放行"错误终止帧"，普通畸形流不回退）
+    await mock("/__reset");
+    await mock("/__control", { auth: "user_keyA", responses: [{ mode: "cutstream" }] });
+    const ctrlCut = await rawGwOnce({ model: "m-errframe-ctrl-cut", messages: [], stream: true });
+    await sleep(100);
+    const ctrlCutRows = await historyForModel("m-errframe-ctrl-cut");
+    ctrlCut.outcome !== "timeout" && ctrlCutRows.length === 1 && ctrlCutRows[0].ok === false &&
+      ctrlCutRows[0].status === 502 && ctrlCutRows[0].errorKind === "upstream"
+      ? ok("对照：上游中途断流仍判 502/upstream（错误帧修复未放宽断流语义）")
+      : bad("B-1 对照断流", JSON.stringify({ result: ctrlCut, rows: historyEventSummary(ctrlCutRows) }));
+    const ctrlMissingdone = await rawGwOnce({ model: "m-errframe-ctrl-nodone", messages: [], stream: true });
+    await sleep(100);
+    const ctrlNoDoneRows = await historyForModel("m-errframe-ctrl-nodone");
+    ctrlMissingdone.outcome !== "timeout" && ctrlNoDoneRows.length === 1 && ctrlNoDoneRows[0].errorKind === "upstream" && ctrlNoDoneRows[0].status === 502
+      ? ok("对照：无错误帧的缺 [DONE] 流仍判损坏 502")
+      : bad("B-1 对照缺 DONE", JSON.stringify({ result: ctrlMissingdone, rows: historyEventSummary(ctrlNoDoneRows) }));
+  }
+
   // ── T9d 上游脏 usage 净化（P1-6：字符串/对象/null usage 不得入 stats/历史）──
   console.log("\n=== T9d bad usage sanitization (P1-6) ===");
   await restartClean();
@@ -1727,6 +1809,82 @@ async function main() {
   r = await gw({ model: "m-400", messages: [] });
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
   r.status === 400 && calls.length === 1 ? ok("上游 400 透传不重试") : bad("4xx", "status=" + r.status + " calls=" + calls.length);
+
+  // ── T21b B-2 错误出口 type 白名单保留（真实 400/401/404/422 不再归一 proxy_error）──
+  console.log("\n=== T21b error type whitelist passthrough (B-2) ===");
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "client4xx", status: 400 }] });
+  r = await gw({ model: "m-b2-400", messages: [] });
+  let b2 = parseJsonResponse(r, "B-2 400");
+  r.status === 400 && b2.error?.type === "invalid_request_error" && b2.error?.message === "bad request (mock)"
+    ? ok("400 invalid_request_error 出口保留（不再归一 proxy_error）")
+    : bad("B-2 400", "status=" + r.status + " " + JSON.stringify(b2.error));
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "client4xx", status: 404, type: "not_found" }] });
+  r = await gw({ model: "m-b2-404", messages: [] });
+  b2 = parseJsonResponse(r, "B-2 404");
+  r.status === 404 && b2.error?.type === "not_found"
+    ? ok("404 not_found 出口保留") : bad("B-2 404", "status=" + r.status + " " + JSON.stringify(b2.error));
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "client4xx", status: 422, type: "invalid_request_error" }] });
+  r = await gw({ model: "m-b2-422", messages: [] });
+  b2 = parseJsonResponse(r, "B-2 422");
+  r.status === 422 && b2.error?.type === "invalid_request_error"
+    ? ok("422 invalid_request_error 出口保留") : bad("B-2 422", "status=" + r.status + " " + JSON.stringify(b2.error));
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "client4xx", status: 422, type: "mystery_error" }] });
+  r = await gw({ model: "m-b2-mystery", messages: [] });
+  b2 = parseJsonResponse(r, "B-2 mystery");
+  r.status === 422 && b2.error?.type === "proxy_error"
+    ? ok("白名单外 type 仍归一 proxy_error（上游任意 type 不得注入出口语义）")
+    : bad("B-2 mystery", "status=" + r.status + " " + JSON.stringify(b2.error));
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: Array(4).fill({ mode: "server5xx", status: 503 }) });
+  r = await gw({ model: "m-b2-5xx", messages: [] });
+  b2 = parseJsonResponse(r, "B-2 5xx");
+  r.status === 502 && b2.error?.type === "proxy_error"
+    ? ok("5xx 出口维持 502/proxy_error（SDK 兼容不回退）") : bad("B-2 5xx", "status=" + r.status + " " + JSON.stringify(b2.error));
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "auth", status: 401, type: "authentication_error" }] });
+  r = await gw({ model: "m-b2-401", messages: [] });
+  b2 = parseJsonResponse(r, "B-2 401");
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  r.status === 401 && b2.error?.type === "authentication_error" && kA && kA.health.authError === true
+    ? ok("401 authentication_error 出口保留且 Key 仍标 authError")
+    : bad("B-2 401", "status=" + r.status + " " + JSON.stringify({ error: b2.error, health: kA && kA.health }));
+  await admin("/admin/api/keys/" + kA.id + "/clear-auth", "POST");
+  // 保留 401 后健康语义不回归：clear-auth 后同一 Key 立即可用
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: [{ mode: "ok" }] });
+  r = await gw({ model: "m-b2-recover", messages: [] });
+  r.status === 200 ? ok("B-2 矩阵后 Key 恢复可用（clear-auth 生效）") : bad("B-2 recover", "status=" + r.status);
+
+  // ── T21c B-5 refresh-quota 探测超时 → 504 internal_error（不再 400 invalid_request_error）──
+  console.log("\n=== T21c refresh-quota timeout 504 (B-5) ===");
+  await sleep(1300); await stopMgr();
+  // 缩短预算到 400ms：mock 额度端点 4×120ms 串行 ≥480ms > 400ms，超时确定性先到
+  await startMgr({ CC_ADMIN_REFRESH_QUOTA_TIMEOUT_MS: "400" });
+  ks = await keysList();
+  const idB5 = ks.find((k) => k.alias === "keyA").id;
+  t0 = performance.now();
+  r = await admin("/admin/api/keys/" + idB5 + "/refresh-quota", "POST");
+  const dtB5 = Math.round(performance.now() - t0);
+  let b5 = null;
+  try { b5 = parseJsonResponse(r, "B-5 refresh timeout"); } catch {}
+  r.status === 504 && b5.error?.type === "internal_error" && String(b5.error?.message || "").includes("400ms")
+    ? ok("refresh-quota 探测超时 → 504 internal_error（含队列等待文案）", dtB5 + "ms")
+    : bad("B-5 504", "status=" + r.status + " dt=" + dtB5 + " " + JSON.stringify(b5));
+  r = await http1(MG + "/health", "GET", {});
+  r.status === 200 ? ok("超时后 manager 存活") : bad("B-5 health", "status=" + r.status);
+  await restartClean(); // 恢复默认 35s 预算
+  const idB5b = (await keysList()).find((k) => k.alias === "keyA").id;
+  r = await admin("/admin/api/keys/" + idB5b + "/refresh-quota", "POST");
+  let b5ok = null;
+  try { b5ok = parseJsonResponse(r, "B-5 recovery"); } catch {}
+  r.status === 200 && b5ok.quota && b5ok.quota.stale === false
+    ? ok("默认预算下刷新恢复 200（超时未卡死队列/Key）")
+    : bad("B-5 恢复", "status=" + r.status + " " + r.body.slice(0, 200));
 
   // ── T22 串行额度探测 / SSE 状态事件 / 系统日志持久化 ──
   console.log("\n=== T22 serial probes & status events & log persistence ===");

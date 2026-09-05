@@ -1039,6 +1039,65 @@ async function main() {
   r = await http1(MG + "/v1/models", "GET", { Authorization: "Bearer " + CLIENT });
   r.status === 200 ? ok("模型套餐 403 后同一 Key 仍可请求 models") : bad("套餐 403 后 models", "status=" + r.status);
 
+  // ── T6c B-11：CC 403 entitlement 折叠 401 误摘健康 Key——文本甄别放宽 ──
+  // 链内无 vendored proxy 折叠，故用 mock 直接回折叠后的出口形状（等价于
+  // CC_STATUS_MAP 403→401 后 manager 所见：status 401 + type=authentication_error
+  // + message，code 已丢失）：client4xx mode 可覆盖 status/message/type 且不带 code。
+  // 对照组 403（code+文本双命中）走 model_plan mode。语义：entitlement/plan 文本
+  // 放行（不标 authError），纯凭证文本仍保守 auth（旧行为前三例全部误摘 authError）。
+  console.log("\n=== T6c B-11 folded entitlement 401/403 keep key healthy ===");
+  await restartClean();
+  const b11 = [
+    // [mode, status, type, message, 期望出口 status, 期望 type]
+    ["client4xx", 401, "authentication_error",
+      "Your plan does not include this capability", 401, "authentication_error"],      // ent403_short
+    ["client4xx", 401, "authentication_error",
+      "This capability is not enabled for your account tier", 401, "authentication_error"], // ent403
+    ["client4xx", 401, "authentication_error",
+      "403 Forbidden: entitlement check failed", 401, "authentication_error"],         // ent403_nocode
+    ["client4xx", 401, "authentication_error",
+      "Your plan does not allow this capability", 401, "authentication_error"],        // 额外宽化形态
+  ];
+  for (const [mode, status, type, message, exitStatus, exitType] of b11) {
+    await mock("/__control", {
+      auth: "user_keyA",
+      responses: [{ mode, status, type, message }],
+    });
+    r = await gw({ model: "m-b11", messages: [] });
+    const body = parseJsonResponse(r, "B-11 folded entitlement");
+    ks = await keysList();
+    kA = ks.find((k) => k.alias === "keyA");
+    if (r.status === exitStatus && body.error?.type === exitType &&
+      !body.error?.message.includes("user_keyA") &&
+      kA.health.authError === false && kA.health.backoffUntilMs <= Date.now() && kA.health.lastErrorKind !== "auth") {
+      ok(`B-11 "${message}" → 出口 ${exitStatus}/${exitType}，key 不标 authError`);
+    } else {
+      bad(`B-11 "${message}"`, JSON.stringify({ status: r.status, body: r.body.replaceAll("user_keyA", "user_***"), health: kA.health }));
+    }
+    // 复位：clear-auth（若上例有残标）+ 确认 /v1/models 可用
+    await admin("/admin/api/keys/" + kA.id + "/clear-auth", "POST");
+  }
+  r = await http1(MG + "/v1/models", "GET", { Authorization: "Bearer " + CLIENT });
+  r.status === 200 ? ok("B-11 各例 clear-auth 复位后同 Key /v1/models 200") : bad("B-11 复位 models", "status=" + r.status);
+
+  // 反例护栏：折叠出口 401/403 + 凭证文本 → 仍按 auth 保守停用（不得因放宽放行）
+  // mock auth mode 固定 message="invalid api key (mock)"——正是纯凭证反例
+  for (const status of [403, 401]) {
+    await mock("/__control", { auth: "user_keyA", responses: [{ mode: "auth", status }] });
+    r = await gw({ model: "m-b11-auth", messages: [] });
+    ks = await keysList();
+    kA = ks.find((k) => k.alias === "keyA");
+    if (kA.health.authError === true && kA.health.backoffUntilMs > Date.now() && r.status === status) {
+      ok(`B-11 反例 invalid api key ${status} → 仍保守 authError + 停用`);
+    } else {
+      bad(`B-11 反例 invalid api key ${status}`, JSON.stringify({ status: r.status, health: kA.health }));
+    }
+    await admin("/admin/api/keys/" + kA.id + "/clear-auth", "POST");
+  }
+  const b11HealthyAfter = await keysList();
+  b11HealthyAfter.find((k) => k.alias === "keyA").health.authError === false
+    ? ok("B-11 全部反例后 clear-auth 复位") : bad("B-11 反例复位", JSON.stringify(b11HealthyAfter.find((k) => k.alias === "keyA").health));
+
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "client4xx", status: 400 }] });
   r = await gw({ model: "m-model-plan-ordinary-4xx", messages: [] });
   ks = await keysList();
@@ -1507,6 +1566,30 @@ async function main() {
   await admin("/admin/api/keys/" + idA, "PUT", { enabled: true });
   r = await admin("/admin/api/keys");
   r.body.includes("***") && !r.body.includes("user_keyA") ? ok("API 仅回显掩码") : bad("掩码", r.body.slice(0, 200));
+
+  // ── C-7：PUT keys/:id 入参类型闸（curl-only 可达的输入卫生 → 400，不静默改写）──
+  const c7OrderBefore = JSON.parse((await admin("/admin/api/keys")).body).keys.map((k) => [k.alias, k.enabled, k.priority]);
+  for (const patch of [{ enabled: "false" }, { priority: "1" }, { alias: 123 }, { note: [1] }, { priority: -1 }]) {
+    r = await admin("/admin/api/keys/" + idA, "PUT", patch);
+    let c7Body = null;
+    try { c7Body = parseJsonResponse(r, "C-7 invalid PUT"); } catch {}
+    if (r.status === 400 && c7Body?.error?.type === "invalid_request_error" &&
+      JSON.stringify(JSON.parse((await admin("/admin/api/keys")).body).keys.map((k) => [k.alias, k.enabled, k.priority])) === JSON.stringify(c7OrderBefore)) {
+      ok("C-7 PUT 非法 " + JSON.stringify(patch) + " → 400 且池不变");
+    } else {
+      bad("C-7 PUT 非法 " + JSON.stringify(patch), JSON.stringify({ status: r.status, body: r.body, now: (JSON.parse((await admin("/admin/api/keys")).body)).keys.map((k) => [k.alias, k.enabled, k.priority]) }));
+    }
+  }
+  const c7DiskBefore = readFileSync(resolve(DATA, "keys.json"), "utf8");
+  await admin("/admin/api/keys/" + idA, "PUT", { enabled: "true" }); // 仍 400
+  readFileSync(resolve(DATA, "keys.json"), "utf8") === c7DiskBefore
+    ? ok("C-7 非法 patch 不落盘（keys.json 字节不变）") : bad("C-7 落盘污染", readFileSync(resolve(DATA, "keys.json"), "utf8").slice(0, 160));
+  r = await admin("/admin/api/keys/" + idA, "PUT", { enabled: false, priority: 0 });
+  let c7Ok = null;
+  try { c7Ok = parseJsonResponse(r, "C-7 legal PUT"); } catch {}
+  r.status === 200 && JSON.parse((await admin("/admin/api/keys")).body).keys.find((k) => k.alias === "keyA").enabled === false
+    ? ok("C-7 合法 PUT enabled:false+priority → 200 并生效") : bad("C-7 合法 PUT", JSON.stringify({ status: r.status, body: r.body }));
+  await admin("/admin/api/keys/" + idA, "PUT", { enabled: true }); // 还原
   r = await admin("/admin/api/logs");
   let lg = JSON.parse(r.body).logs;
   lg.length > 0 && !JSON.stringify(lg).includes("user_keyA") ? ok("logs 有事件且无 Key 明文", lg.length + " 条") : bad("logs", "");

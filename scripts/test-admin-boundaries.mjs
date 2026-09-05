@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -483,6 +483,63 @@ async function testHttpBoundaries() {
     });
     assert.equal(keys.status, 200);
     assert.equal(parseJson(keys, "admin keys response").keys.length, 1);
+
+    // C-7：PUT keys/:id 非法类型 → 400 + 不落盘 + 原状态不变（原行为静默改写：
+    // `!!"false"`→true、`priority:"abc"`→NaN→归 0 移队首并写盘"合法化"）。
+    const diskBefore = readFileSync(join(dataDir, "keys.json"), "utf8");
+    const keysBefore = parseJson(keys, "admin keys response").keys[0];
+    const invalidPatches = [
+      { enabled: "false" },
+      { priority: "1" },
+      { priority: 1.5 },
+      { alias: 123 },
+      { note: ["x"] },
+    ];
+    for (const patch of invalidPatches) {
+      const response = await request({
+        port: managerPort,
+        path: "/admin/api/keys/boundary-key",
+        method: "PUT",
+        headers: { "X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json", Connection: "close" },
+        body: JSON.stringify(patch),
+      });
+      const body = parseJson(response, `C-7 invalid patch ${JSON.stringify(patch)} response`);
+      assert.equal(response.status, 400, `C-7 ${JSON.stringify(patch)} must be 400, got ${response.status}`);
+      assert.equal(body.error?.type, "invalid_request_error");
+      assert.equal(readFileSync(join(dataDir, "keys.json"), "utf8"), diskBefore, `C-7 ${JSON.stringify(patch)} must not reach disk`);
+      const after = parseJson(await request({
+        port: managerPort,
+        path: "/admin/api/keys",
+        headers: { "X-Admin-Token": ADMIN_TOKEN, Connection: "close" },
+      }), "keys after invalid patch").keys[0];
+      assert.equal(JSON.stringify(after), JSON.stringify(keysBefore), `C-7 ${JSON.stringify(patch)} left no mutation`);
+    }
+    console.log(`  PASS C-7 PUT keys invalid types -> 400 (${invalidPatches.length} shapes), disk and state unchanged`);
+
+    const okUpdate = await request({
+      port: managerPort,
+      path: "/admin/api/keys/boundary-key",
+      method: "PUT",
+      headers: { "X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json", Connection: "close" },
+      body: JSON.stringify({ enabled: false, priority: 0, alias: "boundary-updated" }),
+    });
+    assert.equal(okUpdate.status, 200, `C-7 legal PUT must be 200, got ${okUpdate.status}`);
+    const okDisk = parseJson(await request({
+      port: managerPort,
+      path: "/admin/api/keys",
+      headers: { "X-Admin-Token": ADMIN_TOKEN, Connection: "close" },
+    }), "keys after legal PUT").keys[0];
+    assert.equal(okDisk.enabled, false);
+    assert.equal(okDisk.alias, "boundary-updated");
+    // 复位：后续用例依赖 boundary-key 处于启用且 alias=boundary 的基态
+    await request({
+      port: managerPort,
+      path: "/admin/api/keys/boundary-key",
+      method: "PUT",
+      headers: { "X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json", Connection: "close" },
+      body: JSON.stringify({ enabled: true, alias: "boundary" }),
+    });
+    console.log("  PASS C-7 legal PUT enabled/priority/alias -> 200 and persisted");
 
     quotaMock.state.mode = "success";
     quotaMock.state.delayMs = 5;

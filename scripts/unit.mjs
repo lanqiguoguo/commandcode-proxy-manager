@@ -783,6 +783,47 @@ if (SC === "gateway") {
   const ordinary4xx = classify(422, { error: { type: "invalid_request_error", message: "bad request" } });
   check(ordinary4xx.kind === "client", "普通 4xx → client 且不进入 auth", JSON.stringify(ordinary4xx));
 
+  // ── B-11（P2）：CC 403 entitlement 折叠 401 误摘健康 Key —— model_plan 二次甄别放宽 ──
+  // 证据矩阵（evidence/B11.md §3.1，折叠后 code 丢失、message/type 是唯一甄别字段）：
+  // 对照组（修复前已命中，不可回退）+ 漏网组（有 plan/entitlement 语义但缺 model
+  // 宾语/结构偏死）+ 反例护栏组（纯凭证失败必须仍按 auth 保守处理）。
+  // 全部经折叠出口形态喂入：status 401 + type=authentication_error（CC_STATUS_MAP
+  // 403→401 折叠后 manager 可见的形状），message 为 raw 原文。
+  const b11Cases = [
+    // [期望 kind, 名称, 状态, message]
+    // ── 对照组：历史命中（model_plan），放宽后仍须命中 ──
+    ["model_plan", "MODEL_NOT_IN_PLAN 前缀（真实 CC 形态，对照）", 401,
+      "MODEL_NOT_IN_PLAN: Claude Sonnet 5 available in Pro and above plans or extra on demand usage"],
+    ["model_plan", "model+plan 同现句（对照）", 403, "This model is not included in your current plan"],
+    ["model_plan", "The selected model is not available for this subscription", 401,
+      "The selected model is not available for this subscription"],
+    ["model_plan", "MODEL_NOT_IN_PLAN 全码枚举（code 路径）", 401,
+      "model is not included in this plan"], // code: MODEL_NOT_IN_PLAN 单独覆盖见 model401
+    // ── 漏网组（B-11 修复目标）：entitlement/plan 语义明确但此前不命中 → 误摘 → 修复后放行 ──
+    ["model_plan", "ent403_short：plan 语义无 model 宾语", 401, "Your plan does not include this capability"],
+    ["model_plan", "ent403：capability 无 plan/model 词", 401, "This capability is not enabled for your account tier"],
+    ["model_plan", "ent403_nocode：最坏形状无 code", 401, "403 Forbidden: entitlement check failed"],
+    ["model_plan", "plan + allow 无 model 宾语", 401, "Your plan does not allow this capability"],
+    ["model_plan", "tier 语义句", 401, "Your account tier does not include this model"],
+    ["model_plan", "upgrade 需要句", 401, "This capability requires an upgrade of your plan"],
+    ["model_plan", "not entitled 措辞", 401, "Your account is not entitled to use this feature"],
+    // ── 反例护栏组：纯凭证/未知失败 → 必须仍按 auth 保守（不可因放宽放行）──
+    ["auth", "invalid api key（无套餐语义）", 401, "invalid api key"],
+    ["auth", "Invalid API key provided", 401, "Invalid API key provided"],
+    ["auth", "authentication failed", 401, "authentication failed"],
+    ["auth", "401 Unauthorized（纯前缀无套餐语义）", 401, "401 Unauthorized"],
+    ["auth", "空 message 401", 401, ""],
+    ["auth", "裸 Forbidden 403（status 兜底 auth）", 403, "Forbidden"],
+    ["auth", "无 body 403", 403, ""],
+    ["auth", "带 code 的纯凭证 401", 401, "invalid api key for your plan"],
+    ["auth", "authentication error: bad credentials", 401, "authentication error: bad credentials"],
+  ];
+  for (const [expected, name, status, message] of b11Cases) {
+    const body = { error: { type: "authentication_error", message } };
+    const result = classify(status, body);
+    check(result.kind === expected, "B-11 " + name + " → " + expected, JSON.stringify(result));
+  }
+
   // ── B-2 错误出口 type 白名单保留（mapError 纯函数）──
   const m400 = mapError(400, JSON.stringify({ error: { message: "bad request", type: "invalid_request_error" } }));
   check(m400.status === 400 && m400.body.error.type === "invalid_request_error",
@@ -871,7 +912,7 @@ if (SC === "gateway") {
 // ════ keyPool ════
 if (SC === "pool") {
   console.log("=== keyPool 选 Key ===");
-  const { initKeyPool, addKey, updateKey, removeKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, poolUnavailableReason, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess } =
+  const { initKeyPool, addKey, updateKey, removeKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, poolUnavailableReason, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess, listKeys } =
     await import("../src/keyPool.mjs");
   const logEvents = [];
   initKeyPool({ strategy: "active-standby", failoverCooldownMs: 0, backoffBaseMs: 5000, backoffMaxMs: 120000 }, {
@@ -988,6 +1029,52 @@ if (SC === "pool") {
   const deleteLog = logEvents.at(-1);
   check(deleteLog && deleteLog.msg === "删除 Key[备账号]: user_5***XYoV" && deleteLog.keyId === k2.id,
     "删除日志显示别名、掩码和 keyId", JSON.stringify(deleteLog));
+
+  // ── C-7：updateKey 入参类型闸（adminApi PUT keys/:id 唯一入口的输入卫生）──
+  // 非法类型必须在任何变更/持久化前抛错：原行为 `!!"false"`→true、
+  // `priority:"abc"`→NaN→splice 静默归 0 移队首后写盘"合法化"。moveKey 不经
+  // updateKey（直接收 targetIndex）不受影响；合法类型路径行为零变化。
+  const t = (patch) => { try { updateKey(k1.id, patch); return null; } catch (e) { return e; } };
+  const tE = (patch) => { try { updateKey("k_nonexistent", patch); return null; } catch (e) { return e; } };
+  const snap = () => JSON.stringify(listKeys()) + "|" + readFileSync(DATA + "/keys.json", "utf8");
+  const snapshot0 = snap(); // 合法类型测试前的一致基态
+  const invalid = t({ enabled: "false" });
+  check(invalid && invalid.message === "enabled 必须是布尔值", "C-7 字符串布尔 enabled 被拒", String(invalid && invalid.message));
+  check(snap() === snapshot0, "C-7 enabled 非法后内存/磁盘均不变");
+  const priorityStr = t({ priority: "1" });
+  check(priorityStr && priorityStr.message === "priority 必须是非负整数", "C-7 字符串 priority 被拒（不静默归 0）", String(priorityStr && priorityStr.message));
+  check(snap() === snapshot0, "C-7 priority 非法后内存/磁盘均不变");
+  const aliasNum = t({ alias: 123 });
+  check(aliasNum && aliasNum.message === "alias 必须是字符串", "C-7 数字 alias 被拒", String(aliasNum && aliasNum.message));
+  const noteNum = t({ note: 42 });
+  check(noteNum && noteNum.message === "note 必须是字符串", "C-7 数字 note 被拒", String(noteNum && noteNum.message));
+  const priorityFloat = t({ priority: 1.5 });
+  check(priorityFloat && priorityFloat.message === "priority 必须是非负整数", "C-7 浮点 priority 被拒", String(priorityFloat && priorityFloat.message));
+  const priorityNeg = t({ priority: -1 });
+  check(priorityNeg && priorityNeg.message === "priority 必须是非负整数", "C-7 负数 priority 被拒", String(priorityNeg && priorityNeg.message));
+  check(snap() === snapshot0, "C-7 全部非法 patch 后磁盘 keys.json 与内存顺序逐字节不变");
+  const missing = tE({ enabled: false });
+  check(missing && missing.message === "Key 不存在", "C-7 不存在 key 仍先报 Key 不存在", String(missing && missing.message));
+
+  // 合法类型路径行为零变化（对照原实现语义）
+  const enabledBool = t({ enabled: false });
+  check(enabledBool === null, "C-7 合法布尔 enabled 放行", String(enabledBool && enabledBool.message));
+  check(listKeys().find((key) => key.id === k1.id).enabled === false, "C-7 enabled:false 生效落盘");
+  updateKey(k1.id, { enabled: true }); // 还原
+  const priorityInt = t({ priority: 0 });
+  check(priorityInt === null, "C-7 合法整数 priority 放行", String(priorityInt && priorityInt.message));
+  check(listKeys()[0].id === k1.id, "C-7 priority 合法移动仍生效");
+  const longAlias = "x".repeat(100);
+  t({ alias: longAlias });
+  check(listKeys().find((key) => key.id === k1.id).alias.length === 64, "C-7 alias 超长仍文档化截断 64（不拒绝合法长度）");
+  const emptyPatch = t({});
+  check(emptyPatch === null, "C-7 空 patch 放行（幂等）", String(emptyPatch && emptyPatch.message));
+  const unknownPatch = t({ bogus: 1 });
+  check(unknownPatch === null, "C-7 未知字段忽略（与 addKey 同风格）", String(unknownPatch && unknownPatch.message));
+  const snapshotLegal = snap();
+  const lateInvalid = t({ enabled: "false" });
+  check(lateInvalid !== null, "C-7 合法操作后的非法 patch 仍被拒", String(lateInvalid && lateInvalid.message));
+  check(snap() === snapshotLegal, "C-7 非法 patch 不覆盖此前已落盘的合法变更");
 }
 
 // ════ stats ════

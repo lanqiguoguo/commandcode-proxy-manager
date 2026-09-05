@@ -165,14 +165,55 @@ function hasModelPlanMarker(value) {
   return false;
 }
 
+// 纯凭证失败文本（manager 收到上游 401/403 时可能附带）。B-11 放宽只服务于
+// plan/entitlement 语义明确的拒绝——若凭证标记且无任何套餐/授权语义词，直接按
+// auth 处理（反例护栏优先于一切命中）。
+const CREDENTIAL_FAILURE_PATTERN = /(?:invalid|incorrect|wrong|expired|revoked|missing|bad)\s+(?:api[ -]?key|key|token|credential|credentials)|invalid credentials|authentication failed|authentication error|unauthorized|not authorized|forbidden|access denied/i;
+const PLAN_SEMANTIC_WORDS = /\b(?:plan|subscription|entitlement|upgrade|capability|tier)\b|\bnot entitled\b/i;
+
+// 放行宽化的形态（无 model 宾语也命中）：entitlement 语义本身即授权拒绝信号。
+// "not entitled" 措辞自带否定拒绝语义，单独成规；带 entitlement 词的句子需
+// 匹配拒绝/失败动词（同 capability 组风格）。
+const NOT_ENTITLED_PATTERN = /\bnot entitled\b/i;
+const ENTITLEMENT_REJECTION_PATTERN = /\bentitlement\b/i;
+const ENTITLEMENT_REJECTION_WORDS = /\b(?:denied|forbidden|failed|not enabled|not allowed|insufficient|check failed|error|required)\b/i;
+const CAPABILITY_REJECTION_PATTERN = /\bcapability\b/i;
+const CAPABILITY_REJECTION_WORDS = /\b(?:not enabled|not available|not included|not entitled|not allowed|not supported|requires?|upgrade)\b/i;
+const TIER_REJECTION_PATTERN = /\btier\b/i;
+const TIER_REJECTION_NEGATION = /\b(?:does not|doesn't|is not|isn't|cannot|can't|not)\b/i;
+const TIER_REJECTION_WORDS = /\b(?:include|allow|support|entitle|enable|available|cover)\b/i;
+const UPGRADE_REJECTION_PATTERN = /\bupgrade\b/i;
+const UPGRADE_REJECTION_WORDS = /\b(?:required|requires?|needed|your plan|subscription)\b/i;
+
 function isModelPlanMessage(value) {
   if (typeof value !== "string" || !value.trim()) return false;
-  if (!/\b(?:plan|subscription|entitlement|upgrade)\b/i.test(value)) return false;
+  const text = value;
+
+  // 反例护栏（B-11，优先）：凭证失败文本必须保持 auth。真正的凭证错误不带套餐/
+  // 授权语义，而放宽各形态全部要求至少一个 plan/entitlement/capability/tier 语义词，
+  // 因此"凭证标记 + 无套餐语义"在此直接短路。
+  if (CREDENTIAL_FAILURE_PATTERN.test(text) && !PLAN_SEMANTIC_WORDS.test(text)) return false;
+
+  // 语义二元：plan/subscription/entitlement/tier + 否定 + 拒绝/覆盖动词。
+  // B-11 核心放宽：不再要求 model 宾语——"Your plan does not include this
+  // capability"（折叠后 code 丢失、message 是唯一甄别字段）此前因此漏网误摘。
+  if (PLAN_SEMANTIC_WORDS.test(text) &&
+    /\b(?:does not|doesn't|is not|isn't|are not|aren't|cannot|can't|not|no longer)\b/i.test(text) &&
+    /\b(?:include|allow|support|authorize|entitle|enable|available|cover|permit)\b/i.test(text)) return true;
+
+  // capability / account-tier / entitlement / upgrade 无 model 宾语形态。
+  if (NOT_ENTITLED_PATTERN.test(text)) return true;
+  if (ENTITLEMENT_REJECTION_PATTERN.test(text) && ENTITLEMENT_REJECTION_WORDS.test(text)) return true;
+  if (CAPABILITY_REJECTION_PATTERN.test(text) && CAPABILITY_REJECTION_WORDS.test(text)) return true;
+  if (TIER_REJECTION_PATTERN.test(text) && TIER_REJECTION_NEGATION.test(text) && TIER_REJECTION_WORDS.test(text)) return true;
+  if (UPGRADE_REJECTION_PATTERN.test(text) && UPGRADE_REJECTION_WORDS.test(text)) return true;
+
+  // 既有结构形态兜底（历史命中不可回退）。
   return [
     /\bmodel\b[\s\S]{0,100}\b(?:not included|not available|not supported|not allowed|requires?)\b[\s\S]{0,100}\b(?:plan|subscription|entitlement|upgrade)\b/i,
     /\bmodel\b[\s\S]{0,80}\b(?:access|permission)\b[\s\S]{0,80}\b(?:denied|forbidden|not allowed|not authorized)\b[\s\S]{0,80}\b(?:plan|subscription|entitlement|upgrade)\b/i,
     /\b(?:plan|subscription|entitlement)\b[\s\S]{0,100}\b(?:does not|doesn't|cannot|can't|not)\b[\s\S]{0,100}\b(?:include|allow|support|authorize)\b[\s\S]{0,40}\bmodel\b/i,
-  ].some((pattern) => pattern.test(value));
+  ].some((pattern) => pattern.test(text));
 }
 
 function redactUpstreamMessage(value) {

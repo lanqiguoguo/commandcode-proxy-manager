@@ -203,7 +203,14 @@ manager 配置表中的功能开关。
 ### 7.1 Key 池
 
 - 默认策略为 `active-standby`：最高优先级的可用 Key 为主 Key，其余为备用。
-- 401/403 标记认证异常，不通过自动切换掩盖凭证问题。
+- 401/403 的甄别语义：上游的模型/套餐（`model_plan`/entitlement）类拒绝——包括 CC
+  `403→401` 折叠后 `code` 丢失、只剩 `message` 的形态（B-11）——先经
+  `classifyUpstreamError` 对 `[code, type, message]` 做文本二次甄别放行，不标认证异常；
+  纯凭证失败（如 `invalid api key`、无任何 plan/entitlement 语义的 401/403）才标记
+  `authError` 停用，不通过自动切换掩盖凭证问题（恢复需人工 `clear-auth` 或等待退避到期）。
+- 402 欠费被上游（`CC_STATUS_MAP`）折成 429 `rate_limit_error` 后按 429 处理：带
+  `retry_after` 且短于同 Key 重试阈值时先同 Key 重试，否则退避并切换 Key（零输出见
+  B-4 语义，不再同 Key 重试）。
 - 流式内容开始后只透传当前尝试，不能为了换 Key 重放已经发送的内容。
 - 管理界面可以配置 `round-robin` 和 `least-usage`，以及重试、退避、额度阈值和历史保留。
 
@@ -267,6 +274,7 @@ manager 配置表中的功能开关。
 | `LOG_FILE` | 空 | raw upstream 可选的文件日志路径 |
 | `CC_USE_PROVIDER_MODELS` | `true` | raw upstream provider model 列表开关，字符串 `false` 时关闭 |
 | `CC_MAX_BODY_MB` | `100` | raw upstream 请求体上限，正整数 MB |
+| `CMD_ZDR` | `1` 时开启 | raw upstream 的零数据保留（zdr）开关；**托管模式不注入**——manager 只把上方 allowlist 传给 raw child，`CMD_ZDR` 不在其中（需外置模式自启上游时设置） |
 
 raw child 的 `HOST`、`PORT` 不是用户可任意注入的值，而是 manager 为本地进程设置的
 `127.0.0.1` 和 `UPSTREAM_PORT`。`CC_QUOTA_BASE` 只控制 manager 额度探测。
@@ -295,6 +303,11 @@ raw child 的 `HOST`、`PORT` 不是用户可任意注入的值，而是 manager
 
 `SECURE_COOKIES=1` 或 `true` 只应在 HTTPS 反向代理后使用。默认明文 HTTP 部署不设置
 `Secure`，否则浏览器不会回传 SSE cookie。
+
+SSE 会话凭据是 AdminToken 的固定 SHA-256 摘要（`ccpm_sse` HttpOnly cookie，无 nonce、
+无会话表）；修改 AdminToken（`/admin/api/security` 或 env+重启）会同时吊销所有管理
+会话（含 SSE）——不存在单独吊销某个 SSE 会话的机制（C-4，文档化语义，保持现状）。
+轮换 AdminToken 即整体吊销，是当前设计的唯一会话撤销手段。
 
 ## 10. 容器和部署
 

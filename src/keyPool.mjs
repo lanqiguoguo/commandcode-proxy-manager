@@ -168,19 +168,51 @@ export function addKey({ alias = "", key = "", note = "" }) {
   return rec;
 }
 
+// C-7：updateKey 只经 adminApi PUT /admin/api/keys/:id 可达（前端只发合法类型，
+// curl 直打可绕过）——对 patch 字段做严格类型闸，非法类型 400 拒绝而非静默改写
+// （历史问题：`!!"false"`→true、`priority:"abc"`→NaN 静默归 0 移队首后写盘）。
+// moveKey 不经此函数（直接收 targetIndex），不受影响。
+function assertStringField(patch, name, maxLength) {
+  if (patch[name] !== undefined && typeof patch[name] !== "string") {
+    throw new Error(name + " 必须是字符串");
+  }
+  if (typeof patch[name] === "string") {
+    // 只做文档化截断，不做 trim：后端永不隐式改写用户已确认的输入
+    patch[name] = patch[name].slice(0, maxLength);
+  }
+}
+
+function assertBooleanField(patch, name) {
+  if (patch[name] !== undefined && typeof patch[name] !== "boolean") {
+    throw new Error(name + " 必须是布尔值");
+  }
+}
+
+function assertIntegerField(patch, name) {
+  if (patch[name] !== undefined &&
+    (!Number.isInteger(patch[name]) || patch[name] < 0 || patch[name] > 1e9)) {
+    throw new Error(name + " 必须是非负整数");
+  }
+}
+
 export function updateKey(id, patch) {
   const rec = keys.find((k) => k.id === id);
   if (!rec) throw new Error("Key 不存在");
+  // C-7：入参类型闸先于一切变更与持久化——非法类型不落盘、不改内存
+  assertStringField(patch, "alias", 64);
+  assertStringField(patch, "note", 256);
+  assertBooleanField(patch, "enabled");
+  assertIntegerField(patch, "priority");
   const before = snapshotKeys();
   let movedRecord = null;
   let movedTargetIndex = null;
   try {
-    if (patch.alias !== undefined) rec.alias = String(patch.alias).slice(0, 64);
-    if (patch.note !== undefined) rec.note = String(patch.note).slice(0, 256);
-    if (patch.enabled !== undefined) rec.enabled = !!patch.enabled;
+    if (patch.alias !== undefined) rec.alias = patch.alias;
+    if (patch.note !== undefined) rec.note = patch.note;
+    if (patch.enabled !== undefined) rec.enabled = patch.enabled;
     if (patch.priority !== undefined) {
       const i = keys.findIndex((k) => k.id === id);
-      const targetIndex = Math.max(0, Math.min(keys.length - 1, Number(patch.priority)));
+      const targetIndex = Math.max(0, Math.min(keys.length - 1, patch.priority));
       [movedRecord] = keys.splice(i, 1);
       keys.splice(targetIndex, 0, movedRecord);
       keys.forEach((k, idx) => { k.priority = idx; });

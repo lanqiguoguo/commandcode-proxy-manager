@@ -146,13 +146,22 @@ docker logs -f cc-proxy-manager
 | `LOG_FILE` | 空 | raw upstream 可选的追加日志文件；为空时只写 stdout/stderr |
 | `CC_USE_PROVIDER_MODELS` | `true` | raw upstream 读取；值为 `false` 时关闭 provider model 列表路径 |
 | `CC_MAX_BODY_MB` | `100` | raw upstream 请求体大小上限，正整数，单位 MB |
+| `CMD_ZDR` | `1` 时开启 | raw upstream 的零数据保留（zdr）开关。**托管模式不注入**：manager 只把上方 allowlist 传给托管 child，`CMD_ZDR` 不在其中；如需开启请在外置自启上游的进程环境里设置 |
 
 托管子进程的 `HOST` 和 `PORT` 由 manager supervisor 强制设置，不使用外部值覆盖
 `127.0.0.1` 和 `UPSTREAM_PORT`。`CC_QUOTA_BASE` 是 manager 的额度探测变量，不是 raw
 upstream 的 API 基址。
 
-池策略、重试、退避和历史保留天数在管理界面的设置页修改，并持久化到
-`config.json`；它们不是独立的环境变量。
+> **外置模式警示**：raw upstream（vendored `upstream/proxy.mjs` + `config.json`）默认
+> `host: "0.0.0.0"`。`EMBED_UPSTREAM=0` 裸启 `node proxy.mjs` 会把它暴露在
+> `0.0.0.0:<端口>`（默认 3050）——请把外置上游限制在 loopback 或防火墙内
+> （`HOST=127.0.0.1 node proxy.mjs`），不要把 `3050` 发布到宿主机。
+
+- 上游 429/402/超时退避与切换：零输出与无 `retry_after` 的 429 直接退避换 Key（同 Key
+  不重试）；402 欠费被上游折成 429（`CC_STATUS_MAP` 402→429 `rate_limit_error`），
+  `retry_after` 短于同 Key 重试阈值时先同 Key 重试，否则退避换 Key。
+- 池策略、重试、退避和历史保留天数在管理界面的设置页修改，并持久化到
+  `config.json`；它们不是独立的环境变量。
 
 ## 客户端和管理界面
 
@@ -189,7 +198,15 @@ Anthropic SDK 的 `base_url` 指向 `http://127.0.0.1:3080`，`x-api-key` 使用
 在启动或保存时被拒绝），空串仅 `clientToken` 合法，表示未配置、`/v1/*` 回退
 `adminToken`。`PUT /admin/api/pool` 的数值越界按范围 clamp 保存（响应 `200`，
 `body.poolCfg` 为生效值），而 `/admin/api/security` 的令牌越短/超长则 `400` 拒绝
-（字段级错误）。
+（字段级错误）。`PUT /admin/api/keys/:id` 的 `alias`/`note` 必须为字符串、
+`enabled` 必须为布尔、`priority` 必须为非负整数——非法类型一律 `400` 拒绝且不落盘
+（C-7 输入卫生；`priority` 整数即目标下标，经 `moveKey` 的 UI 拖动同语义）。
+
+上游 401/403 的 Key 健康甄别：模型/套餐（entitlement）类拒绝经文本二次甄别
+（`classifyUpstreamError`，含 CC `403→401` 折叠后 `code` 丢失、只剩 `message` 的形态）
+不误摘 Key、不标 `authError`；纯凭证失败（如 `invalid api key` 及无任何
+plan/entitlement 语义的 401/403）仍标 `authError` 停用，需人工 `clear-auth` 恢复
+（B-11）。
 
 ## 启动、关闭和日志
 
@@ -321,3 +338,6 @@ fi
 - 客户端令牌不会转发给 raw upstream；raw upstream 只接收 manager 选出的池内 Key。
 - `/v1/*` 和管理 API 使用分离的鉴权入口；额度探测失败会标记 stale，不阻塞推理请求。
 - 如果 manager 放在 HTTPS 反向代理后，设置 `SECURE_COOKIES=1`，使管理 SSE cookie 只在加密连接中传输。
+- SSE 会话凭据是 AdminToken 的固定 SHA-256 摘要（无 nonce、无会话表）；修改 AdminToken
+  （`/admin/api/security` 或 env+重启）会同时吊销所有管理会话（含 SSE）——不存在单独
+  吊销某个 SSE 会话的机制，轮换 AdminToken 即整体吊销（C-4）。

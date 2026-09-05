@@ -320,10 +320,20 @@ export function recordSuccess(id, attempt) {
   if (!attempt || attempt.id !== id || !Number.isInteger(attempt.version) || attempt.version !== current) {
     return { applied: false, reason: "health_changed", version: current };
   }
-  const changed = h.failCount !== 0 || h.backoffUntilMs !== 0 || h.lastErrorKind !== "";
+  // T6：免费模型（:free/-free 后缀）在额度受限的 Key 上仍可成功——该 Key 的
+  // quotaLimited 状态独立于本次请求成功，不得被 recordSuccess 无条件清空，
+  // 否则前端"额度受限"徽标（按 quotaLimitedUntil）与 lastErrorKind 会错误消失。
+  // 非受限 Key 行为不变（lastErrorKind 照旧清空）。
+  const stillQuotaLimited = quotaLimited(id);
+  const changed = h.failCount !== 0 || h.backoffUntilMs !== 0 ||
+    (stillQuotaLimited ? h.lastErrorKind !== "quota" : h.lastErrorKind !== "");
   h.failCount = 0;
   h.backoffUntilMs = 0;
-  h.lastErrorKind = "";
+  if (stillQuotaLimited) {
+    if (h.lastErrorKind !== "quota") h.lastErrorKind = "quota";
+  } else {
+    h.lastErrorKind = "";
+  }
   if (changed) {
     bumpHealthVersion(id);
     persistState();
@@ -430,24 +440,27 @@ function quotaLimited(id) {
 // 排除逻辑同源（selectKey 据此过滤候选）；不含 cooldown/softLimited 优先级排序。
 // 在睡眠期间 Key 可能已被并发请求标退避 / 额度探测标 quotaLimited / 401 标 authError，
 // 醒来复检发现不可用即不再对它重试，避免向本应排除的 Key 多发一次请求（L-a）。
-export function isKeyUsable(id) {
+// options.allowQuotaLimited（T6）：免费模型请求（model 以 :free/-free 结尾）放宽
+// "额度受限"排除——CC 真实行为中 weekly 100% 的 Key 仍可服务免费模型（实测 200），
+// 额度门只对付费模型生效。其余排除（enabled/退避/authError）任何情况下不变。
+export function isKeyUsable(id, options = {}) {
   const rec = keys.find((k) => k.id === id);
   if (!rec) return false;
   if (!rec.enabled) return false;
   if (inBackoff(id)) return false;
-  if (quotaLimited(id)) return false;
+  if (quotaLimited(id) && !options.allowQuotaLimited) return false;
   const h = health.get(id);
   if (h && h.authError) return false;
   return true;
 }
 
-export function selectKey(excludeIds = null) {
+export function selectKey(excludeIds = null, options = {}) {
   const cooldownMs = poolCfg.failoverCooldownMs ?? 600000;
   const now = nowMs();
   const avail = keys.filter((k) => {
     // failoverCooldown：刚发生过切换的 key 在冷却期内降低优先级（仅 active-standby 场景有效）
     // 实现为：冷却期内该 key 仍可用，但当存在非冷却可用 key 时会被排后
-    return isKeyUsable(k.id) && !(excludeIds && excludeIds.has(k.id));
+    return isKeyUsable(k.id, options) && !(excludeIds && excludeIds.has(k.id));
   });
   if (!avail.length) return null;
   let chosen = null;
@@ -482,7 +495,7 @@ export function selectKey(excludeIds = null) {
   return { id: chosen.id, key: chosen.key, alias: chosen.alias };
 }
 
-export function nextRetryAfterMs() {
+export function nextRetryAfterMs(options = {}) {
   let min = null;
   const now = nowMs();
   for (const k of keys) {
@@ -491,7 +504,9 @@ export function nextRetryAfterMs() {
       // authError 代表需要人工修复，backoffUntilMs 的一小时标记不是客户端应等待的限流窗口。
       // 该 Key 当前无论如何都不可用，因此其 quota/backoff 也不应伪装成可恢复时间。
       if (h && !h.authError) {
-        const until = Math.max(h.backoffUntilMs, h.quotaLimitedUntil);
+        // T6 free 视角：额度受限不算"等待"（free 请求本可立即使用该 Key），
+        // 只把真实 429/超时退避算作可恢复等待；付费视角（默认）行为不变。
+        const until = options.allowQuotaLimited ? h.backoffUntilMs : Math.max(h.backoffUntilMs, h.quotaLimitedUntil);
         if (until > now) min = min === null ? until : Math.min(min, until);
       }
     }
@@ -506,7 +521,9 @@ export function nextRetryAfterMs() {
 // 恢复等待）；backoff=至少一个 Key 处于退避/额度受限（真实自动恢复等待）。
 // waitMs：仅 backoff 种类携带真实等待（≥0，0=全部立即恢复）；其余种类无自动恢复路径，
 // 返回 -1 让出口省略 retry_after/Retry-After，避免 0 语义误导。
-export function poolUnavailableReason() {
+// options.allowQuotaLimited（T6）：免费模型请求视角下"额度受限"不是不可用——
+// 受限 Key 仍在池中可被选中，故等待分类只考虑真实退避（见 nextRetryAfterMs）。
+export function poolUnavailableReason(options = {}) {
   if (!keys.length) return { kind: "empty", waitMs: -1 };
   const now = nowMs();
   let authCount = 0;
@@ -523,14 +540,14 @@ export function poolUnavailableReason() {
       continue;
     }
     if (h) {
-      const until = Math.max(h.backoffUntilMs, h.quotaLimitedUntil);
+      const until = options.allowQuotaLimited ? h.backoffUntilMs : Math.max(h.backoffUntilMs, h.quotaLimitedUntil);
       if (until > now) hasWaiting = true;
     }
   }
   if (authCount + disabledCount === keys.length) {
     return { kind: disabledCount > 0 && authCount === 0 ? "disabled" : "auth", waitMs: -1 };
   }
-  return { kind: "backoff", waitMs: hasWaiting ? nextRetryAfterMs() : 0 };
+  return { kind: "backoff", waitMs: hasWaiting ? nextRetryAfterMs(options) : 0 };
 }
 
 export function getPoolStats() {

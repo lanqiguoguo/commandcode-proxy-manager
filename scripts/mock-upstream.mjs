@@ -30,6 +30,11 @@ let quotaLatency = Number.isFinite(quotaLatencyEnv) && quotaLatencyEnv >= 0 ? qu
 // B-5：探测端点"永不返回"开关（响应在客户端 abort 后才落盘）——刷新超时复现用，
 // 只对 quota 端点生效，不影响 chat 路径（不依赖 __reset，重启即复位）
 const quotaHang = String(process.env.MOCK_QUOTA_HANG || "") === "1";
+// T6：按 auth 的额度覆盖（auth → { weeklyUsed, weeklyCap, fiveHourUsed, fiveHourCap, resetInMs }）。
+// 造"额度 100% 硬停"态用：POST /__control {auth, quota:{...}} 设置后，该 Key 的
+// billing/credits 响应使用 override（weekly cap=used 即触发 manager weeklyHardStop），
+// 无 override 时回退下方写死的默认值。与 __reset 一并清空。
+const quotaOverrides = new Map();
 let initActive = 0;
 let initMaxActive = 0;
 
@@ -86,6 +91,20 @@ const server = http.createServer((req, res) => {
           lifecycle: Array.isArray(j.init.lifecycle) ? [...j.init.lifecycle] : [],
         });
       }
+      // T6：quota 覆盖（auth → 各窗口 used/cap/resetInMs），见模块级注释。
+      // 仅当请求带 quota 对象时设置；quota:null 显式清除单个 auth 的覆盖；
+      // 不带 quota 字段（纯 responses 脚本调用）不影响既有覆盖。
+      if (j.quota && typeof j.quota === "object" && !Array.isArray(j.quota)) {
+        quotaOverrides.set(j.auth, {
+          weeklyUsed: Number.isFinite(j.quota.weeklyUsed) ? j.quota.weeklyUsed : undefined,
+          weeklyCap: Number.isFinite(j.quota.weeklyCap) ? j.quota.weeklyCap : undefined,
+          fiveHourUsed: Number.isFinite(j.quota.fiveHourUsed) ? j.quota.fiveHourUsed : undefined,
+          fiveHourCap: Number.isFinite(j.quota.fiveHourCap) ? j.quota.fiveHourCap : undefined,
+          resetInMs: Number.isFinite(j.quota.resetInMs) ? j.quota.resetInMs : 3600e3,
+        });
+      } else if (j.quota === null) {
+        quotaOverrides.delete(j.auth);
+      }
       json(res, 200, { ok: true }); return;
     }
     if (p === "/__calls") { json(res, 200, { calls }); return; }
@@ -95,6 +114,7 @@ const server = http.createServer((req, res) => {
     if (p === "/__reset") {
       scripts.clear();
       initScripts.clear();
+      quotaOverrides.clear();
       calls.length = 0;
       initCalls.length = 0;
       slowLog.length = 0;
@@ -132,13 +152,35 @@ const server = http.createServer((req, res) => {
       await sleep(quotaLatency); // 轻微延迟，让并发/串行可测
       e.end = performance.now(); e.active = --quotaActive;
       if (p === "/alpha/whoami") return json(res, 200, { success: true, data: { org: { id: "o_test" } } });
-      if (p === "/alpha/billing/credits") return json(res, 200, {
-        credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 },
-        windowLimits: {
-          fiveHour: { cap: 14, used: 1, resetAt: Date.now() + 3600e3 },
-          weekly: { cap: 35, used: 5, resetAt: Date.now() + 2 * 864e5 }
+      if (p === "/alpha/billing/credits") {
+        // T6：per-auth 覆盖（无则回退写死默认）。weekly cap=used → percent=100 触发
+        // manager 的 weeklyHardStop，即真实 CC "weekly 额度 100% 硬停"形态。
+        const o = quotaOverrides.get(auth);
+        if (o) {
+          return json(res, 200, {
+            credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 },
+            windowLimits: {
+              fiveHour: {
+                cap: o.fiveHourCap ?? 14,
+                used: o.fiveHourUsed ?? 1,
+                resetAt: Date.now() + (o.fiveHourCap !== undefined ? o.resetInMs : 3600e3)
+              },
+              weekly: {
+                cap: o.weeklyCap ?? 35,
+                used: o.weeklyUsed ?? 5,
+                resetAt: Date.now() + (o.weeklyCap !== undefined ? o.resetInMs : 2 * 864e5)
+              }
+            }
+          });
         }
-      });
+        return json(res, 200, {
+          credits: { monthlyCredits: 10, purchasedCredits: 0, freeCredits: 0 },
+          windowLimits: {
+            fiveHour: { cap: 14, used: 1, resetAt: Date.now() + 3600e3 },
+            weekly: { cap: 35, used: 5, resetAt: Date.now() + 2 * 864e5 }
+          }
+        });
+      }
       if (p === "/alpha/billing/subscriptions") return json(res, 200, { success: true, data: { currentPeriodStart: "2026-08-25T23:33:28.000Z", currentPeriodEnd: "2026-09-25T23:33:28.000Z", planId: "individual-goat" } });
       return json(res, 200, { totalCount: 42, completedCount: 42, failedCount: 0, successRate: 100, totalTokensIn: 1000, totalTokensOut: 234, totalTokens: 1234, totalCost: 5.5 });
     }

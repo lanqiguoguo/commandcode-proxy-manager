@@ -679,6 +679,7 @@ export async function handleGateway(req, res, url) {
   let body = Buffer.alloc(0);
   let model = "";
   let stream = false;
+  let isFreeModel = false;
   if (req.method === "POST") {
     try {
       body = await readBody(req, 100 * 1024 * 1024);
@@ -693,6 +694,12 @@ export async function handleGateway(req, res, url) {
       stream = j.stream === true;
     } catch {}
   }
+  // T6：免费模型（CC 真实命名 :free / -free 后缀，大小写不敏感）不受额度受限排除
+  // 影响——额度 100%（weekly/quotaLimited）的 Key 仍可服务免费模型（真实 CC 实测：
+  // weekly 100% 下 LongCat-2.0:free 返回 200，免费模型不消耗付费额度）。
+  // 仅放宽 selectKey/isKeyUsable/池等待出口中的"额度受限"排除；free 429 完全按普通
+  // 429 处理（recordRateLimit/recordFailover/退避/切换/冷却语义均不变，不加特例分支）。
+  if (model) isFreeModel = /:free$|-free$/i.test(model);
 
   // 客户端断开检测绑在 res 上：req 可读流被 readBody 消费完后即 destroy，其 'close'
   // 事件往往在后文注册监听之前就已发射（监听永不触发）；res 随连接结束才关闭，事件可靠。
@@ -769,7 +776,7 @@ export async function handleGateway(req, res, url) {
   // 预算只约束"重试/退避/换 Key"，单次尝试的 connectTimeoutMs（默认 120s）不受 30s 约束：
   // 头等待超时按设计从预算中豁免（见下方 perAttemptMs 注释），防止合法慢生成被误杀（T11）。
   while (attempts < maxAttempts && Date.now() < deadlineAt) {
-    const chosen = pool.selectKey(triedKeys);
+    const chosen = pool.selectKey(triedKeys, isFreeModel ? { allowQuotaLimited: true } : undefined);
     if (!chosen) {
       if (clientGone || res.writableEnded || res.destroyed) {
         if (clientGone) recordClientAbort({ keyId: lastKeyId });
@@ -782,7 +789,7 @@ export async function handleGateway(req, res, url) {
         // retry_after/Retry-After（sendJson 仅在 body 携带 retry_after 时才补头），
         // 客户端按普通 429 处理且不会被 0 诱导立即重试。真退避/限额混合保持
         // 原文案并返回真实等待（全部立即恢复时为 0，语义不变）。
-        const reason = pool.poolUnavailableReason();
+        const reason = pool.poolUnavailableReason(isFreeModel ? { allowQuotaLimited: true } : undefined);
         const noRetry = reason && (reason.kind === "empty" || reason.kind === "disabled" || reason.kind === "auth");
         let body = null;
         if (noRetry) {
@@ -793,7 +800,7 @@ export async function handleGateway(req, res, url) {
               : "All API keys require manual auth recovery (clear auth via admin UI)";
           body = { error: { message, type: "rate_limit_error" } };
         } else {
-          const wait = reason && reason.kind === "backoff" ? reason.waitMs : pool.nextRetryAfterMs();
+          const wait = reason && reason.kind === "backoff" ? reason.waitMs : pool.nextRetryAfterMs(isFreeModel ? { allowQuotaLimited: true } : undefined);
           body = {
             error: { message: "No usable API key in pool (all backed off / quota limited)", type: "rate_limit_error" },
             retry_after: retryAfterSeconds(wait)
@@ -1078,7 +1085,8 @@ export async function handleGateway(req, res, url) {
           // 外层 selectKey 会排除它：triedKeys 已含 chosen，且退避/限额已使其不可选）。
           // 该 Key 的状态是并发方标的，此处只做"取消"，不重复 recordRateLimit /
           // recordFailover / 统计事件（避免重复计数）；池中无其他 Key 时最终收尾 429。
-          if (!pool.isKeyUsable(chosen.id)) break;
+          // T6：free 请求复检同候选集放宽（仅额度受限不算不可用）。
+          if (!pool.isKeyUsable(chosen.id, isFreeModel ? { allowQuotaLimited: true } : undefined)) break;
           continue;
         }
         pool.recordRateLimit(chosen.id, retryAfterMs);
@@ -1138,7 +1146,7 @@ export async function handleGateway(req, res, url) {
     if (clientGone) recordClientAbort({ keyId: lastKeyId });
     return;
   }
-  const wait = retryAfterSeconds(pool.nextRetryAfterMs());
+  const wait = retryAfterSeconds(pool.nextRetryAfterMs(isFreeModel ? { allowQuotaLimited: true } : undefined));
   // 最终状态码如实反映失败类型：上游 5xx/网络错误 → 502（客户端 SDK 不应按限流退避），
   // 限流/池不可用 → 429（P2-2）
   const finalStatus = lastStatus >= 500 ? 502 : 429;

@@ -912,7 +912,7 @@ if (SC === "gateway") {
 // ════ keyPool ════
 if (SC === "pool") {
   console.log("=== keyPool 选 Key ===");
-  const { initKeyPool, addKey, updateKey, removeKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, poolUnavailableReason, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess, listKeys } =
+  const { initKeyPool, addKey, updateKey, removeKey, selectKey, isKeyUsable, setQuotaLimited, clearQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, poolUnavailableReason, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess, listKeys } =
     await import("../src/keyPool.mjs");
   const logEvents = [];
   initKeyPool({ strategy: "active-standby", failoverCooldownMs: 0, backoffBaseMs: 5000, backoffMaxMs: 120000 }, {
@@ -1009,6 +1009,56 @@ if (SC === "pool") {
   // 软限制降级（P3-1）
   recordSuccess(k1.id, beginAttempt(k1.id));
   check(selectKey().id === k1.id, "恢复后选主");
+
+  // ── T6：额度受限 Key 对免费模型请求放宽（付费视图零变化）──
+  // 状态：k1 主 / k2 备，均健康。语义：仅"额度受限"排除可被 allowQuotaLimited
+  // 放宽（对应 model 以 :free/-free 结尾）；enabled/退避/authError 任何视图均排除。
+  setQuotaLimited(k1.id, Date.now() + 60000, "weekly");
+  setQuotaLimited(k2.id, Date.now() + 60000, "weekly");
+  check(isKeyUsable(k1.id) === false && isKeyUsable(k1.id, {}) === false,
+    "受限 Key 默认不可用（isKeyUsable 无第二参/空 options 零变化）");
+  check(isKeyUsable(k1.id, { allowQuotaLimited: true }) === true, "free 视角受限 Key 可用");
+  check(selectKey() === null, "双受限 → 付费 selectKey null（零变化）");
+  const paidWaitT6 = nextRetryAfterMs();
+  check(paidWaitT6 > 55000 && paidWaitT6 <= 60000, "付费 nextRetryAfterMs 仍把额度窗口当等待", String(paidWaitT6));
+  const urPaidT6 = poolUnavailableReason();
+  check(urPaidT6.kind === "backoff" && urPaidT6.waitMs > 55000 && urPaidT6.waitMs <= 60000,
+    "双受限付费出口 kind=backoff 携带额度等待", JSON.stringify(urPaidT6));
+  const freeSel = selectKey(null, { allowQuotaLimited: true });
+  check(freeSel && freeSel.id === k1.id, "双受限 free selectKey → 主 Key（active-standby 顺序保留）", JSON.stringify(freeSel));
+  const urFreeT6 = poolUnavailableReason({ allowQuotaLimited: true });
+  check(urFreeT6.kind === "backoff" && urFreeT6.waitMs === 0,
+    "双受限 free 出口：受限不算等待 → kind=backoff waitMs=0", JSON.stringify(urFreeT6));
+  check(nextRetryAfterMs({ allowQuotaLimited: true }) === 0, "双受限无退避 free Retry-After=0", String(nextRetryAfterMs({ allowQuotaLimited: true })));
+  // 受限期间成功（free 200）不得清空 quota 徽标状态；failCount/backoff 照常清空
+  const succT6 = recordSuccess(k1.id, beginAttempt(k1.id));
+  const hT6 = getHealth(k1.id);
+  check(succT6.applied === true && hT6.lastErrorKind === "quota" && hT6.failCount === 0 && hT6.backoffUntilMs === 0,
+    "受限 Key free 成功后 lastErrorKind 保留 quota（failCount/backoff 照常清空）", JSON.stringify(hT6));
+  // free 放宽仅限额度受限：退避/禁用/authError 仍排除
+  recordRateLimit(k2.id, 30000);
+  check(isKeyUsable(k2.id, { allowQuotaLimited: true }) === false, "free 视角退避 Key 仍不可用");
+  clearBackoff(k2.id);
+  updateKey(k2.id, { enabled: false });
+  check(isKeyUsable(k2.id, { allowQuotaLimited: true }) === false, "free 视角禁用 Key 仍不可用");
+  updateKey(k2.id, { enabled: true });
+  markAuthError(k2.id);
+  check(isKeyUsable(k2.id, { allowQuotaLimited: true }) === false, "free 视角 authError Key 仍不可用");
+  clearAuthError(k2.id);
+  // round-robin：双受限 free 请求按轮换各得一次
+  setPoolCfg({ strategy: "round-robin", failoverCooldownMs: 0 });
+  check(selectKey() === null, "round-robin 双受限付费 selectKey null");
+  const rrFree1 = selectKey(null, { allowQuotaLimited: true });
+  const rrFree2 = selectKey(null, { allowQuotaLimited: true });
+  check(rrFree1 && rrFree2 && rrFree1.id !== rrFree2.id,
+    "round-robin 双受限 free 轮换（两个不同 Key）", (rrFree1 ? rrFree1.id : "null") + "→" + (rrFree2 ? rrFree2.id : "null"));
+  // 复位：清额度受限、恢复 active-standby，供既有断言（软限制/排除/冷却）干净进入
+  clearQuotaLimited(k1.id);
+  clearQuotaLimited(k2.id);
+  setPoolCfg({ strategy: "active-standby", failoverCooldownMs: 0 });
+  recordSuccess(k1.id, beginAttempt(k1.id));
+  check(getHealth(k1.id).lastErrorKind === "", "非受限 Key 成功后 lastErrorKind 照常清空（T6 对照组）");
+
   setSoftLimited(k1.id, true);
   check(selectKey().id === k2.id, "主 Key 软限制 → 降级选备（P3-1）");
   setSoftLimited(k2.id, true);

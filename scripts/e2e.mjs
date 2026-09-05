@@ -1965,6 +1965,160 @@ async function main() {
   r = await gw({ model: "m-b2-recover", messages: [] });
   r.status === 200 ? ok("B-2 矩阵后 Key 恢复可用（clear-auth 生效）") : bad("B-2 recover", "status=" + r.status);
 
+  // ── T-free：额度受限（quotaLimited）Key 对免费模型（:free/-free 后缀）仍可用 ──
+  // 修复前：quota 门把受限 Key 整把排除 → free 请求也被 429 误杀。修复后：free 候选集
+  // 放宽"额度受限"排除（enabled/退避/authError 不变），free 429 仍按普通 429 处理。
+  // 受限态造法：mock quota 覆盖置 weekly 100%（cap=used）+ refresh-quota → health 受限；
+  // /__reset 清空覆盖后再 refresh 即解除受限。整块用独立块作用域 + 专用 Key，
+  // 结尾删除专用 Key、重建 keyA 并 restartClean，不影响后续用例。
+  console.log("\n=== T-free quota-limited keys still serve free models (T6) ===");
+  {
+    await mock("/__reset");
+    const tfaAuth = "user_tfa_free_key", tfbAuth = "user_tfb_free_key";
+    for (const rec of await keysList()) await admin("/admin/api/keys/" + rec.id, "DELETE"); // 移除 keyA
+    const tfaAdd = await addKey("tfA", tfaAuth);
+    const tfbAdd = await addKey("tfB", tfbAuth);
+    const tfaId = tfaAdd.data.id, tfbId = tfbAdd.data.id;
+    const poolPut = (patch) => admin("/admin/api/pool", "PUT", patch);
+    const healthOf = async (id) => (await keysList()).find((rec) => rec.id === id).health;
+    const mockCalls = async () => JSON.parse((await mockGet("/__calls")).body).calls;
+    // 置 weekly 100% 硬停（cap=used=35，reset 1h 后）并刷新额度 → quotaLimitedUntil>now
+    const limitKey = async (id, auth) => {
+      await mock("/__control", { auth, quota: { weeklyUsed: 35, weeklyCap: 35, resetInMs: 3600e3 } });
+      await admin("/admin/api/keys/" + id + "/refresh-quota", "POST");
+    };
+    // 清响应脚本 + quota 覆盖；clear-backoff；默认额度（5/35）刷新解除受限
+    const clearLimits = async () => {
+      await mock("/__reset");
+      for (const rec of await keysList()) {
+        await admin("/admin/api/keys/" + rec.id + "/clear-backoff", "POST");
+        await admin("/admin/api/keys/" + rec.id + "/refresh-quota", "POST");
+      }
+    };
+
+    // ── T-free-1：active-standby 双受限 + free → 200（修复前 429 误杀）；付费对照 429 ──
+    await poolPut({ strategy: "active-standby", maxRetries: 3, failoverCooldownMs: 0 });
+    await limitKey(tfaId, tfaAuth);
+    await limitKey(tfbId, tfbAuth);
+    let fh1 = await healthOf(tfaId), fh1b = await healthOf(tfbId);
+    let fr1 = await gw({ model: "t-free-paid-probe", messages: [] }); // 付费：受限 Key 不可见
+    let fc1 = await mockCalls();
+    fh1.quotaLimitedUntil > Date.now() && fh1b.quotaLimitedUntil > Date.now() && fr1.status === 429 && fc1.length === 0
+      ? ok("T-free-1 预置：两 Key 额度受限（health.quotaLimitedUntil>now）且付费请求 429（零上游调用）")
+      : bad("T-free-1 预置", JSON.stringify({ a: fh1, b: fh1b, status: fr1.status, body: fr1.body.slice(0, 120) }));
+    fr1 = await gw({ model: "t-free-1:free", messages: [] });
+    fc1 = await mockCalls();
+    fr1.status === 200 && fc1.length === 1 && fc1[0].auth === tfaAuth
+      ? ok("T-free-1 双受限池 free 请求 200（修复前 429 误杀），走主 Key", JSON.stringify(fc1.map((c) => c.auth)))
+      : bad("T-free-1 free 200", JSON.stringify({ status: fr1.status, calls: fc1.map((c) => c.auth), body: fr1.body.slice(0, 150) }));
+    await clearLimits();
+
+    // ── T-free-2：主 Key free 429（RA=30s > 同 Key 重试阈值）→ 切换备 Key free 200 ──
+    // 主退避按普通 429 语义记录（lastErrorKind=rate_limit），备 Key 成功不丢 quota 徽标。
+    await poolPut({ strategy: "active-standby", maxRetries: 3, failoverCooldownMs: 0 });
+    await limitKey(tfaId, tfaAuth);
+    await limitKey(tfbId, tfbAuth);
+    await mock("/__control", { auth: tfaAuth, responses: [{ mode: "rate_limit", retryAfter: 30 }] });
+    let fr2 = await gw({ model: "t-free-2:free", messages: [] });
+    let fc2 = await mockCalls();
+    let fh2a = await healthOf(tfaId), fh2b = await healthOf(tfbId);
+    fr2.status === 200 && fc2.length === 2 && fc2[0].auth === tfaAuth && fc2[1].auth === tfbAuth
+      ? ok("T-free-2 主 Key free 429 → 切换备 Key free 200（完整多 key 调度）", JSON.stringify(fc2.map((c) => c.auth)))
+      : bad("T-free-2 切换", JSON.stringify({ status: fr2.status, calls: fc2.map((c) => c.auth), body: fr2.body.slice(0, 150) }));
+    fh2a.backoffUntilMs > Date.now() && fh2a.lastErrorKind === "rate_limit" && fh2a.failCount >= 1
+      ? ok("T-free-2 主 Key free 429 完全按普通 429：退避 + lastErrorKind=rate_limit", JSON.stringify(fh2a))
+      : bad("T-free-2 主退避", JSON.stringify(fh2a));
+    fh2b.quotaLimitedUntil > Date.now() && fh2b.lastErrorKind === "quota" && fh2b.failCount === 0
+      ? ok("T-free-2 备 Key 服务 free 成功后仍额度受限（quota 徽标保留）", JSON.stringify(fh2b))
+      : bad("T-free-2 备徽标", JSON.stringify(fh2b));
+    await clearLimits();
+
+    // ── T-free-3：round-robin 双受限 free ×2 → 两 Key 轮流各 1 次 ──
+    await poolPut({ strategy: "round-robin", maxRetries: 3, failoverCooldownMs: 0 });
+    await limitKey(tfaId, tfaAuth);
+    await limitKey(tfbId, tfbAuth);
+    const fr3a = await gw({ model: "t-free-3a:free", messages: [] });
+    const fr3b = await gw({ model: "t-free-3b:free", messages: [] });
+    let fc3 = await mockCalls();
+    fr3a.status === 200 && fr3b.status === 200 && fc3.length === 2 && new Set(fc3.map((c) => c.auth)).size === 2
+      ? ok("T-free-3 round-robin 双受限 free 轮流命中两 Key", fc3.map((c) => c.auth).join(","))
+      : bad("T-free-3 round-robin", JSON.stringify({ s: [fr3a.status, fr3b.status], calls: fc3.map((c) => c.auth) }));
+    await clearLimits();
+
+    // ── T-free-4：least-usage 双受限 → free 选中用量更低的 Key ──
+    // 先 active-standby 对主 tfA 打 3 次成功请求抬高其 5h token 用量，再双受限，
+    // free 请求必须落在 5h token 用量更低的 tfB（least-usage 语义原样复用；tfB 因前面
+    // 用例累积了少量用量，断言比较相对值而非零值）。
+    await poolPut({ strategy: "active-standby", maxRetries: 3, failoverCooldownMs: 0 });
+    for (let i = 0; i < 3; i++) await gw({ model: "t-free-seed" + i, messages: [] });
+    const seedList = await keysList();
+    const seedA = seedList.find((rec) => rec.id === tfaId).usage.h5;
+    const seedB = seedList.find((rec) => rec.id === tfbId).usage.h5;
+    await poolPut({ strategy: "least-usage", maxRetries: 3, failoverCooldownMs: 0 });
+    await limitKey(tfaId, tfaAuth);
+    await limitKey(tfbId, tfbAuth);
+    let fr4 = await gw({ model: "t-free-4:free", messages: [] });
+    let fc4 = await mockCalls(); // 本场景调用日志：seed×3(tfA) + free 请求(应为 tfB)
+    const f4Served = fc4.at(-1)?.auth;
+    fr4.status === 200 && fc4.length === 4 && fc4.slice(0, 3).every((c) => c.auth === tfaAuth) &&
+      seedA.input > seedB.input && f4Served === tfbAuth
+      ? ok("T-free-4 least-usage 双受限 free 选中 5h 用量更低的备 Key", JSON.stringify({ seedA, seedB, servedBy: f4Served }))
+      : bad("T-free-4 least-usage", JSON.stringify({ status: fr4.status, seedA, seedB, calls: fc4.map((c) => c.auth) }));
+    await clearLimits();
+
+    // ── T-free-5：free 成功后徽标保留——受限 Key 的 lastErrorKind 保持 quota ──
+    // 双受限（active-standby 主 tfA 被选中服务 free），成功后 quota 徽标不得被清空。
+    await poolPut({ strategy: "active-standby", maxRetries: 3, failoverCooldownMs: 0 });
+    await limitKey(tfaId, tfaAuth);
+    await limitKey(tfbId, tfbAuth);
+    const hBefore = await healthOf(tfaId);
+    let fr5 = await gw({ model: "t-free-5:free", messages: [] });
+    const hAfter = await healthOf(tfaId);
+    fr5.status === 200 && hAfter.quotaLimitedUntil > Date.now() && hAfter.lastErrorKind === "quota" &&
+      hAfter.failCount === 0 && hAfter.backoffUntilMs === 0
+      ? ok("T-free-5 受限 Key free 成功后 lastErrorKind 保留 quota（徽标不误消失）", JSON.stringify({ before: hBefore, after: hAfter }))
+      : bad("T-free-5 徽标保留", JSON.stringify({ before: hBefore, after: hAfter, status: fr5.status }));
+    await clearLimits();
+    const hRecovered = await healthOf(tfaId);
+    hRecovered.quotaLimitedUntil === 0 && hRecovered.lastErrorKind === ""
+      ? ok("T-free-5 解除受限后 quota 状态与 lastErrorKind 回落为空（非受限语义不变）", JSON.stringify(hRecovered))
+      : bad("T-free-5 恢复", JSON.stringify(hRecovered));
+
+    // ── T-free-6：混合池（主健康 + 备受限）→ free 走主 Key，受限 Key 零调用 ──
+    await poolPut({ strategy: "active-standby", maxRetries: 3, failoverCooldownMs: 0 });
+    await limitKey(tfbId, tfbAuth);
+    let fr6 = await gw({ model: "t-free-6:free", messages: [] });
+    let fc6 = await mockCalls();
+    fr6.status === 200 && fc6.length === 1 && fc6[0].auth === tfaAuth
+      ? ok("T-free-6 混合池 free 请求走健康主 Key（受限备 Key 未被调用）", JSON.stringify(fc6.map((c) => c.auth)))
+      : bad("T-free-6 混合池", JSON.stringify({ status: fr6.status, calls: fc6.map((c) => c.auth) }));
+    await clearLimits();
+
+    // ── T-free-7：单受限 Key + free 429 → 出口 429 + Retry-After≈2s（退避而非额度窗口）──
+    // sameKeyRetryCount=0 禁同 Key 重试：429 RA=2s → recordRateLimit(2s 退避) → 无候选收尾。
+    // 出口等待必须反映真实退避（≈2s），不得退回额度窗口（1h）。
+    await admin("/admin/api/keys/" + tfbId, "DELETE"); // 只剩 tfA 单 Key
+    await poolPut({ strategy: "active-standby", maxRetries: 3, sameKeyRetryCount: 0, failoverCooldownMs: 0 });
+    await limitKey(tfaId, tfaAuth);
+    await mock("/__control", { auth: tfaAuth, responses: [{ mode: "rate_limit", retryAfter: 2 }] });
+    const t7Start = performance.now();
+    let fr7 = await gw({ model: "t-free-7:free", messages: [] });
+    const t7Ms = Math.round(performance.now() - t7Start);
+    const t7Ra = Number(fr7.headers["retry-after"]);
+    const h7 = await healthOf(tfaId);
+    fr7.status === 429 && Number.isFinite(t7Ra) && t7Ra >= 1 && t7Ra <= 3 && t7Ms < 3000 &&
+      h7.backoffUntilMs > Date.now() && h7.lastErrorKind === "rate_limit" && h7.quotaLimitedUntil > Date.now()
+      ? ok("T-free-7 单受限 Key free 429 → 出口 429 + Retry-After≈2s（真实退避，非 1h 额度窗口）", "dt=" + t7Ms + "ms RA=" + t7Ra)
+      : bad("T-free-7 出口", JSON.stringify({ status: fr7.status, dt: t7Ms, ra: t7Ra, h: h7, body: fr7.body.slice(0, 150) }));
+
+    // ── 收尾：删除专用 Key、重建 keyA、还原池配置并 restartClean（供 T21c 起后续用例）──
+    await poolPut({ strategy: "active-standby", maxRetries: 3, sameKeyRetryCount: 2, failoverCooldownMs: 600000 });
+    for (const rec of await keysList()) await admin("/admin/api/keys/" + rec.id, "DELETE");
+    await addKey("keyA", "user_keyA");
+    await restartClean();
+  }
+
+
   // ── T21c B-5 refresh-quota 探测超时 → 504 internal_error（不再 400 invalid_request_error）──
   console.log("\n=== T21c refresh-quota timeout 504 (B-5) ===");
   await sleep(1300); await stopMgr();

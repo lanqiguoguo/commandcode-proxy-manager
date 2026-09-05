@@ -16,6 +16,7 @@ const state = {
   pool: null,
   history: { items: [], total: 0, page: 1 },
   filters: { keyId: "", status: "", errorKind: "", from: "", to: "" },
+  historyFilterDirty: false, // B-8：筛选控件存在未提交编辑时置 true，抑制 SSE stats 自动重载/回填
   page: 1,
   historyLoading: false,
   historyError: "",
@@ -56,8 +57,10 @@ async function api(path, opts) {
   if (state.token) headers["X-Admin-Token"] = state.token;
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   if (res.status === 401 && path !== "/admin/api/login") {
+    // C-16：会话过期不可静默整页刷新——登录页需要读取此标记给出可读提示
+    try { sessionStorage.setItem("ccpm_session_expired", "1"); } catch {}
     resetSession(true);
-    throw new Error("unauthorized");
+    throw new Error("会话已过期，请重新登录");
   }
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
@@ -68,13 +71,30 @@ async function api(path, opts) {
   return data;
 }
 
+// B-9：refresh 慢响应乱序/回退守卫。
+// 1) 请求序号：仅最新请求可落地（同 history 通道模式），旧响应丢弃；
+// 2) SSE quota 到达即说明服务器额度已更新——该事件之后才发起的 refresh 才能拿到
+//    新快照，事件之前发起的在途 GET 携带旧 quota，落地时不得覆盖本地已更新的
+//    quota（逐 key 合并：quota 以本地 SSE 更新为准，其余字段以响应为准）。
+let refreshRequestSeq = 0;
+let quotaEventSeq = 0;
 async function refresh() {
   const sessionSeq = state.sessionSeq;
   const token = state.token;
+  const seq = ++refreshRequestSeq;
+  const quotaSeqAtStart = quotaEventSeq;
   try {
     const [keysData, poolData] = await Promise.all([api("/admin/api/keys"), api("/admin/api/pool")]);
-    if (!token || sessionSeq !== state.sessionSeq || token !== state.token) return false;
-    state.keys = keysData.keys || [];
+    if (seq !== refreshRequestSeq || !token || sessionSeq !== state.sessionSeq || token !== state.token) return false;
+    const localById = new Map(state.keys.map((k) => [k.id, k]));
+    state.keys = (keysData.keys || []).map((incoming) => {
+      const local = localById.get(incoming.id);
+      // 该 key 的 quota 在本次请求发出后被 SSE 更新过 → 保留本地新 quota
+      if (local && local.quota && local.quotaLocalSeq && local.quotaLocalSeq > quotaSeqAtStart) {
+        return { ...incoming, quota: local.quota };
+      }
+      return incoming;
+    });
     state.pool = poolData;
     return true;
   } catch (e) {
@@ -121,11 +141,22 @@ function stopTicker() {
 }
 
 // ── 登录 ──
+// C-16：401 会话过期整页 reload 前写入 sessionStorage 标记，登录页显示可读提示条
+function sessionExpiredNoticeHtml() {
+  let expired = false;
+  try { expired = sessionStorage.getItem("ccpm_session_expired") === "1"; } catch {}
+  if (expired) {
+    try { sessionStorage.removeItem("ccpm_session_expired"); } catch {}
+    return '<div class="alert err" role="alert">会话已过期或已被其他页面刷新，请重新登录</div>';
+  }
+  return "";
+}
 function showLogin() {
   document.getElementById("topbar").hidden = true;
   app.innerHTML =
     '<div class="login-wrap"><div class="card">' +
     "<h2>CommandCode Proxy Manager</h2>" +
+    sessionExpiredNoticeHtml() +
     "<p class=\"muted small\">管理端令牌在首次启动时自动生成，只写入 data/config.json（不在日志中打印），请从该文件读取</p>" +
     "<label>Admin Token</label>" +
     '<input id="login-token" type="password" placeholder="输入管理端令牌" autocomplete="current-password">' +
@@ -285,13 +316,17 @@ async function testKey(id) {
   } catch (e) { clearBusy(id); render(); alert(e.message); }
 }
 async function toggleKey(k) {
-  await api("/admin/api/keys/" + k.id, { method: "PUT", body: JSON.stringify({ enabled: !k.enabled }) });
-  await refresh(); render();
+  try {
+    await api("/admin/api/keys/" + k.id, { method: "PUT", body: JSON.stringify({ enabled: !k.enabled }) });
+    await refresh(); render();
+  } catch (e) { alert(e.message); }
 }
 async function delKey(id) {
   if (!confirm("确定删除该 Key？")) return;
-  await api("/admin/api/keys/" + id, { method: "DELETE" });
-  await refresh(); render();
+  try {
+    await api("/admin/api/keys/" + id, { method: "DELETE" });
+    await refresh(); render();
+  } catch (e) { alert(e.message); }
 }
 // 429/超时退避中且非认证异常：可手动清除退避（H2）
 function backoffBtnHtml(k) {
@@ -309,8 +344,10 @@ async function moveKey(id, dir) {
   const idx = state.keys.findIndex((k) => k.id === id);
   const target = idx + dir;
   if (target < 0 || target >= state.keys.length) return;
-  await api("/admin/api/keys/" + id, { method: "PUT", body: JSON.stringify({ priority: target }) });
-  await refresh(); render();
+  try {
+    await api("/admin/api/keys/" + id, { method: "PUT", body: JSON.stringify({ priority: target }) });
+    await refresh(); render();
+  } catch (e) { alert(e.message); }
 }
 
 // ── 总览 ──
@@ -456,16 +493,26 @@ function renderKeys() {
   document.getElementById("btn-add-key").addEventListener("click", addKey);
 }
 
+// in-flight 锁：addKey 双击/连点只发一次 POST（B-10），配合按钮 disabled 双保险
+let addKeyBusy = false;
 async function addKey() {
+  if (addKeyBusy) return;
   const alias = document.getElementById("k-alias").value.trim();
   const key = document.getElementById("k-key").value.trim();
   const note = document.getElementById("k-note").value.trim();
+  addKeyBusy = true;
+  const btn = document.getElementById("btn-add-key");
+  if (btn) btn.disabled = true;
   try {
     await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ alias, key, note }) });
     document.getElementById("k-key").value = "";
     await refresh(); render();
   } catch (e) {
     document.getElementById("key-msg").innerHTML = '<div class="alert err">' + esc(e.message) + "</div>";
+  } finally {
+    addKeyBusy = false;
+    const b = document.getElementById("btn-add-key");
+    if (b) b.disabled = false;
   }
 }
 
@@ -510,19 +557,12 @@ function renderHistory() {
     '<button class="small ghost" id="h-next">下一页</button>' +
     "</span></div></div>";
   app.innerHTML = html;
-  document.getElementById("h-search").addEventListener("click", () => {
-    state.filters = readFilters();
-    state.page = 1;
-    void loadHistory();
-  });
-  document.getElementById("h-csv").addEventListener("click", exportCsv);
-  document.getElementById("h-prev").addEventListener("click", () => { if (state.page > 1) { state.page--; void loadHistory(); } });
-  document.getElementById("h-next").addEventListener("click", () => { if (state.page * 50 < state.history.total) { state.page++; void loadHistory(); } });
   document.getElementById("h-key").value = state.filters.keyId || "";
   document.getElementById("h-status").value = state.filters.status || "";
   document.getElementById("h-err").value = state.filters.errorKind || "";
   document.getElementById("h-from").value = state.filters.from || "";
   document.getElementById("h-to").value = state.filters.to || "";
+  bindHistoryControls();
 }
 
 function readFilters() {
@@ -543,6 +583,7 @@ function toTs(dtLocal) {
 
 let historyRequestSeq = 0;
 let historyController = null;
+const HISTORY_FILTER_IDS = ["h-key", "h-status", "h-err", "h-from", "h-to"];
 function historyFilterKey(filters) {
   return [filters.keyId, filters.status, filters.errorKind, filters.from, filters.to].map((v) => String(v || "")).join("\u001f");
 }
@@ -560,6 +601,45 @@ function isCurrentHistoryRequest(request) {
     state.view === "history" && state.routeHash === request.routeHash &&
     (location.hash || "#/dashboard") === request.routeHash && state.page === request.page &&
     historyFilterKey(state.filters) === request.filtersKey;
+}
+// 绑定历史页控件事件（查询/导出/翻页 + 筛选脏标记）。每次 innerHTML 渲染后调用。
+function bindHistoryControls() {
+  document.getElementById("h-search").addEventListener("click", () => {
+    state.filters = readFilters();
+    state.historyFilterDirty = false;
+    state.page = 1;
+    void loadHistory();
+  });
+  document.getElementById("h-csv").addEventListener("click", exportCsv);
+  document.getElementById("h-prev").addEventListener("click", () => {
+    // 未提交筛选先落地再翻页：控件是用户意图的来源，翻页结果应与所见筛选一致
+    if (state.historyFilterDirty) {
+      state.filters = readFilters();
+      state.historyFilterDirty = false;
+    }
+    if (state.page > 1) { state.page--; void loadHistory(); }
+  });
+  document.getElementById("h-next").addEventListener("click", () => {
+    if (state.historyFilterDirty) {
+      state.filters = readFilters();
+      state.historyFilterDirty = false;
+    }
+    if (state.page * 50 < state.history.total) { state.page++; void loadHistory(); }
+  });
+  const markFilterDirty = () => { state.historyFilterDirty = true; };
+  for (const id of HISTORY_FILTER_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener("input", markFilterDirty);
+    el.addEventListener("change", markFilterDirty);
+  }
+}
+// B-8：脏标记为真（用户正在编辑/有未提交筛选）时，history 请求的落地渲染整段
+// 跳过——不 swap innerHTML、不清空控件、不抢焦点；表格数据在用户点查询后的
+// 全量渲染中自然刷新（在途请求本就是脏标记置位前按旧 filters 发起的）。
+function renderHistoryWithDirtyGuard() {
+  if (state.historyFilterDirty) return;
+  renderHistory();
 }
 
 async function loadHistory() {
@@ -579,7 +659,9 @@ async function loadHistory() {
   request.filtersKey = historyFilterKey(request.filters);
   state.historyLoading = true;
   state.historyError = "";
-  if (state.view === "history") renderHistory();
+  // 脏标记为真时不渲染（用户点击查询/翻页前已先清脏；SSE stats 自动入口在脏时
+  // 直接跳过 loadHistory），避免"加载中"提示的重绘打断正在编辑的筛选控件。
+  if (state.view === "history" && !state.historyFilterDirty) renderHistory();
 
   const f = request.filters;
   const params = new URLSearchParams();
@@ -598,14 +680,14 @@ async function loadHistory() {
     state.history = data;
     state.historyLoading = false;
     state.historyError = "";
-    renderHistory();
+    renderHistoryWithDirtyGuard();
     return true;
   } catch (e) {
     if (!isCurrentHistoryRequest(request)) return false;
     state.historyLoading = false;
     if (!e || (e.name !== "AbortError" && e.code !== "ABORT_ERR")) {
       state.historyError = e && e.message ? e.message : "请求失败";
-      renderHistory();
+      renderHistoryWithDirtyGuard();
     }
     return false;
   } finally {
@@ -614,6 +696,13 @@ async function loadHistory() {
 }
 
 async function exportCsv() {
+  // C-18：导出前把控件当前值同步进 filters——用户在筛选框编辑后未点查询直接
+  // 点导出时，导出应反映所见（控件）筛选而非上一次已提交（state.filters）的旧筛选。
+  const searchBtn = document.getElementById("h-search");
+  if (searchBtn) {
+    state.filters = readFilters();
+    state.historyFilterDirty = false;
+  }
   const f = state.filters;
   const params = new URLSearchParams();
   if (f.keyId) params.set("keyId", f.keyId);
@@ -724,22 +813,65 @@ async function savePool() {
   for (const id of ids) {
     const el = document.getElementById("f-" + id);
     if (!el) continue;
-    body[id] = el.type === "number" ? Number(el.value) : el.value;
+    // C-15：空串不提交（留空 = 不改动，后端保持原值）——Number("")=0 会把
+    // hardStop/softStop 改写为 50%、retention 变 1 天、min:0 字段真实落 0。
+    if (el.type === "number") {
+      const v = String(el.value).trim();
+      if (v === "") continue;
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      body[id] = n;
+    } else {
+      body[id] = el.value;
+    }
   }
-  // 秒显示字段换算回毫秒
+  // 秒显示字段换算回毫秒；空串同样跳过提交
   for (const id of MS_FIELDS) {
     const el = document.getElementById("f-" + id);
     if (!el) continue;
-    const sec = Number(el.value);
-    if (Number.isFinite(sec) && sec >= 0) body[id] = Math.round(sec * 1000);
+    const raw = String(el.value).trim();
+    if (raw === "") continue;
+    const sec = Number(raw);
+    if (!Number.isFinite(sec) || sec < 0) continue;
+    body[id] = Math.round(sec * 1000);
   }
-  body.zeroOutputCountsAs429 = document.getElementById("f-zeroOutputCountsAs429").checked;
+  const zeroOutputEl = document.getElementById("f-zeroOutputCountsAs429");
+  if (zeroOutputEl) body.zeroOutputCountsAs429 = zeroOutputEl.checked;
+  if (!Object.keys(body).length) {
+    document.getElementById("pool-msg").innerHTML = '<span class="badge ok">未修改任何配置</span>';
+    return;
+  }
   try {
-    await api("/admin/api/pool", { method: "PUT", body: JSON.stringify(body) });
-    document.getElementById("pool-msg").innerHTML = '<span class="badge ok">已保存</span>';
+    const res = await api("/admin/api/pool", { method: "PUT", body: JSON.stringify(body) });
+    const saved = res && typeof res.poolCfg === "object" ? res.poolCfg : null;
+    if (saved) state.pool = { ...(state.pool || {}), poolCfg: saved };
+    // C-19：回读后端 clamp 后的真实值并与提交值比对，被调整的字段明示给用户
+    const msgEl = document.getElementById("pool-msg");
+    if (msgEl) {
+      const adjusted = [];
+      if (saved) {
+        for (const id of ids) {
+          if (body[id] === undefined || typeof body[id] !== "number" || typeof saved[id] !== "number") continue;
+          if (saved[id] !== body[id]) {
+            const label = id === "fiveHourHardStop" ? "5h 硬阈值" : id === "weeklyHardStop" ? "每周硬阈值" : id === "historyRetentionDays" ? "历史保留天数" : id;
+            adjusted.push(label + " 已按范围从 " + body[id] + " 调整为 " + saved[id]);
+          }
+        }
+        for (const id of MS_FIELDS) {
+          if (body[id] === undefined || typeof saved[id] !== "number") continue;
+          if (saved[id] !== body[id]) {
+            adjusted.push((id.endsWith("Ms") ? id.slice(0, -2) : id) + " 已按范围从 " + Math.round(body[id] / 100) / 10 + " 调整为 " + Math.round(saved[id] / 100) / 10 + " 秒");
+          }
+        }
+      }
+      msgEl.innerHTML = adjusted.length
+        ? '<span class="badge ok">已保存</span> <span class="muted small">' + esc(adjusted.join("；")) + "</span>"
+        : '<span class="badge ok">已保存</span>';
+    }
     await refresh();
   } catch (e) {
-    document.getElementById("pool-msg").innerHTML = '<span class="badge bad">' + esc(e.message) + "</span>";
+    const msgEl = document.getElementById("pool-msg");
+    if (msgEl) msgEl.innerHTML = '<span class="badge bad">' + esc(e.message) + "</span>";
   }
 }
 
@@ -882,6 +1014,7 @@ function applyRoute() {
   const nextView = viewFromHash(routeHash);
   if (state.routeHash === routeHash && state.view === nextView) return;
   state.routeHash = routeHash;
+  if (state.view === "history" && nextView !== "history") state.historyFilterDirty = false; // 离开历史页控件即销毁，脏标记不再有意义
   state.view = nextView;
   invalidateHistoryRequest();
   if (state.view === "logs") startLogPoller(); else stopLogPoller();
@@ -961,6 +1094,8 @@ function updateSseIndicator() {
   if (retryBtn) {
     retryBtn.hidden = state.sse.status !== "auth-failed" && state.sse.status !== "stopped";
     retryBtn.disabled = !state.token;
+    // C-16：SSE 鉴权凭据（HttpOnly cookie）失效后重连必然再 401，按钮语义改为重新登录
+    retryBtn.textContent = state.sse.status === "auth-failed" ? "重新登录" : "重连实时";
   }
 }
 function setSseStatus(status, message) {
@@ -1111,8 +1246,14 @@ function attachEventSourceHandlers(source, generation) {
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
     if (!d || typeof d.keyId !== "string") return;
-    const k = state.keys.find((x) => x.id === d.keyId);
-    if (k) k.quota = d.report;
+    // B-9：SSE 额度更新就地改写 state.keys；打上本地序号标记，refresh() 落地时
+    // 据此合并保留（在途慢响应携带的旧 quota 不得回退新值，见 refresh()）。
+    quotaEventSeq++;
+    const index = state.keys.findIndex((x) => x.id === d.keyId);
+    if (index >= 0) {
+      const next = state.keys.map((k, i) => (i === index ? { ...k, quota: d.report, quotaLocalSeq: quotaEventSeq } : k));
+      state.keys = next;
+    }
     if ((state.view === "dashboard" || state.view === "keys") && !quotaRenderTimer) {
       quotaRenderTimer = setTimeout(() => {
         quotaRenderTimer = null;
@@ -1125,7 +1266,11 @@ function attachEventSourceHandlers(source, generation) {
     clearTimeout(statsDebounce);
     statsDebounce = setTimeout(() => {
       statsDebounce = null;
-      if (isActiveSseSource(source, generation) && state.view === "history") void loadHistory();
+      if (!isActiveSseSource(source, generation) || state.view !== "history") return;
+      // B-8：用户有未提交的筛选编辑时跳过自动刷新——后台流量驱动的重载会清掉
+      // 未点查询的筛选输入（既不清空控件也不发请求）；用户点查询时照常全流程。
+      if (state.historyFilterDirty) return;
+      void loadHistory();
     }, 2000);
   });
   source.addEventListener("quota-status", (e) => {
@@ -1163,6 +1308,13 @@ function startEventStream(force) {
 }
 function restartEventStream() {
   if (!state.token) return;
+  // C-16：状态为 auth-failed 时（cookie 通道已 401），"重连"是死按钮——
+  // 重连只会再次 401，此处引导回登录页（保留 in-memory 态，不整页刷新）。
+  if (state.sse.status === "auth-failed") {
+    resetSession(false);
+    showLogin();
+    return;
+  }
   stopEventStream("stopped");
   startEventStream();
 }

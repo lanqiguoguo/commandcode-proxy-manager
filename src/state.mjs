@@ -72,6 +72,7 @@ export function readValidatedJson(name, fallback, validate) {
 }
 
 export function writeJson(name, data) {
+  mergeGuardState(name, data);
   const p = resolve(DATA_DIR, name);
   const tmp = p + ".tmp";
   try {
@@ -86,6 +87,49 @@ export function writeJson(name, data) {
     markPersistenceFailure(failure, "file:" + name);
     console.error(failure.message);
     throw failure;
+  }
+}
+
+// B-6：磁盘历史状态防覆盖守卫（防止 keys.json 损坏导致的空池把运行状态清盘）。
+// 触发链：keys.json 损坏 → keyPool 隔离回退 {keys:[]} → state.json 校验按空
+// knownIds 全跳过 → 此后任何健康变迁（含管理员"修复前加新 key"后的健康请求——复现
+// B-6 Phase 4 实证的覆盖路径）都会用只含当前池 Key 的空 health 快照覆盖 state.json，
+// 退避/authError/quota 历史静默丢失。
+// 守卫语义（报告"保留原条目"方案）：被 armed 后，state.json 的每次写盘先把磁盘上
+// 不属于当前内存快照的历史 keys 条目合并进待写内容再落盘——当前池内 Key 的状态照常
+// 覆盖更新，池外历史条目逐字保留。keys.json 恢复合法并重启后守卫解除（正常加载路径
+// 不再 armed），此后删除 Key 由 removeKey 语义正常清理。
+// 注：armed 条件为"池空 + 磁盘 state 含历史条目"，与 keys.json 为空的原因无关——
+// 管理员误删 keys.json 同样触发保护；残留孤儿条目无害（重启时按 unknown key 告警，
+// 正常池加载后首次写盘即清理）。
+const stateMergeName = { current: null };
+export function guardStateMerge(name) {
+  stateMergeName.current = name;
+}
+const mergeWarned = new Set();
+function mergeGuardState(name, data) {
+  if (name !== stateMergeName.current || !data || typeof data !== "object" || Array.isArray(data)) return;
+  const keys = data.keys;
+  if (!keys || typeof keys !== "object" || Array.isArray(keys)) return; // 非 state.json 快照形态
+  let disk;
+  try {
+    const p = resolve(DATA_DIR, name);
+    if (!fs.existsSync(p)) return;
+    disk = JSON.parse(fs.readFileSync(p, "utf-8"));
+  } catch { return; }
+  const diskKeys = disk && typeof disk === "object" && !Array.isArray(disk) && disk.keys ? disk.keys : null;
+  if (!diskKeys || typeof diskKeys !== "object" || Array.isArray(diskKeys)) return;
+  const merged = { ...keys };
+  let added = 0;
+  for (const [id, entry] of Object.entries(diskKeys)) {
+    if (Object.prototype.hasOwnProperty.call(merged, id)) continue;
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) { merged[id] = entry; added++; }
+  }
+  if (!added) return;
+  data.keys = merged;
+  if (!mergeWarned.has(name)) {
+    mergeWarned.add(name);
+    console.error("[state] " + name + " 写盘前合并保留 " + added + " 条磁盘历史 keys 条目（keys.json 异常期间防状态丢失，B-6）");
   }
 }
 

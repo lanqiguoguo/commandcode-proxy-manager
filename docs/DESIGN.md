@@ -191,7 +191,7 @@ docker logs -f cc-proxy-manager
 2. manager 从 Key 池选择当前可用 Key，不把客户端令牌传给上游。
 3. gateway 按当前运行配置构造 `http://UPSTREAM_HOST:UPSTREAM_PORT`，托管模式实际为 loopback。
 4. raw upstream 从请求头取得池内 Key，负责协议转换、初始化请求、指纹、会话和 Command Code API 调用。
-5. 对未开始输出的非 2xx 或完整无输出响应，manager 可按池配置执行同 Key 重试或切换 Key；流式响应开始后不切换 Key。
+5. 对未开始输出的非 2xx 或完整无输出响应，manager 可按池配置执行同 Key 重试或切换 Key（零输出除外，见 §7.1 B-4 语义）；流式响应开始后不切换 Key。
 6. manager 记录外部请求、状态、错误类别、token 和延迟；Key 健康和额度状态写入 `/data`。
 
 raw upstream 当前原始行为包括：每个 API Key 的 fingerprint/session 状态、初始化预请求、
@@ -203,7 +203,6 @@ manager 配置表中的功能开关。
 ### 7.1 Key 池
 
 - 默认策略为 `active-standby`：最高优先级的可用 Key 为主 Key，其余为备用。
-- 429、402、零输出和可切换超时会触发有界同 Key 重试、退避和必要的切换。
 - 401/403 标记认证异常，不通过自动切换掩盖凭证问题。
 - 流式内容开始后只透传当前尝试，不能为了换 Key 重放已经发送的内容。
 - 管理界面可以配置 `round-robin` 和 `least-usage`，以及重试、退避、额度阈值和历史保留。

@@ -576,7 +576,7 @@ async function main() {
   r = await http1(MG + "/v1/chat/completions", "POST", { "Content-Type": "application/json", "x-api-key": CLIENT }, JSON.stringify({ model: "x", messages: [] }));
   r.status === 429 ? ok("x-api-key 鉴权通过（空池 429）") : bad("x-api-key", "got " + r.status);
   r = await gw({ model: "x", messages: [] });
-  r.status === 429 && r.body.includes("No usable API key") ? ok("空池 → 429 No usable API key") : bad("空池 429", "status=" + r.status + " " + r.body.slice(0, 120));
+  r.status === 429 && r.body.includes("No API keys configured") ? ok("空池 → 429 No API keys configured（B-3 分类文案）") : bad("空池 429", "status=" + r.status + " " + r.body.slice(0, 120));
 
   // ── 播种 keyA(主)/keyB(备) ──
   let rr = (await addKey("keyA", "user_keyA")).response;
@@ -780,8 +780,12 @@ async function main() {
   const authB = await gw({ model: "m-auth-only-b", messages: [] });
   r = await gw({ model: "m-auth-only-c", messages: [] });
   const authOnlyBody = JSON.parse(r.body);
-  authA.status === 401 && authB.status === 401 && r.status === 429 && r.headers["retry-after"] === "0" && authOnlyBody.retry_after === 0
-    ? ok("auth-only pool Retry-After=0，不伪装一小时人工等待")
+  // B-3：auth-only 池需人工 clear-auth（≥1h），出口不再承诺 Retry-After:0"立即可重试"——
+  // body 无 retry_after 键、无 Retry-After 头（header 断言同时锁定 sendJson 不加 0 头）。
+  authA.status === 401 && authB.status === 401 && r.status === 429 &&
+    r.headers["retry-after"] === undefined && !("retry_after" in authOnlyBody) &&
+    /manual auth recovery/.test(authOnlyBody.error?.message || "")
+    ? ok("auth-only pool 429 标注需人工 clear-auth，无 Retry-After 0（B-3）")
     : bad("auth-only Retry-After", JSON.stringify({ a: authA.status, b: authB.status, c: r.status, header: r.headers["retry-after"], body: authOnlyBody }));
   // auth-only 是负向场景；正向断言完成后恢复 Key 健康状态，避免污染后续 T4。
   await restartClean();
@@ -1055,16 +1059,34 @@ async function main() {
     ? ok("模型套餐错误历史按 client 记录且不伪装 auth")
     : bad("模型套餐历史分类", JSON.stringify(modelPlanStats));
 
-  // ── T7 零输出 → 同 Key 重试（决策 8）──
-  console.log("\n=== T7 zero output ===");
+  // ── T7 零输出 → 直接退避切 Key，不再同 Key 重试（B-4：确定性零输出连打同一 Key
+  //    是纯成本放大——3× 完整生成；零输出重试仅留给带真实短 retry_after 的 429）──
+  console.log("\n=== T7 zero output failover ===");
   await restartClean();
+  await mock("/__reset");
   await mock("/__control", { auth: "user_keyA", responses: [{ mode: "zeroout" }, { mode: "ok" }] });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "ok" }] });
   r = await gw({ model: "m-zero", messages: [] });
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
-  r.status === 200 && calls.length === 2 && calls.every((c) => c.auth === "user_keyA")
-    ? ok("零输出同 Key 重试成功") : bad("零输出重试", "status=" + r.status + " calls=" + calls.length);
+  r.status === 200 && calls.length === 2 && calls[0].auth === "user_keyA" && calls[1].auth === "user_keyB"
+    ? ok("零输出 1 次后即切 keyB（同 Key 0 次重试，B-4）") : bad("零输出切换", "status=" + r.status + " calls=" + JSON.stringify(calls.map((c) => c.auth)));
   ks = await keysList();
-  ks.find((k) => k.alias === "keyA").health.backoffUntilMs <= Date.now() ? ok("重试成功不留退避") : bad("零输出退避", "");
+  ks.find((k) => k.alias === "keyA").health.lastErrorKind === "rate_limit" && ks.find((k) => k.alias === "keyA").health.failCount === 1
+    ? ok("零输出记 rate_limit 退避（zeroOutputCountsAs429 语义保留）") : bad("零输出退避", JSON.stringify(ks.find((k) => k.alias === "keyA").health));
+
+  // ── T7c 零输出且池内无其他可用 Key → keyA 恰 1 次尝试后最终 429（同 Key 不重打）──
+  await restartClean();
+  ks = await keysList();
+  const t7cKeyB = ks.find((k) => k.alias === "keyB");
+  await admin("/admin/api/keys/" + t7cKeyB.id, "DELETE"); // 移走备 Key 构造单 Key 池
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_keyA", responses: Array(4).fill({ mode: "zeroout" }) });
+  r = await gw({ model: "m-zero-single", messages: [] });
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  const zeroSingleBody = parseJsonResponse(r, "zero single");
+  r.status === 429 && calls.length === 1 && calls[0].auth === "user_keyA" && zeroSingleBody.retry_after === 10
+    ? ok("单可用 Key 零输出：恰 1 次尝试后 429 + retry_after=10（B-4，修复前同 Key 3 次）") : bad("零输出单 Key", "status=" + r.status + " calls=" + calls.length + " body=" + JSON.stringify(zeroSingleBody));
+  await addKey("keyB", "user_keyB"); // 还原备 Key（新 id，auth 仍 user_keyB）
 
   // ── T7b zeroOutputCountsAs429=false → 零输出不计 429、不惩罚 Key ──
   await restartClean();
@@ -1441,7 +1463,7 @@ async function main() {
     ? ok("超时 Key 进入退避") : bad("超时退避", "");
   await admin("/admin/api/pool", "PUT", { connectTimeoutMs: 120000 });
 
-  // ── T12 maxRetries 预算 ──
+  // ── T12 retry 预算（B-4：零输出退避即换 Key——keyA 1 次 + keyB 1 次，无同 Key 重试）──
   console.log("\n=== T12 retry budget ===");
   await restartClean();
   const zz = Array(20).fill({ mode: "zeroout" });
@@ -1449,7 +1471,7 @@ async function main() {
   await mock("/__control", { auth: "user_keyB", responses: [...zz] });
   r = await gw({ model: "m-budget", messages: [] });
   calls = JSON.parse((await mockGet("/__calls")).body).calls;
-  r.status === 429 && calls.length === 4 ? ok("总尝试=maxRetries+1=4", calls.map((c) => c.auth.replace("user_", "")).join("→")) : bad("预算", "status=" + r.status + " calls=" + calls.length);
+  r.status === 429 && calls.length === 2 ? ok("零输出总尝试=2（各 Key 1 次，B-4 成本收紧）", calls.map((c) => c.auth.replace("user_", "")).join("→")) : bad("预算", "status=" + r.status + " calls=" + calls.length);
 
   // ── T13 历史筛选 / 分页 ──
   console.log("\n=== T13 history ===");
@@ -2005,6 +2027,74 @@ async function main() {
   !f10History.some((entry) => entry.model === "f10-expired") && !f10LogsApi.some((entry) => entry.msg.includes("f10-expired"))
     ? ok("重启后 history/logs API 不暴露已清除脏数据")
     : bad("F10 API 脏数据", JSON.stringify({ history: f10History.find((entry) => entry.model === "f10-expired"), logs: f10LogsApi.find((entry) => entry.msg.includes("f10-expired")) }));
+
+  // ── T22c B-6：keys.json 损坏 → state.json 防覆盖合并守卫（真实进程 5 阶段复现）──
+  // 阶段 1 造状态：b6a rate_limit 退避 + b6b authError 落盘；阶段 2/3 损坏 keys.json
+  // 重启（空池 + 守卫告警）；阶段 4 add key + 健康请求触发写盘——历史条目必须合并
+  // 保留（修复前此步把 state.json 清成单条空 health）；阶段 5 恢复 keys.json 重启后
+  // 历史状态完整找回。使用专用临时 Key，不依赖测试序列中池内 Key 的存在性。
+  console.log("\n=== T22c corrupt keys.json state guard (B-6) ===");
+  await mock("/__reset");
+  // 本用例使用专用临时 Key 且需要空池顺序：先移走测试序列遗留的 keyA（T21 添加）。
+  const t22cPool = await keysList();
+  const t22cKeyA = t22cPool.find((k) => k.alias === "keyA");
+  if (t22cKeyA) await admin("/admin/api/keys/" + t22cKeyA.id, "DELETE");
+  const b6aAdd = await addKey("b6a", "user_b6aaa_key");
+  const b6bAdd = await addKey("b6b", "user_b6bbb_key");
+  const b6IdA = b6aAdd.data.id;
+  const b6IdB = b6bAdd.data.id;
+  await mock("/__control", { auth: "user_b6aaa_key", responses: [{ mode: "rate_limit", retryAfter: 60 }] });
+  await mock("/__control", { auth: "user_b6bbb_key", responses: [{ mode: "auth" }] });
+  r = await gw({ model: "m-b6-a", messages: [] }); // b6a 退避 → 切 b6b 401 → b6b authError
+  await sleep(1300); // state.json 防抖落盘
+  const b6StatePath = resolve(DATA, "state.json");
+  const b6StateRaw = readFileSync(b6StatePath, "utf-8");
+  const b6StateBefore = JSON.parse(b6StateRaw);
+  const b6Seeded = b6StateBefore.keys[b6IdA]?.failCount >= 1 && b6StateBefore.keys[b6IdA]?.backoffUntilMs > Date.now() &&
+    b6StateBefore.keys[b6IdB]?.authError === true;
+  b6Seeded ? ok("T22c 阶段1：b6a 退避 + b6b authError 已 durable 落盘") : bad("T22c 阶段1", b6StateRaw.slice(0, 200));
+  const b6KeysRaw = readFileSync(resolve(DATA, "keys.json"), "utf-8");
+  await stopMgr();
+  // 阶段 2：截断 keys.json（损坏 JSON）
+  const b6Corrupt = b6KeysRaw.slice(0, 70);
+  writeFileSync(resolve(DATA, "keys.json"), b6Corrupt);
+  await startMgr();
+  const b6CorruptFiles = readdirSync(DATA).filter((f) => /^keys\.json\.corrupt-\d+$/.test(f));
+  const b6StateAfterStartup = readFileSync(b6StatePath, "utf-8");
+  b6CorruptFiles.length >= 1 && b6StateAfterStartup === b6StateRaw && mgrStderr.includes("keys.json 为空")
+    ? ok("T22c 阶段2：损坏 keys.json 隔离 + 空池启动 + 守卫告警（state.json 未动）")
+    : bad("T22c 阶段2", JSON.stringify({ corrupt: b6CorruptFiles, guardLog: mgrStderr.slice(-2000).includes("keys.json 为空") }));
+  // 阶段 3：add key → 只写 keys.json；随后对 b6c 制造一次真实健康变迁（429 退避）
+  // 触发 state.json 写盘——历史条目必须合并保留，b6c 自身的退避照常写入
+  const b6Added = (await addKey("b6c", "user_b6ccc_key")).data.id;
+  await mock("/__reset");
+  await mock("/__control", { auth: "user_b6ccc_key", responses: [{ mode: "rate_limit", retryAfter: 60 }] });
+  r = await gw({ model: "m-b6-ccc", messages: [] }); // 429 → recordRateLimit → persistState 防抖
+  await sleep(1300); // 等 state.json 1s 防抖落盘（合并守卫在写盘路径生效）
+  const b6StateAfterHealthy = JSON.parse(readFileSync(b6StatePath, "utf-8"));
+  // 结构断言：历史条目保留（backoff 可能因场景耗时自然到期，保留性看 failCount/
+  // lastErrorKind/authError 而不看 backoffUntil 是否仍在未来）+ b6c 自身新退避写入
+  const b6HistoryKept = b6StateAfterHealthy.keys[b6IdA] && b6StateAfterHealthy.keys[b6IdA].failCount >= 1 &&
+    b6StateAfterHealthy.keys[b6IdA].lastErrorKind === "rate_limit" &&
+    b6StateAfterHealthy.keys[b6IdB] && b6StateAfterHealthy.keys[b6IdB].authError === true;
+  const b6NewKept = b6StateAfterHealthy.keys[b6Added] && b6StateAfterHealthy.keys[b6Added].failCount >= 1 &&
+    b6StateAfterHealthy.keys[b6Added].lastErrorKind === "rate_limit";
+  r.status === 429 && b6HistoryKept && b6NewKept
+    ? ok("T22c 阶段3：健康变迁写盘后历史退避/authError 条目合并保留（B-6，修复前被清空）", JSON.stringify(Object.keys(b6StateAfterHealthy.keys)))
+    : bad("T22c 阶段3", JSON.stringify({ status: r.status, ids: { b6IdA, b6IdB, added: b6Added }, after: b6StateAfterHealthy }));
+  await stopMgr();
+  // 阶段 4：恢复 keys.json + state.json 备份 → 重启后状态完整找回
+  writeFileSync(resolve(DATA, "keys.json"), b6KeysRaw);
+  writeFileSync(b6StatePath, b6StateRaw);
+  await startMgr();
+  const b6RestoredKeys = await keysList();
+  const b6RestoredA = b6RestoredKeys.find((k) => k.id === b6IdA);
+  const b6RestoredB = b6RestoredKeys.find((k) => k.id === b6IdB);
+  b6RestoredA && b6RestoredB && b6RestoredA.health.failCount >= 1 && b6RestoredB.health.authError === true
+    ? ok("T22c 阶段4：恢复 keys.json 重启后 b6a 退避/b6b authError 完整找回")
+    : bad("T22c 阶段4", JSON.stringify(b6RestoredKeys.map((k) => [k.alias, k.health])));
+  await restartClean(); // 清退避/authError 残留，后续用例干净进入
+
 
   // ── T23 hosted supervisor：raw upstream readiness/logs/reaping ──
   console.log("\n=== T23 hosted upstream supervision ===");

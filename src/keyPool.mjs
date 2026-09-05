@@ -1,7 +1,10 @@
 // ── Key 池：主备顺序、健康状态、429/额度退避（持久化到 /data） ──
 import { randomUUID } from "crypto";
-import { readValidatedJson, writeJson, debouncedWriter } from "./state.mjs";
+import { readValidatedJson, writeJson, debouncedWriter, guardStateMerge } from "./state.mjs";
 import { isRecord, validateKeysDocument, validateStateDocument } from "./persistenceSchema.mjs";
+import fs from "fs";
+import { resolve } from "path";
+import { DATA_DIR } from "./config.mjs";
 
 let keys = [];        // 数组顺序即主备优先级（index 0 = 主 Key）
 let health = new Map();
@@ -21,6 +24,25 @@ export function initKeyPool(cfgPool, opts = {}) {
   keys = data.keys;
   keys.sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
   const knownIds = new Set(keys.map((key) => key.id));
+  // B-6：keys.json 损坏隔离回退为空时，state.json 校验因 knownIds 为空全跳过——
+  // 若磁盘 state.json 仍含历史 keys 条目，启用空快照覆盖写守卫，防止首次健康变迁
+  // 用空 health 覆盖磁盘退避/authError/quota 状态。原始读取不经 knownIds 过滤，
+  // 独立于上面的校验读取。
+  let diskStateHasKeysEntries = false;
+  try {
+    const path = resolve(DATA_DIR, "state.json");
+    if (fs.existsSync(path)) {
+      const raw = fs.readFileSync(path, "utf-8");
+      const value = JSON.parse(raw);
+      if (isRecord(value?.keys) && Object.keys(value.keys).length > 0) diskStateHasKeysEntries = true;
+    }
+  } catch (e) {
+    console.warn("[keyPool] state.json 预检失败（" + e.message + "），覆盖写守卫未启用");
+  }
+  if (keys.length === 0 && diskStateHasKeysEntries) {
+    guardStateMerge("state.json");
+    console.error("[keyPool] 检测到 keys.json 为空（可能损坏被隔离）但 state.json 含历史 keys 状态——已启用 state.json 防覆盖合并守卫（磁盘历史条目写盘保留），请恢复 keys.json 后重启（B-6）");
+  }
   const saved = readValidatedJson("state.json", { keys: {} }, (value) => validateStateDocument(value, { knownIds }));
   const savedKeys = isRecord(saved.keys) ? saved.keys : {};
   keys.forEach((k) => {
@@ -439,6 +461,40 @@ export function nextRetryAfterMs() {
     }
   }
   return min ? Math.max(0, min - nowMs()) : 0;
+}
+
+// B-3：selectKey 返回 null（无可用候选）时，向网关出口提供分类与可恢复等待量。
+// 触发集含语义完全不同的四类状态，固定文案 "all backed off / quota limited" 失实，
+// Retry-After:0 在 authError/空池场景还承诺了不存在的"立即可重试"（需人工 clear-auth）。
+// kind：empty=池无任何 Key；disabled=全禁用；auth=全部 authError（需人工介入，无自动
+// 恢复等待）；backoff=至少一个 Key 处于退避/额度受限（真实自动恢复等待）。
+// waitMs：仅 backoff 种类携带真实等待（≥0，0=全部立即恢复）；其余种类无自动恢复路径，
+// 返回 -1 让出口省略 retry_after/Retry-After，避免 0 语义误导。
+export function poolUnavailableReason() {
+  if (!keys.length) return { kind: "empty", waitMs: -1 };
+  const now = nowMs();
+  let authCount = 0;
+  let disabledCount = 0;
+  let hasWaiting = false;
+  for (const k of keys) {
+    if (!k.enabled) {
+      disabledCount++;
+      continue;
+    }
+    const h = health.get(k.id);
+    if (h && h.authError) {
+      authCount++;
+      continue;
+    }
+    if (h) {
+      const until = Math.max(h.backoffUntilMs, h.quotaLimitedUntil);
+      if (until > now) hasWaiting = true;
+    }
+  }
+  if (authCount + disabledCount === keys.length) {
+    return { kind: disabledCount > 0 && authCount === 0 ? "disabled" : "auth", waitMs: -1 };
+  }
+  return { kind: "backoff", waitMs: hasWaiting ? nextRetryAfterMs() : 0 };
 }
 
 export function getPoolStats() {

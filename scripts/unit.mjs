@@ -503,9 +503,10 @@ if (SC === "config") {
 // ════ persistence（F13 JSON schema、隔离与未知 Key 兼容）════
 if (SC === "persistence") {
   console.log("=== persistence schema/quarantine ===");
-  const { initKeyPool, listKeys, getHealth } = await import("../src/keyPool.mjs");
+  const { initKeyPool, listKeys, getHealth, addKey } = await import("../src/keyPool.mjs");
   const { initQuota, getReport, probeKey } = await import("../src/quota.mjs");
   const { validateKeysDocument, validateStateDocument, validateQuotaCacheDocument } = await import("../src/persistenceSchema.mjs");
+  const { writeJson } = await import("../src/state.mjs");
 
   const keyOne = { id: "k1", alias: "one", key: "user_schema_secret_one", note: "", enabled: true, priority: 0, createdAt: Date.now() };
   const keyTwo = { id: "k2", alias: "two", key: "user_schema_secret_two", note: "", enabled: false, priority: 1, createdAt: Date.now() };
@@ -625,6 +626,42 @@ if (SC === "persistence") {
   check(!missingState.thrown && backupNames("state.json").length === unknownStateBefore.length &&
     readFileSync(DATA + "/state.json", "utf8") === missingStateRaw && missingHealth && missingHealth.failCount === 0,
     "state 合法缺失 key → 保持文件且使用默认 health");
+
+  // B-6：keys.json 损坏（隔离回退空池）+ state.json 含历史 → 覆盖写守卫合并保留
+  // 历史条目。模拟真实时序：损坏 keys.json 启动 → add key（写 keys.json）→ 健康变迁
+  // 触发 persistState（此处用 writeJson 模拟 debouncedWriter 的 getData 快照路径）——
+  // 写盘内容必须仍含磁盘历史条目，state.json 不被清空。
+  {
+    remove("keys.json");
+    writeRaw("keys.json", "not-json"); // 损坏 → 隔离 + 空池启动
+    const b6Historical = JSON.stringify({ keys: {
+      "legacy-k1": { backoffUntilMs: 9999999999999, failCount: 1, lastErrorKind: "rate_limit", authError: false, quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false, failoverCount: 0, lastFailoverAt: 0, lastUsedAt: 0 },
+      "legacy-k2": { backoffUntilMs: 0, failCount: 0, lastErrorKind: "auth", authError: true, quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false, failoverCount: 0, lastFailoverAt: 0, lastUsedAt: 0 }
+    } });
+    writeRaw("state.json", b6Historical);
+    const b6Before = backupNames("state.json");
+    const b6Init = captureLogs(initPool);
+    check(!b6Init.thrown && listKeys().length === 0 && b6Init.lines.some((line) => line.includes("防覆盖合并守卫") || line.includes("keys.json 为空")),
+      "损坏 keys.json + 历史 state → 空池启动并告警启用守卫", b6Init.lines.join(" | ").slice(0, 200));
+    // add key（写 keys.json）+ 模拟健康变迁的 persistState 快照写盘
+    const newRec = addKey({ alias: "b6new", key: "user_b6_new_key" });
+    check(backupNames("state.json").length === b6Before.length && readFileSync(DATA + "/state.json", "utf8") === b6Historical,
+      "add key 不触发 state.json 覆盖（写盘守卫前磁盘原样）");
+    const writeAfterHealth = captureLogs(() => writeJson("state.json", { keys: {
+      [newRec.id]: { backoffUntilMs: 0, failCount: 0, lastErrorKind: "", authError: false, quotaLimitedUntil: 0, quotaLimitedReason: "", softLimited: false, failoverCount: 0, lastFailoverAt: 0, lastUsedAt: 0 }
+    } }));
+    const b6Disk = JSON.parse(readFileSync(DATA + "/state.json", "utf-8"));
+    check(b6Disk.keys["legacy-k1"] && b6Disk.keys["legacy-k1"].failCount === 1 && b6Disk.keys["legacy-k1"].backoffUntilMs === 9999999999999 &&
+      b6Disk.keys["legacy-k2"] && b6Disk.keys["legacy-k2"].authError === true && b6Disk.keys[newRec.id],
+      "健康变迁写盘后历史 state 条目合并保留（B-6，修复前此处被 1 条空 health 覆盖）", JSON.stringify(b6Disk).slice(0, 300));
+    check(writeAfterHealth.lines.some((line) => line.includes("合并保留")), "B-6 守卫输出合并告警", writeAfterHealth.lines.join(" | "));
+    // 守卫不阻断正常池：newRec 在池内 → 覆盖写（无孤儿残留）仍可用
+    const urEmptyCheck = listKeys().length === 1;
+    check(urEmptyCheck, "守卫后池内 Key 正常可用", listKeys().map((k) => k.alias).join(","));
+  }
+  // 恢复干净状态：写回合法 keys/state，供 quota 段独立使用
+  writeValidKeys();
+  remove("state.json");
 
   const quotaPoolCalls = [];
   const quotaSoftCalls = [];
@@ -834,7 +871,7 @@ if (SC === "gateway") {
 // ════ keyPool ════
 if (SC === "pool") {
   console.log("=== keyPool 选 Key ===");
-  const { initKeyPool, addKey, updateKey, removeKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess } =
+  const { initKeyPool, addKey, updateKey, removeKey, selectKey, setQuotaLimited, setSoftLimited, recordRateLimit, recordTimeout, markAuthError, clearAuthError, clearBackoff, recordFailover, nextRetryAfterMs, poolUnavailableReason, setPoolCfg, getPoolStats, getHealth, beginAttempt, recordSuccess } =
     await import("../src/keyPool.mjs");
   const logEvents = [];
   initKeyPool({ strategy: "active-standby", failoverCooldownMs: 0, backoffBaseMs: 5000, backoffMaxMs: 120000 }, {
@@ -890,6 +927,28 @@ if (SC === "pool") {
   // auth-only 池没有可恢复的自动等待；人工修复的一小时标记不得冒充 Retry-After。
   markAuthError(k1.id);
   check(nextRetryAfterMs() === 0, "auth-only pool Retry-After 不返回人工修复的一小时", String(nextRetryAfterMs()));
+  clearAuthError(k1.id);
+  clearAuthError(k2.id);
+
+  // B-3：poolUnavailableReason 出口分类——backoff 混合返回真实等待；disabled/auth
+  // 无自动恢复等待（waitMs=-1 供出口省略 retry_after，杜绝 Retry-After:0 误导）
+  recordRateLimit(k1.id, 30000); // k1 退避，k2 健康 → backoff 混合
+  const urBackoff = poolUnavailableReason();
+  check(urBackoff && urBackoff.kind === "backoff" && urBackoff.waitMs > 25000 && urBackoff.waitMs <= 30000,
+    "退避混合 → kind=backoff 携带真实等待", JSON.stringify(urBackoff));
+  clearBackoff(k1.id);
+  updateKey(k1.id, { enabled: false });
+  updateKey(k2.id, { enabled: false });
+  const urDisabled = poolUnavailableReason();
+  check(urDisabled && urDisabled.kind === "disabled" && urDisabled.waitMs === -1,
+    "全禁用 → kind=disabled 且无自动恢复等待", JSON.stringify(urDisabled));
+  updateKey(k1.id, { enabled: true });
+  updateKey(k2.id, { enabled: true });
+  markAuthError(k1.id);
+  markAuthError(k2.id);
+  const urAuth = poolUnavailableReason();
+  check(urAuth && urAuth.kind === "auth" && urAuth.waitMs === -1,
+    "全 authError → kind=auth 且无自动恢复等待（clear-auth 语义）", JSON.stringify(urAuth));
   clearAuthError(k1.id);
   clearAuthError(k2.id);
 

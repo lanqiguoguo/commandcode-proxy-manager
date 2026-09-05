@@ -735,11 +735,30 @@ export async function handleGateway(req, res, url) {
         return;
       }
       if (attempts === 0) {
-        const wait = retryAfterSeconds(pool.nextRetryAfterMs());
-        sendJson(res, 429, {
-          error: { message: "No usable API key in pool (all backed off / quota limited)", type: "rate_limit_error" },
-          retry_after: wait
-        });
+        // B-3：按池状态分类文案与 Retry-After——空池/全 disabled/全 authError 都不是
+        // "all backed off / quota limited"，且 authError 需人工 clear-auth（≥1h），
+        // Retry-After:0 的"立即可重试"承诺失实。这三类无自动恢复路径：不发
+        // retry_after/Retry-After（sendJson 仅在 body 携带 retry_after 时才补头），
+        // 客户端按普通 429 处理且不会被 0 诱导立即重试。真退避/限额混合保持
+        // 原文案并返回真实等待（全部立即恢复时为 0，语义不变）。
+        const reason = pool.poolUnavailableReason();
+        const noRetry = reason && (reason.kind === "empty" || reason.kind === "disabled" || reason.kind === "auth");
+        let body = null;
+        if (noRetry) {
+          const message = reason.kind === "empty"
+            ? "No API keys configured in pool (add keys via admin UI)"
+            : reason.kind === "disabled"
+              ? "All API keys are disabled (enable via admin UI)"
+              : "All API keys require manual auth recovery (clear auth via admin UI)";
+          body = { error: { message, type: "rate_limit_error" } };
+        } else {
+          const wait = reason && reason.kind === "backoff" ? reason.waitMs : pool.nextRetryAfterMs();
+          body = {
+            error: { message: "No usable API key in pool (all backed off / quota limited)", type: "rate_limit_error" },
+            retry_after: retryAfterSeconds(wait)
+          };
+        }
+        sendJson(res, 429, body);
         recordRequestEvent({ status: 429, ok: false, errorKind: "rate_limit" });
         return;
       }
@@ -994,9 +1013,14 @@ export async function handleGateway(req, res, url) {
           ? Math.ceil(retryAfterMs / 1000)
           : (mapped.body.retry_after !== undefined ? mapped.body.retry_after : 30);
         lastBody = mapped.body;
-        // 决策 8：429/402/零输出先同 Key 重试；确属持续限流才退避 + 切换备 Key
-        const retryable = sameKeyTries < sameKeyMax && attempts < maxAttempts &&
-          (zeroOut || (retryAfterMs !== null && retryAfterMs <= (poolCfg.sameKeyRetryMaxWaitMs ?? 5000)));
+        // B-4：零输出不再同 Key 重试——确定性零输出对同一 Key 连打多次是纯成本放大
+        // （DESIGN 原"零输出触发有界同 Key 重试"设计废弃，见 DESIGN.md §7.1）。
+        // 零输出立即退避（zeroOutputCountsAs429=true 时）并换 Key：有备 Key 则下一次
+        // 尝试走外层 while 的新 Key，无备 Key 则收尾出口 body.retry_after 保持上游
+        // 的 10s 语义。同 Key 重试仅保留给带真实短 retry_after（≤sameKeyRetryMaxWaitMs）
+        // 的 429——此时上游明确要求客户端稍后重试同 Key。
+        const retryable = !zeroOut && sameKeyTries < sameKeyMax && attempts < maxAttempts &&
+          (retryAfterMs !== null && retryAfterMs <= (poolCfg.sameKeyRetryMaxWaitMs ?? 5000));
         sameKeyTries++;
         if (retryable) {
           const delay = Math.min(retryAfterMs ?? 2000, poolCfg.sameKeyRetryDelayMs ?? 2000, Math.max(0, deadlineAt - Date.now()));

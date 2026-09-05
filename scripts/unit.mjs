@@ -933,6 +933,19 @@ if (SC === "pool") {
   updateKey(k2.id, { priority: 1 });
   logEvents.length = 0;
   check(selectKey().id === k1.id, "默认选主 Key");
+  // 启用/停用日志：与新增/删除同风格（别名 + keyId），且持久化成功后才发出
+  updateKey(k1.id, { enabled: false });
+  const disableLog = logEvents.at(-1);
+  check(disableLog && disableLog.msg === "停用 Key[主账号]" && disableLog.keyId === k1.id,
+    "停用日志显示别名并携带正确 keyId", JSON.stringify(disableLog));
+  updateKey(k1.id, { enabled: false }); // 幂等：状态未变不重复记日志
+  check(logEvents.length === 1 && logEvents.at(-1) === disableLog,
+    "重复停用不产生多余日志", JSON.stringify(logEvents));
+  updateKey(k1.id, { enabled: true });
+  const enableLog = logEvents.at(-1);
+  check(enableLog && enableLog.msg === "启用 Key[主账号]" && enableLog.keyId === k1.id,
+    "启用日志显示别名并携带正确 keyId", JSON.stringify(enableLog));
+  logEvents.length = 0;
   setQuotaLimited(k1.id, Date.now() + 60000, "fiveHour");
   const healthLog = logEvents.at(-1);
   check(healthLog && healthLog.msg.includes("Key[主账号]") && healthLog.keyId === k1.id,

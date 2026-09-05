@@ -206,6 +206,7 @@ export function updateKey(id, patch) {
   const before = snapshotKeys();
   let movedRecord = null;
   let movedTargetIndex = null;
+  const enabledChanged = patch.enabled !== undefined && patch.enabled !== rec.enabled;
   try {
     if (patch.alias !== undefined) rec.alias = patch.alias;
     if (patch.note !== undefined) rec.note = patch.note;
@@ -222,6 +223,9 @@ export function updateKey(id, patch) {
   } catch (e) {
     keys = before;
     throw e;
+  }
+  if (enabledChanged) {
+    emitLog((patch.enabled ? "启用 " : "停用 ") + keyLabel(rec), rec.id);
   }
   if (movedRecord) {
     emitLog("调整主备顺序: " + keyLabel(movedRecord) + " -> 第 " + (movedTargetIndex + 1) + " 位", movedRecord.id);

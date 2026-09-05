@@ -401,6 +401,18 @@ if (SC === "config") {
   expectField("backoff 时间关系", { pool: { backoffBaseMs: 30000, backoffMaxMs: 5000 } }, "pool.backoffMaxMs");
   expectField("quotaRefreshMs 越界", { pool: { quotaRefreshMs: 4999 } }, "pool.quotaRefreshMs");
   expectField("顶层数组", [], "$");
+  // 令牌强校验（A-1/C-1/C-8）：非空 8..128 位为系统级不变量；空串放行
+  // （clientToken 清空回退 adminToken；adminToken 由 loadConfig 自动生成兜底）
+  expectField("clientToken 过短", { clientToken: "abc123" }, "clientToken");
+  expectField("adminToken 过短", { adminToken: "short" }, "adminToken");
+  expectField("clientToken 超 128 上限", { clientToken: "x".repeat(129) }, "clientToken");
+  expectField("adminToken 超 128 上限", { adminToken: "x".repeat(129) }, "adminToken");
+  expectField("token 全空白", { adminToken: "        " }, "adminToken");
+  check(validateConfig({ clientToken: "eight-ok" }).clientToken === "eight-ok", "8 位 clientToken 通过 schema");
+  check(validateConfig({ adminToken: "eight-ok" }).adminToken === "eight-ok", "8 位 adminToken 通过 schema");
+  check(validateConfig({ clientToken: "x".repeat(128) }).clientToken.length === 128, "128 位 clientToken 恰好通过 schema");
+  check(validateConfig({ clientToken: "", adminToken: "" }).clientToken === "" && validateConfig({ adminToken: "" }).adminToken === "",
+    "空串 token 放行（clientToken=未配置回退；adminToken=待自动生成）");
 
   const clamped = normalizePoolPatch({ maxRetries: 999 }, valid.pool);
   check(clamped.maxRetries === 10, "管理 API 保持 maxRetries 越界 clamp=10", JSON.stringify(clamped));
@@ -429,22 +441,54 @@ if (SC === "config") {
     const first = loadConfig();
     check(first.adminToken === "unit-env-admin-A" && first.clientToken === "unit-env-client-A", "无磁盘 token 时 env 初始化生效");
 
+    // A-1：env 提供短 token 且磁盘无值 → 启动即拒绝（生效配置校验），且不落盘
     const configPath = DATA + "/config.json";
-    writeFileSync(configPath, JSON.stringify({ ...first, adminToken: "unit-disk-admin-B", clientToken: "unit-disk-client-B" }));
+    writeFileSync(configPath, JSON.stringify({}));
+    delete process.env.ADMIN_TOKEN;
+    process.env.CLIENT_TOKEN = "abc"; // 3 位短 clientToken
+    let shortTokenError = null;
+    try { loadConfig(); } catch (e) { shortTokenError = e; }
+    check(shortTokenError instanceof ConfigValidationError && shortTokenError.fields.some((f) => f.field === "clientToken"),
+      "env 短 token 拒绝启动并返回字段诊断", String(shortTokenError));
+    const shortBackups = fs.readdirSync(DATA).filter((name) => /^config\.json\.corrupt-\d+$/.test(name));
+    check(shortBackups.length === 0 && !JSON.parse(readFileSync(configPath, "utf-8")).clientToken,
+      "env 短 token 不落盘也不隔离既有合法 config.json", JSON.stringify(shortBackups));
+    delete process.env.CLIENT_TOKEN;
+    process.env.ADMIN_TOKEN = "unit-env-admin-A";
+    process.env.CLIENT_TOKEN = "unit-env-client-A";
+    const envRestored = loadConfig();
+    check(envRestored.clientToken === "unit-env-client-A", "移除短 env 后启动恢复");
+
+    const configPath2 = DATA + "/config.json";
+    writeFileSync(configPath2, JSON.stringify({ ...first, adminToken: "unit-disk-admin-B", clientToken: "unit-disk-client-B" }));
     process.env.ADMIN_TOKEN = "unit-env-admin-C";
     process.env.CLIENT_TOKEN = "unit-env-client-C";
     const second = loadConfig();
     check(second.adminToken === "unit-disk-admin-B" && second.clientToken === "unit-disk-client-B", "磁盘 token 优先，不被 env 静默覆盖");
 
-    const corruptRaw = JSON.stringify({ pool: { zeroOutputCountsAs429: "false" } });
-    writeFileSync(configPath, corruptRaw);
+    // C-1：磁盘语义损坏（短 adminToken）→ 拒绝启动 + 隔离原文件
+    const corruptRaw = JSON.stringify({ adminToken: "short" });
+    writeFileSync(configPath2, corruptRaw);
     let semanticError = null;
     try { loadConfig(); } catch (e) { semanticError = e; }
-    const backups = fs.readdirSync(DATA).filter((name) => /^config\.json\.corrupt-\d+$/.test(name));
-    const backupRaw = backups.length ? readFileSync(DATA + "/" + backups[backups.length - 1], "utf-8") : "";
-    check(semanticError instanceof ConfigValidationError && semanticError.fields.some((f) => f.field === "pool.zeroOutputCountsAs429"),
-      "磁盘语义损坏拒绝启动并返回字段诊断", String(semanticError));
-    check(backups.length === 1 && backupRaw === corruptRaw, "磁盘语义损坏原文件隔离保留", JSON.stringify(backups));
+    const backups2 = fs.readdirSync(DATA).filter((name) => /^config\.json\.corrupt-\d+$/.test(name));
+    const backupRaw2 = backups2.length ? readFileSync(DATA + "/" + backups2[backups2.length - 1], "utf-8") : "";
+    check(semanticError instanceof ConfigValidationError && semanticError.fields.some((f) => f.field === "adminToken"),
+      "磁盘短 token 拒绝启动并返回字段诊断", String(semanticError));
+    check(backups2.length === 1 && backupRaw2 === corruptRaw, "磁盘短 token 原文件隔离保留", JSON.stringify(backups2));
+
+    // C-1：恢复合法磁盘 config.json 后可正常启动
+    writeFileSync(configPath2, JSON.stringify({ ...first, adminToken: "unit-disk-good-123", clientToken: "unit-disk-good-456" }));
+    const recovered = loadConfig();
+    check(recovered.adminToken === "unit-disk-good-123" && recovered.clientToken === "unit-disk-good-456", "恢复合法 config.json 后启动成功");
+
+    // 回归 F12：pool 语义损坏走同一隔离流程（config.json 被隔离 → 路径不存在）
+    const poolCorruptRaw = JSON.stringify({ pool: { zeroOutputCountsAs429: "false" } });
+    writeFileSync(configPath2, poolCorruptRaw);
+    let poolSemanticError = null;
+    try { loadConfig(); } catch (e) { poolSemanticError = e; }
+    check(poolSemanticError instanceof ConfigValidationError && poolSemanticError.fields.some((f) => f.field === "pool.zeroOutputCountsAs429"),
+      "磁盘 pool 语义损坏拒绝启动并返回字段诊断", String(poolSemanticError));
 
     const saveFields = fieldsOf(() => saveConfig({ ...second, pool: { ...second.pool, maxRetries: NaN } }));
     check(saveFields.includes("pool.maxRetries") && !fs.existsSync(configPath), "saveConfig 拒绝语义非法且不覆盖原文件", JSON.stringify(saveFields));

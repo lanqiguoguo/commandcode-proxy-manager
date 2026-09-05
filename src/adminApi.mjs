@@ -508,11 +508,24 @@ export async function handleAdmin(req, res, url) {
         throw new ConfigValidationError("管理端 security 配置", [{ field: "security", message: "请求体必须是对象" }]);
       }
       const nextCfg = { ...cfg };
+      // 令牌强度与 config.mjs validateConfig 同规则（非空 8..128 位）：此处只做
+      // 提前字段级校验给出友好错误，saveConfig 的生效校验是最终防线。空串仅
+      // clientToken 合法（显式清空 → /v1 回退 adminToken），AdminToken 不允许空串。
       if (body.clientToken !== undefined) {
         if (typeof body.clientToken !== "string") {
           throw new ConfigValidationError("管理端 security 配置", [{ field: "clientToken", message: "必须是字符串" }]);
         }
-        nextCfg.clientToken = String(body.clientToken).slice(0, 128);
+        if (body.clientToken === "") {
+          nextCfg.clientToken = ""; // 显式清空 → 回退 adminToken
+        } else if (body.clientToken.trim() === "") {
+          throw new ConfigValidationError("管理端 security 配置", [{ field: "clientToken", message: "不能只包含空白字符" }]);
+        } else if (body.clientToken.length < 8) {
+          throw new ConfigValidationError("管理端 security 配置", [{ field: "clientToken", message: "至少 8 位" }]);
+        } else if (body.clientToken.length > 128) {
+          throw new ConfigValidationError("管理端 security 配置", [{ field: "clientToken", message: "长度不能超过 128" }]);
+        } else {
+          nextCfg.clientToken = body.clientToken;
+        }
       }
       if (body.adminToken !== undefined) {
         if (typeof body.adminToken !== "string") {
@@ -520,6 +533,7 @@ export async function handleAdmin(req, res, url) {
         }
         const t = String(body.adminToken).trim();
         if (t.length < 8) throw new ConfigValidationError("管理端 security 配置", [{ field: "adminToken", message: "至少 8 位" }]);
+        if (t.length > 128) throw new ConfigValidationError("管理端 security 配置", [{ field: "adminToken", message: "长度不能超过 128" }]);
         nextCfg.adminToken = t;
       }
       saveConfig(nextCfg);

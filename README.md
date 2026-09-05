@@ -106,8 +106,9 @@ docker logs -f cc-proxy-manager
 ```
 
 托管模式只有在 raw upstream ready 后才会开放 manager 端口。成功后 `/health` 返回 `200`
-和 `OK`。首次启动没有磁盘令牌时，manager 会生成 `AdminToken`，并写入 `/data/config.json`
-和启动日志；管理界面地址为 `http://127.0.0.1:3080/admin`。
+和 `OK`。首次启动没有磁盘令牌时，manager 会生成 `AdminToken`（同时作为回退的客户端
+令牌），只写入 `/data/config.json`，不会打印到启动日志——请从该文件读取令牌登录管理
+界面（`http://127.0.0.1:3080/admin`）或配置 `ADMIN_TOKEN`/`CLIENT_TOKEN` 环境变量。
 
 ## 配置
 
@@ -128,7 +129,7 @@ docker logs -f cc-proxy-manager
 | `CC_UPSTREAM_SHUTDOWN_TIMEOUT_MS` | `5000` | 发送 `SIGTERM` 后等待 raw upstream 退出的时间，允许 `0..120000` 毫秒 |
 | `CC_SHUTDOWN_GRACE_MS` | `10000` | manager 停止接收后等待活动请求和连接排空的时间，允许 `100..120000` 毫秒 |
 | `CC_SHUTDOWN_FORCE_WAIT_MS` | `1000` | manager 强制销毁活动连接后的额外等待时间，允许 `100..120000` 毫秒 |
-| `ADMIN_TOKEN` | 自动生成 | `/admin` 和 `/admin/api/*` 的管理令牌 |
+| `ADMIN_TOKEN` | 自动生成 | `/admin` 和 `/admin/api/*` 的管理令牌；自动生成时只写入 `/data/config.json`（0600），不打印到日志 |
 | `CLIENT_TOKEN` | 空，回退 `ADMIN_TOKEN` | `/v1/*` 客户端令牌 |
 | `CC_QUOTA_BASE` | `https://api.commandcode.ai` | manager 额度探测使用的 API 基址；探测失败只保留 stale 快照 |
 | `SECURE_COOKIES` | 空 | 设为 `1` 或 `true` 时给管理 SSE cookie 添加 `Secure`，只用于 HTTPS 反向代理 |
@@ -182,6 +183,13 @@ Anthropic SDK 的 `base_url` 指向 `http://127.0.0.1:3080`，`x-api-key` 使用
 管理 API 除登录和退出登录外需要 `X-Admin-Token`。主要端点包括
 `/admin/api/keys`、`/admin/api/pool`、`/admin/api/history`、`/admin/api/logs` 和
 `/admin/api/events`。
+
+令牌与池配置的边界契约：非空的 `ADMIN_TOKEN`/`CLIENT_TOKEN` 必须为 8..128 位
+（环境变量、`config.json` 或 `/admin/api/security` 任一路径提供短于 8 位的令牌都会
+在启动或保存时被拒绝），空串仅 `clientToken` 合法，表示未配置、`/v1/*` 回退
+`adminToken`。`PUT /admin/api/pool` 的数值越界按范围 clamp 保存（响应 `200`，
+`body.poolCfg` 为生效值），而 `/admin/api/security` 的令牌越短/超长则 `400` 拒绝
+（字段级错误）。
 
 ## 启动、关闭和日志
 

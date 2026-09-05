@@ -126,7 +126,7 @@ function showLogin() {
   app.innerHTML =
     '<div class="login-wrap"><div class="card">' +
     "<h2>CommandCode Proxy Manager</h2>" +
-    "<p class=\"muted small\">管理端令牌在首次启动时生成并打印到容器日志 / data/config.json</p>" +
+    "<p class=\"muted small\">管理端令牌在首次启动时自动生成，只写入 data/config.json（不在日志中打印），请从该文件读取</p>" +
     "<label>Admin Token</label>" +
     '<input id="login-token" type="password" placeholder="输入管理端令牌" autocomplete="current-password">' +
     '<div class="mt"></div><button id="btn-login">登录</button>' +

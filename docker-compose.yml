@@ -8,7 +8,7 @@ services:
     environment:
       PORT: "${PORT:-3080}"
       DATA_DIR: /data
-      # ADMIN_TOKEN: change-me     # 可选：不设置则首次启动自动生成并打印到日志
+      # ADMIN_TOKEN: change-me     # 可选：不设置则首次启动自动生成并写入 /data/config.json（不在日志中打印）
       # CLIENT_TOKEN: change-me    # 可选：不设置则 /v1/* 回退使用 AdminToken
     volumes:
       - ccpm-data:/data

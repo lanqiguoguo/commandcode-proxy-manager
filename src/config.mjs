@@ -161,12 +161,18 @@ export function validateConfig(input, options = {}) {
       else addFieldError(fields, field, "必须是非空、无空白的主机名、IPv4 或 IPv6 地址");
     }
   }
+  // 令牌强校验（系统级不变量，A-1/C-1/C-8）：空串表示“未配置”（clientToken →
+  // /v1 回退 adminToken；adminToken 由 loadConfig 自动生成 48-hex 兜底），不是
+  // “非空短 token”，放行；非空值必须 8..128 位——与 adminApi security 端点同
+  // 规则，避免端点与磁盘路径规则分叉。loadConfig 自动生成值天然满足该范围。
   for (const field of ["clientToken", "adminToken"]) {
     if (!hasOwn(input, field)) continue;
     const value = input[field];
     if (typeof value !== "string") addFieldError(fields, field, "必须是字符串");
-    else if (value.length > 1024) addFieldError(fields, field, "长度不能超过 1024");
-    else if (value.trim() === "" && value !== "") addFieldError(fields, field, "不能只包含空白字符");
+    else if (value === "") out[field] = "";
+    else if (value.trim() === "") addFieldError(fields, field, "不能只包含空白字符");
+    else if (value.length < 8) addFieldError(fields, field, "至少 8 位");
+    else if (value.length > 128) addFieldError(fields, field, "长度不能超过 128");
     else out[field] = value;
   }
   if (hasOwn(input, "pool")) {
@@ -268,6 +274,9 @@ function applyEnvironment(data) {
 }
 
 function applyTokenEnvironment(data) {
+  // 令牌 env 仅在磁盘无值时初始化填充；env 值不在这里做强度校验——loadConfig
+  // 尾部会对“生效配置”整体 validateConfig：任何生效路径上的非空短 token（磁盘、
+  // env、自动生成）都会触发 ConfigValidationError 拒绝启动（A-1/C-1 一处闭合）。
   for (const [name, field] of [["ADMIN_TOKEN", "adminToken"], ["CLIENT_TOKEN", "clientToken"]]) {
     const value = process.env[name];
     if (!value) continue;
@@ -344,12 +353,10 @@ export function loadConfig() {
   applyTokenEnvironment(data);
 
   if (!data.adminToken) {
+    // C-3：自动生成的 token 只落盘（config.json 0600），不再打印明文到
+    // stdout/docker logs；只提示位置，管理员从 DATA_DIR/config.json 读取。
     data.adminToken = crypto.randomBytes(24).toString("hex");
-    console.log("============================================================");
-    console.log("  Generated AdminToken (also the fallback client token):");
-    console.log("  " + data.adminToken);
-    console.log("  Persisted to " + resolve(DATA_DIR, "config.json"));
-    console.log("============================================================");
+    console.log(`[config] 已生成 AdminToken（同时作为 /v1 回退 clientToken），已持久化到 ${resolve(DATA_DIR, "config.json")}（管理界面登录与 /v1 鉴权请从该文件读取令牌）`);
   }
   try {
     data = validateConfig(data, { source: "生效配置" });

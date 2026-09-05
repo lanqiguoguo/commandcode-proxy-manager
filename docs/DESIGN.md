@@ -251,7 +251,7 @@ manager 配置表中的功能开关。
 | `CC_UPSTREAM_SHUTDOWN_TIMEOUT_MS` | `5000` | raw `SIGTERM` 等待，`0..120000` 毫秒 |
 | `CC_SHUTDOWN_GRACE_MS` | `10000` | manager 排空等待，`100..120000` 毫秒 |
 | `CC_SHUTDOWN_FORCE_WAIT_MS` | `1000` | manager 强制关闭后的等待，`100..120000` 毫秒 |
-| `ADMIN_TOKEN` | 首次自动生成 | 管理鉴权；磁盘已有值时优先 |
+| `ADMIN_TOKEN` | 首次自动生成 | 管理鉴权；磁盘已有值时优先；自动生成值只写入 `config.json`（0600），不打印到 stdout/docker logs |
 | `CLIENT_TOKEN` | 空，回退 `ADMIN_TOKEN` | `/v1/*` 鉴权；磁盘已有值时优先 |
 | `CC_QUOTA_BASE` | `https://api.commandcode.ai` | manager 额度 API 基址 |
 | `SECURE_COOKIES` | 空 | `1`/`true` 时为 SSE cookie 添加 `Secure` |
@@ -287,6 +287,12 @@ raw child 的 `HOST`、`PORT` 不是用户可任意注入的值，而是 manager
 | `POST /admin/api/security` | 修改 client/admin token |
 | `GET /admin/api/logs` | 查询持久化 manager/raw 日志，可按 `src=proxy` 过滤 |
 | `GET /admin/api/events` | SSE 推送 quota、stats 和 log 事件 |
+
+数值边界契约（有意分叉，均为文档化行为）：`PUT /admin/api/pool` 的数值越界按
+范围 **clamp** 保存（如 `hardStop` `0`→下限 `50`、`999`→上限 `100`），响应 `200`
+且 `body.poolCfg` 为 clamp 后的生效值，前端据此回显；`POST /admin/api/security`
+的令牌非空值必须为 8..128 位，越短或超长一律 `400` 拒绝（字段级错误），空串仅
+`clientToken` 合法，语义为清空配置、`/v1` 回退 `adminToken`。
 
 `SECURE_COOKIES=1` 或 `true` 只应在 HTTPS 反向代理后使用。默认明文 HTTP 部署不设置
 `Secure`，否则浏览器不会回传 SSE cookie。

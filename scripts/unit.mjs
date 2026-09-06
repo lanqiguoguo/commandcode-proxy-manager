@@ -824,6 +824,32 @@ if (SC === "gateway") {
     check(result.kind === expected, "B-11 " + name + " → " + expected, JSON.stringify(result));
   }
 
+  // ── 模型名错误（CC 403 → 折叠 401 "Model/provider not recognized"）──
+  // 真实 CC 取证（2026-09-06）：大小写错/未知模型/错加 :free/尾部空格统一返回该
+  // 文本；假 key 直连返回 401 "Invalid 'Authorization' header or token."（凭证形态
+  // 不同）。模型名错误是请求级错误 → model_error，不标 authError（否则池内 Key
+  // 被逐个误杀）；凭证/未知文本必须仍按 auth 保守处理。
+  const modelErrCases = [
+    // [期望 kind, 名称, 状态, message]（全部为折叠出口形状 status 401 + auth_error type）
+    ["model_error", "真实取证：小写 longcat", 401, "Model/provider not recognized: anthropic:meituan/longcat-2.0:free"],
+    ["model_error", "真实取证：完全未知模型", 401, "Model/provider not recognized: anthropic:meituan/NoSuchModel-9.9:free"],
+    ["model_error", "真实取证：错误 :free 后缀", 401, "Model/provider not recognized: anthropic:gpt-5.5:free"],
+    ["model_error", "真实取证：尾部空格模型", 401, "Model/provider not recognized: anthropic:deepseek/deepseek-v4-flash "],
+    ["model_error", "model not found 变体", 401, "model not found: anthropic:foo/bar"],
+    ["model_error", "unknown model 变体", 401, "unknown model anthropic:foo/bar"],
+    ["model_error", "raw 403 形态（未折叠）", 403, "Model/provider not recognized: anthropic:foo/bar"],
+    // ── 护栏：凭证/未知/其它错误不得被误归 model_error ──
+    ["auth", "凭证失效原文（直连取证）", 401, "Invalid 'Authorization' header or token."],
+    ["auth", "invalid api key", 401, "invalid api key"],
+    ["auth", "model access denied（无 not recognized 语义）", 403, "model access denied"],
+    ["model_plan", "MODEL_NOT_IN_PLAN（仍归 plan 优先）", 401, "MODEL_NOT_IN_PLAN: Claude Sonnet 5 available in Pro and above plans"],
+  ];
+  for (const [expected, name, status, message] of modelErrCases) {
+    const body = { error: { type: "authentication_error", message } };
+    const result = classify(status, body);
+    check(result.kind === expected, "模型名错误 " + name + " → " + expected, JSON.stringify(result));
+  }
+
   // ── B-2 错误出口 type 白名单保留（mapError 纯函数）──
   const m400 = mapError(400, JSON.stringify({ error: { message: "bad request", type: "invalid_request_error" } }));
   check(m400.status === 400 && m400.body.error.type === "invalid_request_error",

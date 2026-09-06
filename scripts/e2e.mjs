@@ -1118,6 +1118,70 @@ async function main() {
     ? ok("模型套餐错误历史按 client 记录且不伪装 auth")
     : bad("模型套餐历史分类", JSON.stringify(modelPlanStats));
 
+  // ── T6d 模型名错误（CC 403→折叠 401 "Model/provider not recognized"）不标 auth ──
+  // 真实 CC 取证：大小写错/未知模型/错加 :free 统一返回该文本（非凭证失效——
+  // 假 key 直连返回 "Invalid 'Authorization' header or token."）。请求级错误：
+  // 出口 400 invalid_request_error、不标 authError、不重试；护栏：凭证文本仍 auth。
+  console.log("\n=== T6d model not recognized keeps key healthy ===");
+  await restartClean();
+  await mock("/__control", {
+    auth: "user_keyA",
+    responses: [{ mode: "client4xx", status: 401, type: "authentication_error",
+      message: "Model/provider not recognized: anthropic:meituan/longcat-2.0:free" }],
+  });
+  r = await gw({ model: "meituan/longcat-2.0:free", messages: [] });
+  const mnrBody = parseJsonResponse(r, "model not recognized");
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  r.status === 400 && mnrBody.error?.type === "invalid_request_error" &&
+    mnrBody.error?.message.includes("not recognized") &&
+    !r.body.includes("user_keyA") &&
+    kA.health.authError === false && kA.health.backoffUntilMs <= Date.now() && kA.health.lastErrorKind !== "auth"
+    ? ok("模型名错误 → 出口 400 invalid_request_error，key 不标 authError（修复前误标停用）")
+    : bad("模型名错误分类", JSON.stringify({ status: r.status, body: r.body.replaceAll("user_keyA", "user_***"), health: kA.health }));
+
+  // 对照：凭证失效原文（假 key 直连 CC 取证文本）→ 仍必须标 authError
+  await mock("/__control", {
+    auth: "user_keyA",
+    responses: [{ mode: "client4xx", status: 401, type: "authentication_error",
+      message: "Invalid 'Authorization' header or token." }],
+  });
+  r = await gw({ model: "m-bad-cred", messages: [] });
+  ks = await keysList();
+  kA = ks.find((k) => k.alias === "keyA");
+  kA.health.authError === true && kA.health.backoffUntilMs > Date.now() && kA.health.lastErrorKind === "auth"
+    ? ok("凭证失效原文仍按 auth 停用（护栏）")
+    : bad("凭证失效护栏", JSON.stringify({ status: r.status, health: kA.health }));
+  await admin("/admin/api/keys/" + kA.id + "/clear-auth", "POST");
+
+  // authError 事件携带净化触发文本（观测性：日志可区分真凭证失效 vs 折叠误判）
+  const logsAfterAuth = JSON.parse((await admin("/admin/api/logs?limit=30", "GET")).body).logs || [];
+  const authLog = [...logsAfterAuth].reverse().find((l) => (l.msg || "").includes("认证失败"));
+  authLog && (authLog.msg || "").includes("Invalid 'Authorization' header or token.") && !(authLog.msg || "").includes("user_keyA")
+    ? ok("authError 日志携带净化后的触发 message（可区分真伪）")
+    : bad("authError 日志摘要", JSON.stringify(authLog && authLog.msg));
+
+  // 多 key 不传染：keyA 遇模型名错误不标 auth → 后续流量仍走 keyA（池不雪崩）
+  await mock("/__reset"); // 清空前序用例残留响应队列，保证本用例调用序列精确
+  await mock("/__control", {
+    auth: "user_keyA",
+    responses: [{ mode: "client4xx", status: 401, type: "authentication_error",
+      message: "Model/provider not recognized: anthropic:nope/nope:free" }, { mode: "ok" }],
+  });
+  await mock("/__control", { auth: "user_keyB", responses: [{ mode: "ok" }] });
+  r = await gw({ model: "nope/nope:free", messages: [] });   // 第一次：模型名错误
+  r = await gw({ model: "m-after-mnr", messages: [] });       // 第二次：应仍走 keyA 且 200
+  calls = JSON.parse((await mockGet("/__calls")).body).calls;
+  r.status === 200 && calls.length === 2 && calls[1].auth === "user_keyA" &&
+    (await keysList()).find((k) => k.alias === "keyA").health.authError === false
+    ? ok("模型名错误后同 Key 后续请求正常（多 Key 池不逐个误杀）")
+    : bad("多 key 不传染", JSON.stringify({ status: r.status, calls: calls.map((c) => [c.auth, c.mode]), health: (await keysList()).find((k) => k.alias === "keyA").health }));
+
+  const mnrStats = await historyForModel("meituan/longcat-2.0:free");
+  mnrStats.length === 1 && mnrStats[0].status === 400 && mnrStats[0].errorKind === "client" && mnrStats[0].ok === false
+    ? ok("模型名错误历史按 client 400 记录（不伪装 auth）")
+    : bad("模型名错误历史分类", JSON.stringify(mnrStats));
+
   // ── T7 零输出 → 直接退避切 Key，不再同 Key 重试（B-4：确定性零输出连打同一 Key
   //    是纯成本放大——3× 完整生成；零输出重试仅留给带真实短 retry_after 的 429）──
   console.log("\n=== T7 zero output failover ===");

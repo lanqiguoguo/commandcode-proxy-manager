@@ -262,6 +262,14 @@ const KNOWN_UPSTREAM_TYPES = new Set([
   "request_too_large",
 ]);
 
+// 模型名错误文本：CC 对"模型不存在/拼写错"（大小写错、未知模型、错误 :free 后缀、
+// 尾部空格）统一返回 403 → vendored upstream 折叠为 401 authentication_error，
+// message 形如 "Model/provider not recognized: anthropic:<model>"（实测取证）。
+// 这不是凭证失效（假 key 直连 CC 返回 401 "Invalid 'Authorization' header or
+// token."，形态完全不同），而是请求级错误——不得标 authError 停用健康 Key。
+// 否则客户端一次模型名拼错会把池内 Key 逐个误杀（先主后备的"传染"）。
+const MODEL_NOT_RECOGNIZED_PATTERN = /\b(?:model|provider)\b[\s\S]{0,30}\b(?:not recognized|not found|unknown|does not exist|is not a valid model)\b|\bunknown (?:model|provider)\b|(?:^|[^a-z])(?:model|provider) (?:not recognized|not found)\b/i;
+
 // Return a category after parsing only the structured error fields that the
 // upstream contract uses. Model-plan errors are checked before status-only
 // handling so a future 429/402 response cannot poison key health either.
@@ -269,6 +277,11 @@ export function classifyUpstreamError(status, text) {
   const parsed = parseUpstreamError(text);
   const modelPlan = [parsed.code, parsed.type, parsed.message].some(hasModelPlanMarker) || isModelPlanMessage(parsed.message);
   if (modelPlan) return { kind: "model_plan", parsed };
+  // 模型名错误（CC 403 → 上游折叠 401 "Model/provider not recognized..."）：
+  // 请求级错误，优先于 auth 判定，避免把健康 Key 标 authError（多 Key 池会逐个误杀）。
+  if ((status === 401 || status === 403) && MODEL_NOT_RECOGNIZED_PATTERN.test(parsed.message)) {
+    return { kind: "model_error", parsed };
+  }
   if (status === 401 || status === 403) return { kind: "auth", parsed };
   if (status === 402 || status === 429) return { kind: "rate_limit", parsed };
   if (status >= 500) return { kind: "upstream", parsed };
@@ -1025,7 +1038,7 @@ export async function handleGateway(req, res, url) {
           recordClientAbort({ keyId: chosen.id });
           return;
         }
-        pool.markAuthError(chosen.id);
+        pool.markAuthError(chosen.id, { message: redactUpstreamMessage(classification.parsed.message || "") });
         activeAc = null;
         lastStatus = upRes.status;
         lastErrorKind = "auth";
@@ -1037,6 +1050,28 @@ export async function handleGateway(req, res, url) {
         recordRequestEvent({ keyId: chosen.id, status: upRes.status, errorKind: "auth" });
         const mapped = mapError(upRes.status, text);
         sendJson(res, mapped.status, mapped.body);
+        return;
+      }
+
+      if (classification.kind === "model_error") {
+        // 模型名错误（"Model/provider not recognized"）是请求写错，不是 Key 失效：
+        // 不标 authError、不重试、不改 Key 健康；出口按 400 invalid_request_error
+        // 语义透传（上游折叠成的 401 authentication_error 会误导客户端当作凭证问题）。
+        if (clientGone) {
+          activeAc = null;
+          recordClientAbort({ keyId: chosen.id });
+          return;
+        }
+        activeAc = null;
+        lastStatus = 400;
+        lastErrorKind = "client";
+        if (clientGone || res.writableEnded || res.destroyed) {
+          if (clientGone) recordClientAbort({ keyId: chosen.id });
+          return;
+        }
+        recordRequestEvent({ keyId: chosen.id, status: 400, errorKind: "client" });
+        const message = redactUpstreamMessage(classification.parsed.message || "Unknown model");
+        sendJson(res, 400, { error: { message, type: "invalid_request_error" } });
         return;
       }
 

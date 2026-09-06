@@ -341,7 +341,7 @@ export function recordSuccess(id, attempt) {
   return { applied: true, changed };
 }
 
-export function markAuthError(id) {
+export function markAuthError(id, parsed = null) {
   const h = health.get(id);
   if (!h) return;
   h.authError = true;
@@ -349,7 +349,13 @@ export function markAuthError(id) {
   h.backoffUntilMs = nowMs() + 3600 * 1000;
   bumpHealthVersion(id);
   persistState();
-  emitKeyLog(id, " 认证失败（401/403），已标记异常并停止自动使用");
+  // 附带触发错误摘要（截断 + 去控制字符，≤200 字符）——真凭证失效与"折叠 401"
+  // （模型名拼错等请求级错误若漏过甄别）在日志/管理端可区分，便于运维判断
+  // 是否需要 clear-auth；完整净化（key 掩码等）由调用方（gateway）负责。
+  const snippet = parsed && parsed.message && typeof parsed.message === "string"
+    ? " " + parsed.message.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 200)
+    : "";
+  emitKeyLog(id, " 认证失败（401/403），已标记异常并停止自动使用" + snippet);
 }
 
 export function clearAuthError(id) {
